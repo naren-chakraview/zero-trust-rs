@@ -2,8 +2,27 @@
 name = "zero-trust"
 version = "0.1.0"
 edition = "2021"
-description = "A Rust library for zero-trust security primitives"
+description = "A zero-trust identity and OBO-delegation gateway/fabric service"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/REPLACE_ME/zero-trust-rs"
 
+[[bin]]
+name = "zt-gateway"
+path = "src/bin/zt-gateway.rs"
+
 [dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_yaml_ng = "0.10"
+jsonwebtoken = "9"
+thiserror = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "signal"] }
+axum = "0.7"
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+rsa = "0.9"
+rand = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[dev-dependencies]
+tower = { version = "0.4", features = ["util"] }
+serde_json = "1"

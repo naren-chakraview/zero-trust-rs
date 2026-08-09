@@ -1,0 +1,43 @@
+# Adapted from the chakraview-zero-trust-blueprint's identity/spiffe-ids.yaml,
+# with bootstrap_token added per workload for zt-gateway's v0.1 issuance
+# endpoint (a stand-in for real SPIRE node attestation).
+
+trust_domain: chakra.internal
+
+workloads:
+  - name: api-gateway
+    spiffe_id: spiffe://chakra.internal/ns/api-gateway/sa/api-gateway
+    namespace: api-gateway
+    service_account: api-gateway
+    max_obo_chain_depth: 1
+    allowed_callers: []
+    bootstrap_token: api-gateway-dev-secret
+
+  - name: orders-svc
+    spiffe_id: spiffe://chakra.internal/ns/orders/sa/orders-svc
+    namespace: orders
+    service_account: orders-svc
+    max_obo_chain_depth: 3
+    allowed_callers:
+      - spiffe://chakra.internal/ns/api-gateway/sa/api-gateway
+    bootstrap_token: orders-dev-secret
+
+  - name: inventory-svc
+    spiffe_id: spiffe://chakra.internal/ns/inventory/sa/inventory-svc
+    namespace: inventory
+    service_account: inventory-svc
+    max_obo_chain_depth: 3
+    allowed_callers:
+      - spiffe://chakra.internal/ns/orders/sa/orders-svc
+      - spiffe://chakra.internal/ns/api-gateway/sa/api-gateway
+    bootstrap_token: inventory-dev-secret
+
+  # Legacy service onboarded via the ZT gateway — no SVID of its own.
+  # Present for documentation; skipped by Registry (spiffe_id is null).
+  - name: legacy-billing-svc
+    spiffe_id: null
+    namespace: legacy
+    service_account: legacy-billing-svc
+    onboarding_topology: topology-b-dedicated-pod
+    gateway_spiffe_id: spiffe://chakra.internal/ns/zt-gateway/sa/zt-gateway
+    note: "HTTP/1.1 service; ZT gateway performs REST passthrough"

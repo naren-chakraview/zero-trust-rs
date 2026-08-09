@@ -1,0 +1,9 @@
+[package]
+name = "zero-trust"
+version = "0.1.0"
+edition = "2021"
+description = "A Rust library for zero-trust security primitives"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/REPLACE_ME/zero-trust-rs"
+
+[dependencies]

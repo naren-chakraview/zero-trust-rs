@@ -71,3 +71,34 @@ pub enum ConfigError {
     #[error("protected_workload is not a valid SPIFFE ID: {0}")]
     InvalidProtectedWorkload(#[from] SpiffeIdError),
 }
+
+/// Errors from loading/generating TLS server certificate material or
+/// building a `rustls::ServerConfig`.
+#[derive(Debug, thiserror::Error)]
+pub enum TlsError {
+    #[error("failed to read TLS certificate/key file: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("no certificates found in {0}")]
+    NoCertsFound(String),
+    #[error("no private key found in {0}")]
+    NoKeyFound(String),
+    #[error("failed to generate an ephemeral certificate: {0}")]
+    Generation(String),
+    #[error("failed to build rustls server config: {0}")]
+    RustlsConfig(#[from] rustls::Error),
+}
+
+/// Errors from X.509 SVID issuance ([`crate::CertificateAuthority::sign_csr`]).
+#[derive(Debug, thiserror::Error)]
+pub enum CaError {
+    #[error("unknown workload: {0}")]
+    UnknownWorkload(String),
+    #[error("bootstrap token does not match the requesting workload")]
+    InvalidBootstrapToken,
+    #[error("malformed certificate signing request: {0}")]
+    MalformedCsr(String),
+    #[error("CSR requests identity '{requested}' but the authenticated workload is '{expected}'")]
+    SanMismatch { requested: String, expected: String },
+    #[error("failed to sign certificate: {0}")]
+    Signing(String),
+}

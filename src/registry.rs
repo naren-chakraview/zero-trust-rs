@@ -30,6 +30,16 @@ pub struct WorkloadEntry {
     pub bootstrap_token: Option<String>,
 }
 
+/// The result of [`Registry::check_bootstrap_token`]. A plain enum, not a
+/// `Result`, because "unknown workload" and "wrong token" are deliberately
+/// not conflated — callers map each to their own distinct error variant
+/// (e.g. `IdentityError::UnknownWorkload` vs. `InvalidBootstrapToken`).
+pub enum CredentialCheck<'a> {
+    Ok(&'a WorkloadEntry),
+    UnknownWorkload,
+    InvalidCredential,
+}
+
 /// The parsed registry: every known workload, keyed by its `SpiffeId`.
 #[derive(Debug, Clone, Default)]
 pub struct Registry {
@@ -117,6 +127,21 @@ impl Registry {
     /// entries.
     pub fn get_by_name(&self, name: &str) -> Option<&WorkloadEntry> {
         self.entries.values().find(|entry| entry.name == name)
+    }
+
+    /// Checks a presented `bootstrap_token` against `workload_name`'s
+    /// registered one. Every issuance endpoint (JWT SVID, X.509 SVID, ...)
+    /// needs this exact "look up by name, compare the token" check — it
+    /// lives here once so `identity.rs` and `ca.rs` can't drift apart on
+    /// what counts as a valid credential.
+    pub fn check_bootstrap_token(&self, workload_name: &str, credential: &str) -> CredentialCheck<'_> {
+        let Some(entry) = self.get_by_name(workload_name) else {
+            return CredentialCheck::UnknownWorkload;
+        };
+        match &entry.bootstrap_token {
+            Some(expected) if expected == credential => CredentialCheck::Ok(entry),
+            _ => CredentialCheck::InvalidCredential,
+        }
     }
 
     pub fn len(&self) -> usize {

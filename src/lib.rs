@@ -3,6 +3,7 @@
 //! chakraview-zero-trust-blueprint's Rego policies, minus the OPA/Envoy/K8s
 //! infrastructure they normally run inside.
 
+mod ca;
 mod config;
 mod error;
 mod headers;
@@ -11,9 +12,11 @@ mod jwt;
 mod obo;
 mod registry;
 mod spiffe_id;
+mod tls;
 
-pub use config::GatewayConfig;
-pub use error::{ConfigError, IdentityError, JwtError, RegistryError, SpiffeIdError};
+pub use ca::{CertificateAuthority, LocalCa, SignedCert};
+pub use config::{CaConfig, ClientAuth, GatewayConfig, TlsConfig};
+pub use error::{CaError, ConfigError, IdentityError, JwtError, RegistryError, SpiffeIdError, TlsError};
 pub use headers::{
     build_outbound_headers, CallerChain, OutboundHeaders, HEADER_CALLER_CHAIN, HEADER_OBO_TOKEN,
     HEADER_USER_PRINCIPAL,
@@ -21,8 +24,9 @@ pub use headers::{
 pub use identity::{IdentityProvider, IssuedToken, LocalIssuer};
 pub use jwt::{JwtSigner, JwtVerifier, OboClaims};
 pub use obo::{validate, Decision, DenyReason, ValidationRequest, Validator};
-pub use registry::{Registry, WorkloadEntry, DEFAULT_MAX_OBO_CHAIN_DEPTH};
+pub use registry::{CredentialCheck, Registry, WorkloadEntry, DEFAULT_MAX_OBO_CHAIN_DEPTH};
 pub use spiffe_id::SpiffeId;
+pub use tls::{build_client_cert_verifier, build_server_config, load_certs, ServerCertificate};
 
 /// Current time as Unix seconds. A thin wrapper so call sites don't reach
 /// for a date/time crate just to compare against a JWT `exp`/`iat`.

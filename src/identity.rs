@@ -7,7 +7,7 @@ use rsa::{RsaPrivateKey, RsaPublicKey};
 
 use crate::error::{IdentityError, JwtError};
 use crate::jwt::{JwtSigner, JwtVerifier, OboClaims};
-use crate::registry::Registry;
+use crate::registry::{CredentialCheck, Registry};
 use crate::spiffe_id::SpiffeId;
 
 /// A freshly minted JWT SVID and when it expires (Unix seconds).
@@ -118,15 +118,13 @@ impl IdentityProvider for LocalIssuer {
         audience: &str,
         credential: &str,
     ) -> Result<IssuedToken, IdentityError> {
-        let requester = self
-            .registry
-            .get_by_name(requester_workload_name)
-            .ok_or_else(|| IdentityError::UnknownWorkload(requester_workload_name.to_string()))?;
-
-        match &requester.bootstrap_token {
-            Some(expected) if expected == credential => {}
-            _ => return Err(IdentityError::InvalidBootstrapToken),
-        }
+        let requester = match self.registry.check_bootstrap_token(requester_workload_name, credential) {
+            CredentialCheck::Ok(entry) => entry,
+            CredentialCheck::UnknownWorkload => {
+                return Err(IdentityError::UnknownWorkload(requester_workload_name.to_string()))
+            }
+            CredentialCheck::InvalidCredential => return Err(IdentityError::InvalidBootstrapToken),
+        };
 
         let audience_id: SpiffeId = audience.parse()?;
 

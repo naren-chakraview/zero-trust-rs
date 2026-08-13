@@ -12,29 +12,76 @@ infrastructure.
 It ships as two things:
 
 - **A library** (`zero_trust`) — SPIFFE ID parsing, the workload registry,
-  JWT SVID issuance/verification, OBO header construction, and the
-  `validate()` decision engine. Usable on its own if you're embedding Rust.
-- **A binary**, `zt-gateway` — an HTTP service built on the library that
-  issues tokens, exposes a decision API, and reverse-proxies traffic to a
-  backend application, denying anything that fails validation before the
-  backend ever sees it.
+  JWT SVID and X.509 SVID issuance/verification, OBO header construction,
+  TLS/mTLS setup, and the `validate()` decision engine. Usable on its own if
+  you're embedding Rust.
+- **A binary**, `zt-gateway` — a TLS-capable HTTP service built on the
+  library that issues tokens/certs, exposes a decision API, and
+  reverse-proxies traffic to a backend application, denying anything that
+  fails validation before the backend ever sees it.
 
-## v0.1 limitation: no TLS yet
+## TLS and mTLS
 
-This version serves **plain HTTP, not mTLS**. Caller identity comes entirely
-from a presented `X-SPIFFE-OBO-Token` (a signed, short-lived JWT) — there is
-no independently-verified transport identity backing it. That means a leaked
-token is usable by anyone until it expires (default 5 minutes), where the
-blueprint's real mTLS layer would prevent that by binding identity to the
-TLS channel itself. TLS/mTLS termination is planned as a v0.2 addition; the
-validation engine (`obo::validate`) already has a `source_principal` slot
-ready for a verified transport identity to plug into once that lands.
+TLS is opt-in via config (see `docs/design/0001-tls-mtls-termination.md` for
+the full design). Three postures, in the order a deployment would typically
+move through them:
 
-Workload identity issuance is also **local to this process** in v0.1 (see
-`IdentityProvider`/`LocalIssuer` in `src/identity.rs`) rather than backed by
-a real SPIRE server — but that's a trait boundary specifically so a
-SPIRE-backed provider can be swapped in later without touching the
-validation logic or the HTTP layer.
+- **No `tls:` block at all** — plain HTTP. Caller identity comes entirely
+  from a presented `X-SPIFFE-OBO-Token`; a leaked token is usable by anyone
+  until it expires (default 5 minutes).
+- **`tls:` present, `client_auth: none`** (or omitted) — connections are
+  encrypted, but caller identity is still bearer-token-only. Closes the
+  "token travels in plaintext" gap without requiring any client to change.
+- **`tls.client_auth: optional` or `required`** — the gateway also verifies
+  a presented client certificate's SPIFFE ID (from its SAN URI) against a
+  trusted CA, and feeds it into `obo::validate` as an independently-verified
+  `source_principal`. This activates two checks that are otherwise dormant:
+  a direct call with no OBO token but an allow-listed client cert, and
+  rejecting an OBO token whose `sub` doesn't match the TLS-verified caller
+  (impersonation). `optional` lets bearer-token-only and mTLS-capable
+  callers coexist during migration; `required` fails the TLS handshake
+  itself for anyone without a valid client cert — parity with the
+  blueprint's `PeerAuthentication: STRICT`.
+
+The CA a gateway **trusts** for verifying client certs is independent of
+whether it can **issue** them itself — see `ca.cert_path`/`ca.key_path`
+below. A gateway can verify against a CA it doesn't hold the key for.
+
+Workload identity issuance (both JWT SVIDs and X.509 SVIDs) is **local to
+this process** in v0.1 (see `IdentityProvider`/`LocalIssuer` in
+`src/identity.rs` and `CertificateAuthority`/`LocalCa` in `src/ca.rs`)
+rather than backed by a real SPIRE server — but both are trait boundaries
+specifically so a SPIRE-backed provider can be swapped in later without
+touching the validation logic or the HTTP layer.
+
+### Config reference
+
+```yaml
+tls:
+  cert_path: /path/to/server-cert.pem   # omit both to generate an ephemeral dev cert
+  key_path: /path/to/server-key.pem
+  client_auth: optional                 # none | optional | required
+
+ca:
+  cert_path: /path/to/ca-cert.pem       # trust root for verifying client certs
+  key_path: /path/to/ca-key.pem         # optional — set only if THIS gateway issues X.509 SVIDs
+  ttl_seconds: 3600                     # X.509 SVID TTL when this gateway is the issuer
+```
+
+Omit `ca.key_path` to run verify-only (trusting a CA this gateway doesn't
+control) — `POST /v1/svid/x509` returns `501` in that mode. Omit `ca:`
+entirely, with `client_auth` still enabled, to get an ephemeral dev CA
+(same spirit as the ephemeral server cert / ephemeral JWT key fallbacks —
+not for anything a real client should trust long-term).
+
+Try `examples/gateway.mtls.config.yaml` to run with TLS + optional mTLS
+enabled (ephemeral server + CA certs, generated fresh on every startup).
+Because the ephemeral CA's key never touches disk, there's no cert on disk
+for a `curl --cert`/`--cacert` walkthrough to point at — for a real,
+runnable end-to-end mTLS flow (issuing a CSR-signed client cert, presenting
+it over a real TLS handshake, and seeing the impersonation check fire),
+see the `mtls_*` tests in `src/bin/zt-gateway.rs`, which exercise exactly
+that path against a real socket.
 
 ## Running it
 
@@ -73,8 +120,9 @@ curl -s -X POST http://127.0.0.1:8443/v1/authorize `
 | Endpoint | Purpose |
 |---|---|
 | `POST /v1/svid/jwt` | Issue a JWT SVID: `{workload_name, audience, bootstrap_token}` -> `{token, expires_at}`. |
+| `POST /v1/svid/x509` | Issue an X.509 SVID from a CSR: `{workload_name, csr_pem, bootstrap_token}` -> `{cert_pem, expires_at}`. `501` if this gateway holds no CA signing key (verify-only mode). |
 | `POST /v1/authorize` | Ask "is this allowed?" directly (ext_authz-style): `{destination, obo_token?, caller_chain?}` -> `{allow, deny_reason}`. |
-| `ANY /*` | The reverse proxy. Requires `X-SPIFFE-OBO-Token`; forwards to `upstream_addr` on allow, `403` with `{deny_reason}` on deny. |
+| `ANY /*` | The reverse proxy. Requires `X-SPIFFE-OBO-Token` (or, with mTLS, an allow-listed client cert); forwards to `upstream_addr` on allow, `403` with `{deny_reason}` on deny. |
 
 ## Build & test
 

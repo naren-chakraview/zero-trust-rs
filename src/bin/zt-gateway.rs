@@ -1,13 +1,16 @@
-//! The zt-gateway service: issues JWT SVIDs, exposes an `ext_authz`-style
-//! decision API, and reverse-proxies traffic to a protected backend
-//! application, denying anything that fails `zero_trust::validate`.
+//! The zt-gateway service: issues JWT SVIDs and X.509 SVIDs, exposes an
+//! `ext_authz`-style decision API, and reverse-proxies traffic to a
+//! protected backend application, denying anything that fails
+//! `zero_trust::validate`.
 //!
-//! v0.1 limitation (see the plan doc / README): this serves plain HTTP,
-//! not mTLS. Caller identity comes entirely from the presented
-//! `X-SPIFFE-OBO-Token` — there is no independently-verified transport
-//! identity, so `ValidationRequest::source_principal` is always `None`
-//! here. See `obo::validate`'s doc comment for what that does and doesn't
-//! check as a result.
+//! When TLS is configured with `client_auth: optional` or `required` (see
+//! `GatewayConfig::tls`), a verified client certificate's SPIFFE ID becomes
+//! `ValidationRequest::source_principal` — extracted once per connection
+//! right after the TLS handshake (see `serve()`/`extract_peer_identity`)
+//! and threaded into every request on that connection via `axum::Extension`.
+//! With `client_auth: none` (or no `tls:` block at all), it's always
+//! `None`, same as v0.1. See `obo::validate`'s doc comment for exactly what
+//! that does and doesn't enable.
 
 use std::sync::Arc;
 
@@ -16,12 +19,18 @@ use axum::extract::{Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
-use axum::{Json, Router};
+use axum::{Extension, Json, Router};
+use hyper_util::rt::TokioIo;
+use hyper_util::service::TowerToHyperService;
 use serde::{Deserialize, Serialize};
+use tokio::net::TcpListener;
+use tokio_rustls::TlsAcceptor;
 
 use zero_trust::{
-    now_unix_secs, validate, Decision, GatewayConfig, IdentityError, IdentityProvider,
-    LocalIssuer, Registry, SpiffeId, ValidationRequest, HEADER_CALLER_CHAIN, HEADER_OBO_TOKEN,
+    build_client_cert_verifier, build_server_config, load_certs, now_unix_secs, validate, CaError,
+    CertificateAuthority, ClientAuth, Decision, GatewayConfig, IdentityError, IdentityProvider,
+    LocalCa, LocalIssuer, Registry, ServerCertificate, SpiffeId, ValidationRequest,
+    HEADER_CALLER_CHAIN, HEADER_OBO_TOKEN,
 };
 
 /// Everything a request handler needs, cheap to clone (every field is an
@@ -30,6 +39,11 @@ use zero_trust::{
 #[derive(Clone)]
 struct AppState {
     identity: Arc<dyn IdentityProvider + Send + Sync>,
+    /// `None` whenever this gateway isn't configured to issue X.509 SVIDs
+    /// itself — either no `ca:` block at all, or a verify-only setup
+    /// (`ca.cert_path` without `ca.key_path`). `POST /v1/svid/x509` returns
+    /// `501` in that case rather than this field ever being unwrap()'d.
+    ca: Option<Arc<dyn CertificateAuthority + Send + Sync>>,
     registry: Arc<Registry>,
     http_client: reqwest::Client,
     upstream_addr: String,
@@ -64,8 +78,47 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     };
 
+    let ca = resolve_ca(&config, &registry)?;
+
+    let tls_acceptor = match &config.tls {
+        Some(tls_config) => {
+            let server_cert = match (&tls_config.cert_path, &tls_config.key_path) {
+                (Some(cert_path), Some(key_path)) => ServerCertificate::load(cert_path, key_path)?,
+                (None, None) => {
+                    tracing::warn!(
+                        "no tls.cert_path/key_path configured — generating an ephemeral \
+                         self-signed server certificate; not for anything a real client \
+                         should be asked to trust long-term"
+                    );
+                    ServerCertificate::generate_ephemeral(vec![
+                        "localhost".to_string(),
+                        "127.0.0.1".to_string(),
+                    ])?
+                }
+                _ => return Err("tls.cert_path and tls.key_path must both be set, or both omitted".into()),
+            };
+
+            let client_cert_verifier = match tls_config.client_auth {
+                ClientAuth::None => None,
+                ClientAuth::Optional | ClientAuth::Required => {
+                    let trust_root_der = resolve_trust_root_der(&config, &ca)?.ok_or(
+                        "tls.client_auth is enabled but no CA trust root could be resolved \
+                         (set ca.cert_path or ca.key_path)",
+                    )?;
+                    let allow_unauthenticated = tls_config.client_auth == ClientAuth::Optional;
+                    Some(build_client_cert_verifier(&trust_root_der, allow_unauthenticated)?)
+                }
+            };
+
+            let server_config = build_server_config(server_cert, client_cert_verifier)?;
+            Some(TlsAcceptor::from(Arc::new(server_config)))
+        }
+        None => None,
+    };
+
     let state = AppState {
         identity: Arc::new(issuer),
+        ca,
         registry: Arc::new(registry),
         http_client: reqwest::Client::new(),
         upstream_addr: config.upstream_addr.clone(),
@@ -73,9 +126,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
 
     let router = build_router(state);
-    let listener = tokio::net::TcpListener::bind(&config.listen_addr).await?;
-    tracing::info!(addr = %config.listen_addr, upstream = %config.upstream_addr, "zt-gateway listening");
-    axum::serve(listener, router).await?;
+    let listener = TcpListener::bind(&config.listen_addr).await?;
+    tracing::info!(
+        addr = %config.listen_addr,
+        upstream = %config.upstream_addr,
+        tls = tls_acceptor.is_some(),
+        "zt-gateway listening"
+    );
+    serve(listener, router, tls_acceptor).await;
 
     Ok(())
 }
@@ -83,9 +141,155 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/v1/svid/jwt", post(issue_svid))
+        .route("/v1/svid/x509", post(issue_x509_svid))
         .route("/v1/authorize", post(authorize))
         .fallback(proxy_handler)
         .with_state(state)
+}
+
+/// Decides whether (and how) this gateway can issue X.509 SVIDs, per the
+/// "Trust root vs. issuance capability" split in
+/// `docs/design/0001-tls-mtls-termination.md`:
+///
+/// - `ca.cert_path` + `ca.key_path` both set → self-issuing: load and use them.
+/// - `ca.cert_path` set, `ca.key_path` absent → verify-only: no `LocalCa` at all.
+/// - Neither set, but `tls.client_auth != None` → dev convenience: generate
+///   an ephemeral CA.
+/// - Otherwise: no CA needed, `POST /v1/svid/x509` will always 501.
+fn resolve_ca(
+    config: &GatewayConfig,
+    registry: &Registry,
+) -> Result<Option<Arc<dyn CertificateAuthority + Send + Sync>>, Box<dyn std::error::Error>> {
+    if let Some(ca_config) = &config.ca {
+        match (&ca_config.cert_path, &ca_config.key_path) {
+            (Some(cert_path), Some(key_path)) => {
+                let ca = LocalCa::load(registry.clone(), cert_path, key_path, ca_config.ttl_seconds)?;
+                return Ok(Some(Arc::new(ca)));
+            }
+            (Some(_), None) => {
+                tracing::info!(
+                    "ca.cert_path configured without ca.key_path — verify-only mode; \
+                     POST /v1/svid/x509 will return 501"
+                );
+                return Ok(None);
+            }
+            (None, _) => {} // fall through to the ephemeral-dev-CA check below
+        }
+    }
+
+    let client_auth_enabled = matches!(
+        config.tls.as_ref().map(|tls| tls.client_auth),
+        Some(ClientAuth::Optional) | Some(ClientAuth::Required)
+    );
+    if client_auth_enabled {
+        tracing::warn!(
+            "client_auth is enabled but no ca.cert_path is configured — generating an \
+             ephemeral CA; not for anything a real client should trust long-term"
+        );
+        let ttl_seconds = config.ca.as_ref().map(|c| c.ttl_seconds).unwrap_or(3600);
+        let ca = LocalCa::generate(registry.clone(), ttl_seconds)?;
+        return Ok(Some(Arc::new(ca)));
+    }
+
+    Ok(None)
+}
+
+/// Resolves which CA cert to trust when verifying a presented client
+/// certificate — independent of whether *this* gateway can also issue
+/// (`ca`, from [`resolve_ca`]). If `ca` holds an issuer, its own root is
+/// the trust root (self-issuing or ephemeral-dev cases). Otherwise, in
+/// verify-only mode, the trust root is read directly from `ca.cert_path`.
+fn resolve_trust_root_der(
+    config: &GatewayConfig,
+    ca: &Option<Arc<dyn CertificateAuthority + Send + Sync>>,
+) -> Result<Option<Vec<u8>>, Box<dyn std::error::Error>> {
+    if let Some(ca) = ca {
+        return Ok(Some(ca.root_cert_der().to_vec()));
+    }
+    if let Some(cert_path) = config.ca.as_ref().and_then(|c| c.cert_path.as_ref()) {
+        let certs = load_certs(cert_path)?;
+        return Ok(certs.first().map(|cert| cert.to_vec()));
+    }
+    Ok(None)
+}
+
+/// A connection's verified client-certificate identity, if any. Always
+/// present as a request extension (see `serve()`) regardless of whether
+/// TLS or client auth is in use at all — `None` in every case where there
+/// isn't a verified identity, so handlers never need to distinguish
+/// "no TLS," "TLS but no client cert," and "client cert with no SPIFFE
+/// SAN" — they all just mean "no source_principal."
+#[derive(Clone)]
+struct PeerIdentity(Option<SpiffeId>);
+
+/// Pulls the verified peer certificate's SPIFFE ID (a URI SAN entry) out of
+/// a just-completed TLS handshake, if the caller presented one.
+fn extract_peer_identity(tls_stream: &tokio_rustls::server::TlsStream<tokio::net::TcpStream>) -> PeerIdentity {
+    let (_io, connection) = tls_stream.get_ref();
+    let spiffe_id = connection
+        .peer_certificates()
+        .and_then(|certs| certs.first())
+        .and_then(|cert| extract_spiffe_id_from_der(cert));
+    PeerIdentity(spiffe_id)
+}
+
+fn extract_spiffe_id_from_der(der: &[u8]) -> Option<SpiffeId> {
+    let (_remainder, cert) = x509_parser::parse_x509_certificate(der).ok()?;
+    let san = cert.subject_alternative_name().ok()??;
+    san.value.general_names.iter().find_map(|name| match name {
+        x509_parser::extensions::GeneralName::URI(uri) => uri.parse::<SpiffeId>().ok(),
+        _ => None,
+    })
+}
+
+/// Accepts raw TCP connections, optionally terminates TLS on each one, and
+/// serves the same `Router` behind it either way — with that connection's
+/// [`PeerIdentity`] (verified client cert, or `None`) attached to every
+/// request via `axum::Extension`. Written by hand (rather than
+/// `axum::serve`) specifically so this extraction has direct access to the
+/// TLS connection object right after the handshake, instead of going
+/// through axum's `Connected`/`ConnectInfo` machinery for `MakeService`.
+async fn serve(listener: TcpListener, router: Router, tls_acceptor: Option<TlsAcceptor>) {
+    loop {
+        let (stream, remote_addr) = match listener.accept().await {
+            Ok(pair) => pair,
+            Err(error) => {
+                tracing::warn!(%error, "failed to accept connection");
+                continue;
+            }
+        };
+
+        let router = router.clone();
+        let tls_acceptor = tls_acceptor.clone();
+
+        tokio::spawn(async move {
+            let result = match tls_acceptor {
+                Some(acceptor) => match acceptor.accept(stream).await {
+                    Ok(tls_stream) => {
+                        let peer_identity = extract_peer_identity(&tls_stream);
+                        let hyper_service = TowerToHyperService::new(router.layer(Extension(peer_identity)));
+                        hyper::server::conn::http1::Builder::new()
+                            .serve_connection(TokioIo::new(tls_stream), hyper_service)
+                            .await
+                    }
+                    Err(error) => {
+                        tracing::debug!(%error, %remote_addr, "TLS handshake failed");
+                        return;
+                    }
+                },
+                None => {
+                    let hyper_service = TowerToHyperService::new(router.layer(Extension(PeerIdentity(None))));
+                    hyper::server::conn::http1::Builder::new()
+                        .serve_connection(TokioIo::new(stream), hyper_service)
+                        .await
+                }
+            };
+
+            if let Err(error) = result {
+                tracing::debug!(%error, %remote_addr, "connection error");
+            }
+        });
+    }
 }
 
 #[derive(Serialize)]
@@ -135,6 +339,48 @@ async fn issue_svid(State(state): State<AppState>, Json(req): Json<IssueRequest>
     }
 }
 
+// --- POST /v1/svid/x509 ---
+
+#[derive(Deserialize)]
+struct IssueX509Request {
+    workload_name: String,
+    bootstrap_token: String,
+    csr_pem: String,
+}
+
+#[derive(Serialize)]
+struct IssueX509Response {
+    cert_pem: String,
+    expires_at: i64,
+}
+
+async fn issue_x509_svid(State(state): State<AppState>, Json(req): Json<IssueX509Request>) -> Response {
+    let Some(ca) = &state.ca else {
+        return error_response(
+            StatusCode::NOT_IMPLEMENTED,
+            "this gateway does not hold CA signing key material; obtain X.509 SVIDs from your organization's CA",
+        );
+    };
+
+    match ca.sign_csr(&req.workload_name, &req.csr_pem, &req.bootstrap_token) {
+        Ok(signed) => (
+            StatusCode::OK,
+            Json(IssueX509Response {
+                cert_pem: signed.cert_pem,
+                expires_at: signed.expires_at,
+            }),
+        )
+            .into_response(),
+        Err(CaError::UnknownWorkload(name)) => {
+            error_response(StatusCode::NOT_FOUND, format!("unknown workload: {name}"))
+        }
+        Err(CaError::InvalidBootstrapToken) => error_response(StatusCode::UNAUTHORIZED, "invalid bootstrap token"),
+        Err(e @ CaError::SanMismatch { .. }) => error_response(StatusCode::FORBIDDEN, e.to_string()),
+        Err(e @ CaError::MalformedCsr(_)) => error_response(StatusCode::BAD_REQUEST, e.to_string()),
+        Err(e) => error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string()),
+    }
+}
+
 // --- POST /v1/authorize ---
 
 #[derive(Deserialize)]
@@ -150,14 +396,19 @@ struct AuthorizeResponse {
     deny_reason: String,
 }
 
-async fn authorize(State(state): State<AppState>, Json(req): Json<AuthorizeRequest>) -> Response {
+async fn authorize(
+    State(state): State<AppState>,
+    peer_identity: Option<Extension<PeerIdentity>>,
+    Json(req): Json<AuthorizeRequest>,
+) -> Response {
     let Ok(destination) = req.destination.parse::<SpiffeId>() else {
         return error_response(StatusCode::BAD_REQUEST, "destination is not a valid SPIFFE ID");
     };
+    let source_principal = peer_identity.and_then(|Extension(PeerIdentity(id))| id);
 
     let request = ValidationRequest {
         destination: &destination,
-        source_principal: None,
+        source_principal: source_principal.as_ref(),
         obo_token: req.obo_token.as_deref(),
         caller_chain: req.caller_chain.as_deref(),
     };
@@ -184,13 +435,18 @@ fn header_str(headers: &HeaderMap, name: &str) -> Option<String> {
     headers.get(name)?.to_str().ok().map(str::to_string)
 }
 
-async fn proxy_handler(State(state): State<AppState>, req: Request) -> Response {
+async fn proxy_handler(
+    State(state): State<AppState>,
+    peer_identity: Option<Extension<PeerIdentity>>,
+    req: Request,
+) -> Response {
+    let source_principal = peer_identity.and_then(|Extension(PeerIdentity(id))| id);
     let obo_token = header_str(req.headers(), HEADER_OBO_TOKEN);
     let caller_chain = header_str(req.headers(), HEADER_CALLER_CHAIN);
 
     let request = ValidationRequest {
         destination: &state.protected_workload,
-        source_principal: None,
+        source_principal: source_principal.as_ref(),
         obo_token: obo_token.as_deref(),
         caller_chain: caller_chain.as_deref(),
     };
@@ -203,6 +459,7 @@ async fn proxy_handler(State(state): State<AppState>, req: Request) -> Response 
     tracing::info!(
         allow = decision.is_allow(),
         destination = %state.protected_workload,
+        source_principal = source_principal.as_ref().map(|id| id.to_string()),
         obo_present = obo_token.is_some(),
         obo_chain = caller_chain.as_deref().unwrap_or(""),
         deny_reason = decision.deny_reason_str(),
@@ -288,6 +545,7 @@ mod tests {
     const TRUST_DOMAIN: &str = "chakra.internal";
     const INVENTORY: &str = "spiffe://chakra.internal/ns/inventory/sa/inventory-svc";
     const ORDERS: &str = "spiffe://chakra.internal/ns/orders/sa/orders-svc";
+    const API_GATEWAY: &str = "spiffe://chakra.internal/ns/api-gateway/sa/api-gateway";
 
     fn test_registry() -> Registry {
         Registry::from_yaml_str(&format!(
@@ -305,6 +563,12 @@ workloads:
     max_obo_chain_depth: 3
     allowed_callers: []
     bootstrap_token: orders-secret
+
+  - name: api-gateway
+    spiffe_id: {API_GATEWAY}
+    max_obo_chain_depth: 1
+    allowed_callers: []
+    bootstrap_token: api-gateway-secret
 "#
         ))
         .unwrap()
@@ -315,6 +579,7 @@ workloads:
         let issuer = LocalIssuer::generate(registry.clone(), 300).unwrap();
         AppState {
             identity: Arc::new(issuer),
+            ca: None,
             registry: Arc::new(registry),
             http_client: reqwest::Client::new(),
             upstream_addr,
@@ -379,6 +644,58 @@ workloads:
 
         let response = router.oneshot(request).await.unwrap();
         assert_eq!(response.status(), SC::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn issue_x509_svid_returns_501_when_no_ca_is_configured() {
+        // test_state()'s ca field is None by construction.
+        let state = test_state("http://unused.invalid".to_string());
+        let router = build_router(state);
+
+        let body = r#"{"workload_name":"orders-svc","bootstrap_token":"orders-secret","csr_pem":"irrelevant"}"#;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/svid/x509")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), SC::NOT_IMPLEMENTED);
+    }
+
+    #[tokio::test]
+    async fn issue_x509_svid_returns_a_cert_for_correct_credentials() {
+        use rcgen::{CertificateParams, KeyPair, SanType};
+
+        let mut state = test_state("http://unused.invalid".to_string());
+        let ca = zero_trust::LocalCa::generate(test_registry(), 3600).unwrap();
+        state.ca = Some(Arc::new(ca));
+        let router = build_router(state);
+
+        let key_pair = KeyPair::generate().unwrap();
+        let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.subject_alt_names = vec![SanType::URI(ORDERS.try_into().unwrap())];
+        let csr_pem = params.serialize_request(&key_pair).unwrap().pem().unwrap();
+
+        let body = serde_json::json!({
+            "workload_name": "orders-svc",
+            "bootstrap_token": "orders-secret",
+            "csr_pem": csr_pem,
+        })
+        .to_string();
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/svid/x509")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), SC::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert!(parsed["cert_pem"].as_str().unwrap().contains("BEGIN CERTIFICATE"));
     }
 
     #[tokio::test]
@@ -476,5 +793,251 @@ workloads:
         let response = router.oneshot(request).await.unwrap();
         assert_eq!(response.status(), SC::FORBIDDEN);
         assert_eq!(hits.load(Ordering::SeqCst), 0);
+    }
+
+    /// The one test in this project that can't use `tower::oneshot`: TLS is
+    /// part of the transport `serve()` wraps around the `Router`, not part
+    /// of the `Router`/handler logic itself, so proving it works requires a
+    /// real socket and a real TLS handshake on both ends.
+    #[tokio::test]
+    async fn tls_handshake_succeeds_and_the_proxy_still_denies_without_a_token() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let state = test_state("http://unused.invalid".to_string());
+        let router = build_router(state);
+
+        let server_cert =
+            ServerCertificate::generate_ephemeral(vec!["localhost".to_string()]).unwrap();
+        let trusted_der = server_cert.cert_chain[0].clone();
+        let server_config = build_server_config(server_cert, None).unwrap();
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve(listener, router, Some(acceptor)));
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(trusted_der).unwrap();
+        let client_config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let mut tls_stream = connector.connect(server_name, tcp).await.unwrap();
+
+        tls_stream
+            .write_all(b"GET /some/path HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = Vec::new();
+        tls_stream.read_to_end(&mut response).await.unwrap();
+        let response_text = String::from_utf8_lossy(&response);
+
+        // The TLS handshake succeeded (we got an HTTP response at all) and
+        // the request — no X-SPIFFE-OBO-Token — was still denied by the
+        // same obo::validate call the plain-HTTP tests exercise.
+        assert!(response_text.starts_with("HTTP/1.1 403"), "got: {response_text}");
+    }
+
+    /// Builds a client keypair + CSR for `spiffe_id`, has `ca` sign it
+    /// (authenticating as `workload_name` via `bootstrap_token`, exactly
+    /// the way a real workload would call `POST /v1/svid/x509`), and
+    /// returns the signed cert + private key ready to hand to a `rustls`
+    /// client config.
+    fn build_client_cert(
+        ca: &LocalCa,
+        workload_name: &str,
+        spiffe_id: &str,
+        bootstrap_token: &str,
+    ) -> (rustls::pki_types::CertificateDer<'static>, rustls::pki_types::PrivateKeyDer<'static>) {
+        let key_pair = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.subject_alt_names = vec![rcgen::SanType::URI(spiffe_id.try_into().unwrap())];
+        let csr_pem = params.serialize_request(&key_pair).unwrap().pem().unwrap();
+        let signed = ca.sign_csr(workload_name, &csr_pem, bootstrap_token).unwrap();
+
+        let mut reader = std::io::BufReader::new(signed.cert_pem.as_bytes());
+        let cert_der = rustls_pemfile::certs(&mut reader).next().unwrap().unwrap();
+        let key_der = rustls::pki_types::PrivateKeyDer::Pkcs8(rustls::pki_types::PrivatePkcs8KeyDer::from(
+            key_pair.serialize_der(),
+        ));
+
+        (cert_der, key_der)
+    }
+
+    /// Spawns a real TLS-terminating `zt-gateway` instance (mTLS trust root
+    /// = `ca.root_cert_der()`) and returns its address plus its own server
+    /// certificate DER (for the test client to trust).
+    async fn spawn_mtls_server(
+        registry: Registry,
+        issuer: LocalIssuer,
+        ca: &LocalCa,
+        protected_workload: &str,
+        client_auth: ClientAuth,
+        upstream_addr: String,
+    ) -> (String, rustls::pki_types::CertificateDer<'static>) {
+        let mut state = test_state(upstream_addr);
+        state.registry = Arc::new(registry);
+        state.identity = Arc::new(issuer);
+        state.protected_workload = Arc::new(protected_workload.parse().unwrap());
+        let router = build_router(state);
+
+        let server_cert = ServerCertificate::generate_ephemeral(vec!["localhost".to_string()]).unwrap();
+        let server_cert_der = server_cert.cert_chain[0].clone();
+
+        let allow_unauthenticated = client_auth == ClientAuth::Optional;
+        let verifier = build_client_cert_verifier(ca.root_cert_der(), allow_unauthenticated).unwrap();
+        let server_config = build_server_config(server_cert, Some(verifier)).unwrap();
+        let acceptor = TlsAcceptor::from(Arc::new(server_config));
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(serve(listener, router, Some(acceptor)));
+
+        (addr.to_string(), server_cert_der)
+    }
+
+    /// Connects over TLS (optionally presenting a client cert), sends one
+    /// raw HTTP/1.1 GET carrying `obo_token`, and returns the raw response
+    /// text.
+    async fn send_request_over_tls(
+        addr: &str,
+        trusted_server_cert: rustls::pki_types::CertificateDer<'static>,
+        client_identity: Option<(rustls::pki_types::CertificateDer<'static>, rustls::pki_types::PrivateKeyDer<'static>)>,
+        obo_token: &str,
+    ) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(trusted_server_cert).unwrap();
+
+        let builder = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots);
+
+        let client_config = match client_identity {
+            Some((cert, key)) => builder.with_client_auth_cert(vec![cert], key).unwrap(),
+            None => builder.with_no_client_auth(),
+        };
+
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let mut tls_stream = connector.connect(server_name, tcp).await.unwrap();
+
+        let request = format!(
+            "GET /some/path HTTP/1.1\r\nHost: localhost\r\n{HEADER_OBO_TOKEN}: {obo_token}\r\nConnection: close\r\n\r\n"
+        );
+        tls_stream.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        tls_stream.read_to_end(&mut response).await.unwrap();
+        String::from_utf8_lossy(&response).to_string()
+    }
+
+    #[tokio::test]
+    async fn mtls_client_cert_matching_obo_subject_is_allowed() {
+        let registry = test_registry();
+        let ca = LocalCa::generate(registry.clone(), 3600).unwrap();
+        let issuer = LocalIssuer::generate(registry.clone(), 300).unwrap();
+        let token = issuer.issue_jwt_svid("orders-svc", INVENTORY, "orders-secret").unwrap();
+        let (upstream_addr, hits) = spawn_test_upstream("hello from upstream").await;
+
+        let (addr, server_cert_der) =
+            spawn_mtls_server(registry, issuer, &ca, INVENTORY, ClientAuth::Optional, upstream_addr).await;
+        let (client_cert, client_key) = build_client_cert(&ca, "orders-svc", ORDERS, "orders-secret");
+
+        let response = send_request_over_tls(&addr, server_cert_der, Some((client_cert, client_key)), &token.token).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "got: {response}");
+        assert!(response.contains("hello from upstream"), "got: {response}");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn mtls_client_cert_mismatched_with_obo_subject_is_denied() {
+        let registry = test_registry();
+        let ca = LocalCa::generate(registry.clone(), 3600).unwrap();
+        let issuer = LocalIssuer::generate(registry.clone(), 300).unwrap();
+        // The OBO token claims to be from orders-svc...
+        let token = issuer.issue_jwt_svid("orders-svc", INVENTORY, "orders-secret").unwrap();
+
+        let (addr, server_cert_der) = spawn_mtls_server(
+            registry,
+            issuer,
+            &ca,
+            INVENTORY,
+            ClientAuth::Optional,
+            "http://unused.invalid".to_string(),
+        )
+        .await;
+        // ...but the TLS client cert presented is api-gateway's. Both are
+        // legitimately CA-issued — only the mismatch between "who the
+        // channel says you are" and "who the token says you are" should be
+        // rejected. This is `obo::validate`'s impersonation check, exercised
+        // end-to-end for the first time (it's only ever been unit-tested
+        // with a directly-constructed `ValidationRequest` before now).
+        let (client_cert, client_key) = build_client_cert(&ca, "api-gateway", API_GATEWAY, "api-gateway-secret");
+
+        let response = send_request_over_tls(&addr, server_cert_der, Some((client_cert, client_key)), &token.token).await;
+        assert!(response.starts_with("HTTP/1.1 403"), "got: {response}");
+        assert!(response.contains("obo_token_subject_mismatch"), "got: {response}");
+    }
+
+    #[tokio::test]
+    async fn mtls_required_rejects_the_handshake_without_a_client_cert() {
+        let registry = test_registry();
+        let ca = LocalCa::generate(registry.clone(), 3600).unwrap();
+        let issuer = LocalIssuer::generate(registry.clone(), 300).unwrap();
+
+        let (addr, server_cert_der) = spawn_mtls_server(
+            registry,
+            issuer,
+            &ca,
+            INVENTORY,
+            ClientAuth::Required,
+            "http://unused.invalid".to_string(),
+        )
+        .await;
+
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(server_cert_der).unwrap();
+        let client_config = rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(client_config));
+
+        let tcp = tokio::net::TcpStream::connect(&addr).await.unwrap();
+        let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+
+        // Whether the rejection surfaces at `connect()` itself or only once
+        // we try to actually use the connection depends on exactly when the
+        // client observes the server's fatal alert — both are valid places
+        // for a TLS stack to report "the server would not accept this
+        // connection," so this test accepts either rather than assuming one.
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        match connector.connect(server_name, tcp).await {
+            Err(_) => {}
+            Ok(mut tls_stream) => {
+                let write_result = tls_stream
+                    .write_all(b"GET /some/path HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+                    .await;
+                let mut response = Vec::new();
+                let read_result = tls_stream.read_to_end(&mut response).await;
+
+                assert!(
+                    write_result.is_err() || read_result.is_err() || response.is_empty(),
+                    "expected the connection to be rejected somewhere; got: {}",
+                    String::from_utf8_lossy(&response)
+                );
+            }
+        }
     }
 }

@@ -1,0 +1,53 @@
+# Adapted from spiffe/spire-tutorials k8s/quickstart/server-cluster-role.yaml,
+# namespace changed to zero-trust-demo (all our demo resources live in one
+# namespace rather than a dedicated "spire" one).
+kind: Role
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: spire-server-configmap-role
+  namespace: zero-trust-demo
+rules:
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["patch", "get", "list"]
+---
+kind: RoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: spire-server-configmap-role-binding
+  namespace: zero-trust-demo
+subjects:
+  - kind: ServiceAccount
+    name: spire-server
+    namespace: zero-trust-demo
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: spire-server-configmap-role
+---
+# Lets the k8s_psat node attestor validate agents' projected service
+# account tokens against the TokenReview API.
+kind: ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: spire-server-trust-role
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "nodes"]
+    verbs: ["get"]
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
+---
+kind: ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: spire-server-trust-role-binding
+subjects:
+  - kind: ServiceAccount
+    name: spire-server
+    namespace: zero-trust-demo
+roleRef:
+  kind: ClusterRole
+  name: spire-server-trust-role
+  apiGroup: rbac.authorization.k8s.io

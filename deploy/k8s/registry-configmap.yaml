@@ -1,0 +1,40 @@
+# Same shape/content as tests/fixtures/registry.yaml, shared by all three
+# zt-gateway instances below. Bootstrap tokens in plaintext are fine for a
+# local kind demo; not for anything real (see README's v0.1 identity
+# limitations).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: zt-registry
+  namespace: zero-trust-demo
+data:
+  registry.yaml: |
+    trust_domain: chakra.internal
+
+    workloads:
+      - name: api-gateway
+        spiffe_id: spiffe://chakra.internal/ns/api-gateway/sa/api-gateway
+        namespace: api-gateway
+        service_account: api-gateway
+        max_obo_chain_depth: 1
+        allowed_callers: []
+        bootstrap_token: api-gateway-dev-secret
+
+      - name: orders-svc
+        spiffe_id: spiffe://chakra.internal/ns/orders/sa/orders-svc
+        namespace: orders
+        service_account: orders-svc
+        max_obo_chain_depth: 3
+        allowed_callers:
+          - spiffe://chakra.internal/ns/api-gateway/sa/api-gateway
+        bootstrap_token: orders-dev-secret
+
+      - name: inventory-svc
+        spiffe_id: spiffe://chakra.internal/ns/inventory/sa/inventory-svc
+        namespace: inventory
+        service_account: inventory-svc
+        max_obo_chain_depth: 3
+        allowed_callers:
+          - spiffe://chakra.internal/ns/orders/sa/orders-svc
+          - spiffe://chakra.internal/ns/api-gateway/sa/api-gateway
+        bootstrap_token: inventory-dev-secret

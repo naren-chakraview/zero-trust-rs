@@ -1,0 +1,69 @@
+# Adapted from spiffe/spire-tutorials k8s/quickstart/server-configmap.yaml:
+# trust_domain matches this project's chakra.internal (same as
+# tests/fixtures/registry.yaml), cluster name matches the kind cluster
+# ("zero-trust"), service_account_allow_list matches agent-account.yaml.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: spire-server
+  namespace: zero-trust-demo
+data:
+  server.conf: |
+    server {
+      bind_address = "0.0.0.0"
+      bind_port = "8081"
+      socket_path = "/tmp/spire-server/private/api.sock"
+      trust_domain = "chakra.internal"
+      data_dir = "/run/spire/data"
+      log_level = "DEBUG"
+      ca_key_type = "rsa-2048"
+
+      ca_subject = {
+        country = ["US"],
+        organization = ["chakra"],
+        common_name = "",
+      }
+    }
+
+    plugins {
+      DataStore "sql" {
+        plugin_data {
+          database_type = "sqlite3"
+          connection_string = "/run/spire/data/datastore.sqlite3"
+        }
+      }
+
+      NodeAttestor "k8s_psat" {
+        plugin_data {
+          clusters = {
+            "zero-trust" = {
+              service_account_allow_list = ["zero-trust-demo:spire-agent"]
+            }
+          }
+        }
+      }
+
+      KeyManager "disk" {
+        plugin_data {
+          keys_path = "/run/spire/data/keys.json"
+        }
+      }
+
+      Notifier "k8sbundle" {
+        plugin_data {
+          # Defaults to namespace "spire"/configmap "spire-bundle" if
+          # unset -- must be set explicitly since we don't use the
+          # original quickstart's dedicated "spire" namespace.
+          namespace = "zero-trust-demo"
+          config_map = "spire-bundle"
+        }
+      }
+    }
+
+    health_checks {
+      listener_enabled = true
+      bind_address = "0.0.0.0"
+      bind_port = "8080"
+      live_path = "/live"
+      ready_path = "/ready"
+    }

@@ -1,0 +1,8 @@
+# Created empty; the server's k8sbundle Notifier plugin populates the
+# `bundle.crt` key once it starts and generates its self-signed CA (needs
+# the RoleBinding in server-cluster-role.yaml to patch this).
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: spire-bundle
+  namespace: zero-trust-demo

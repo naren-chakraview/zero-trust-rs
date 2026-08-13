@@ -1,0 +1,44 @@
+# A throwaway pod purely for proving SVID issuance works (Phase 4's
+# verification target). None of the real demo services (api-gateway,
+# orders-svc, inventory-svc) mount the SPIRE agent socket or have the
+# spire-agent CLI available.
+#
+# The spire-agent image is minimal (no shell/coreutils -- no `sleep` to
+# idle on), so rather than keep a long-lived pod open for `kubectl exec`,
+# this pod's command *is* the fetch itself: it runs once, and the result
+# is read back via `kubectl logs`.
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: spire-debug-client
+  namespace: zero-trust-demo
+---
+apiVersion: v1
+kind: Pod
+metadata:
+  name: spire-debug-client
+  namespace: zero-trust-demo
+  labels:
+    app: spire-debug-client
+spec:
+  serviceAccountName: spire-debug-client
+  restartPolicy: Never
+  containers:
+    - name: spire-agent-cli
+      image: ghcr.io/spiffe/spire-agent:1.11.2
+      command:
+        - /opt/spire/bin/spire-agent
+        - api
+        - fetch
+        - x509
+        - -socketPath
+        - /run/spire/sockets/agent.sock
+      volumeMounts:
+        - name: spire-agent-socket
+          mountPath: /run/spire/sockets
+          readOnly: true
+  volumes:
+    - name: spire-agent-socket
+      hostPath:
+        path: /run/spire/sockets
+        type: DirectoryOrCreate

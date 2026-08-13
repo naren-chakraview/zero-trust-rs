@@ -1,0 +1,78 @@
+# orders-svc: the middle hop (api-gateway -> orders-svc -> inventory-svc).
+# Same same-pod topology as inventory-svc.yaml.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: zt-gateway-config-orders-svc
+  namespace: zero-trust-demo
+data:
+  gateway.config.yaml: |
+    listen_addr: 0.0.0.0:8443
+    upstream_addr: http://127.0.0.1:8080
+    registry_path: /etc/zt-gateway/registry.yaml
+    protected_workload: spiffe://chakra.internal/ns/orders/sa/orders-svc
+    token_ttl_seconds: 300
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: orders-svc
+  namespace: zero-trust-demo
+  labels:
+    app: orders-svc
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: orders-svc
+  template:
+    metadata:
+      labels:
+        app: orders-svc
+    spec:
+      containers:
+        - name: backend
+          image: hashicorp/http-echo:latest
+          args:
+            - -listen=127.0.0.1:8080
+            - -text=hello from orders-svc
+
+        - name: zt-gateway
+          image: zero-trust/zt-gateway:dev
+          imagePullPolicy: Never
+          env:
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://otel-collector:4318
+            - name: RUST_LOG
+              value: info
+          args:
+            - /etc/zt-gateway/gateway.config.yaml
+          ports:
+            - containerPort: 8443
+          volumeMounts:
+            - name: registry
+              mountPath: /etc/zt-gateway/registry.yaml
+              subPath: registry.yaml
+            - name: gateway-config
+              mountPath: /etc/zt-gateway/gateway.config.yaml
+              subPath: gateway.config.yaml
+      volumes:
+        - name: registry
+          configMap:
+            name: zt-registry
+        - name: gateway-config
+          configMap:
+            name: zt-gateway-config-orders-svc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: orders-svc
+  namespace: zero-trust-demo
+spec:
+  selector:
+    app: orders-svc
+  ports:
+    - name: https
+      port: 8443
+      targetPort: 8443

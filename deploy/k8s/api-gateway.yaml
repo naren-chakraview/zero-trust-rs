@@ -1,0 +1,79 @@
+# api-gateway: the ingress hop (api-gateway -> orders-svc -> inventory-svc).
+# max_obo_chain_depth: 1 for this workload (see registry-configmap.yaml) --
+# it's the entry point and does not itself delegate further.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: zt-gateway-config-api-gateway
+  namespace: zero-trust-demo
+data:
+  gateway.config.yaml: |
+    listen_addr: 0.0.0.0:8443
+    upstream_addr: http://127.0.0.1:8080
+    registry_path: /etc/zt-gateway/registry.yaml
+    protected_workload: spiffe://chakra.internal/ns/api-gateway/sa/api-gateway
+    token_ttl_seconds: 300
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: api-gateway
+  namespace: zero-trust-demo
+  labels:
+    app: api-gateway
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: api-gateway
+  template:
+    metadata:
+      labels:
+        app: api-gateway
+    spec:
+      containers:
+        - name: backend
+          image: hashicorp/http-echo:latest
+          args:
+            - -listen=127.0.0.1:8080
+            - -text=hello from api-gateway
+
+        - name: zt-gateway
+          image: zero-trust/zt-gateway:dev
+          imagePullPolicy: Never
+          env:
+            - name: OTEL_EXPORTER_OTLP_ENDPOINT
+              value: http://otel-collector:4318
+            - name: RUST_LOG
+              value: info
+          args:
+            - /etc/zt-gateway/gateway.config.yaml
+          ports:
+            - containerPort: 8443
+          volumeMounts:
+            - name: registry
+              mountPath: /etc/zt-gateway/registry.yaml
+              subPath: registry.yaml
+            - name: gateway-config
+              mountPath: /etc/zt-gateway/gateway.config.yaml
+              subPath: gateway.config.yaml
+      volumes:
+        - name: registry
+          configMap:
+            name: zt-registry
+        - name: gateway-config
+          configMap:
+            name: zt-gateway-config-api-gateway
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: api-gateway
+  namespace: zero-trust-demo
+spec:
+  selector:
+    app: api-gateway
+  ports:
+    - name: https
+      port: 8443
+      targetPort: 8443

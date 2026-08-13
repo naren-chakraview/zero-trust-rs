@@ -22,15 +22,19 @@ use axum::routing::post;
 use axum::{Extension, Json, Router};
 use hyper_util::rt::TokioIo;
 use hyper_util::service::TowerToHyperService;
+use opentelemetry::trace::TracerProvider as _;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
+use tower_http::trace::TraceLayer;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
 
 use zero_trust::{
     build_client_cert_verifier, build_server_config, load_certs, now_unix_secs, validate, CaError,
     CertificateAuthority, ClientAuth, Decision, GatewayConfig, IdentityError, IdentityProvider,
     LocalCa, LocalIssuer, Registry, ServerCertificate, SpiffeId, ValidationRequest,
-    HEADER_CALLER_CHAIN, HEADER_OBO_TOKEN,
+    HEADER_CALLER_CHAIN, HEADER_OBO_TOKEN, HEADER_USER_PRINCIPAL,
 };
 
 /// Everything a request handler needs, cheap to clone (every field is an
@@ -50,11 +54,54 @@ struct AppState {
     protected_workload: Arc<SpiffeId>,
 }
 
+/// Sets up structured stdout logs (always) plus, when
+/// `OTEL_EXPORTER_OTLP_ENDPOINT` is set, real OTLP trace export (an
+/// `opentelemetry_sdk` `TracerProvider` bridged into `tracing` spans via
+/// `tracing-opentelemetry`). Returns the provider so `main` can keep it
+/// alive for the process lifetime — dropping it would tear down the batch
+/// exporter's background flush task.
+///
+/// Local `cargo run` with no OTLP endpoint configured behaves exactly as
+/// before: `Option<Layer>` is itself a no-op `Layer` when `None`, so the
+/// OTEL half of the pipeline simply isn't there.
+fn init_tracing() -> Option<opentelemetry_sdk::trace::TracerProvider> {
+    let otel_provider = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok().map(|_| {
+        let exporter = opentelemetry_otlp::SpanExporter::builder()
+            .with_http()
+            .build()
+            .expect("failed to build OTLP span exporter");
+
+        let resource = opentelemetry_sdk::Resource::new(vec![opentelemetry::KeyValue::new(
+            "service.name",
+            "zt-gateway",
+        )]);
+
+        let provider = opentelemetry_sdk::trace::TracerProvider::builder()
+            .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
+            .with_resource(resource)
+            .build();
+
+        opentelemetry::global::set_tracer_provider(provider.clone());
+        provider
+    });
+
+    let otel_layer = otel_provider
+        .as_ref()
+        .map(|provider| tracing_opentelemetry::layer().with_tracer(provider.tracer("zt-gateway")));
+
+    tracing_subscriber::registry()
+        .with(tracing_subscriber::EnvFilter::from_default_env())
+        .with(tracing_subscriber::fmt::layer())
+        .with(otel_layer)
+        .init();
+
+    otel_provider
+}
+
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
+    // Kept alive for the rest of `main` -- see `init_tracing`'s doc comment.
+    let _otel_provider = init_tracing();
 
     let config_path = std::env::args()
         .nth(1)
@@ -144,6 +191,7 @@ fn build_router(state: AppState) -> Router {
         .route("/v1/svid/x509", post(issue_x509_svid))
         .route("/v1/authorize", post(authorize))
         .fallback(proxy_handler)
+        .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
 
@@ -435,6 +483,25 @@ fn header_str(headers: &HeaderMap, name: &str) -> Option<String> {
     headers.get(name)?.to_str().ok().map(str::to_string)
 }
 
+// Field names deliberately match the blueprint's ADR-0008 OTEL span
+// attributes (`obo.caller_principal`, `obo.chain`, `obo.user_principal`,
+// `obo.token_ttl_seconds`) so traces from this project line up with what
+// the original blueprint's OTEL Collector pipeline expects. Declared as
+// `Empty` here (rather than just passed at the `tracing::info!` call site
+// below) because a `tracing` span's field set is fixed at creation time —
+// `Span::record` can only fill in a value for a field that was already
+// declared, never add a new one.
+#[tracing::instrument(
+    skip_all,
+    fields(
+        obo.caller_principal = tracing::field::Empty,
+        obo.chain = tracing::field::Empty,
+        obo.user_principal = tracing::field::Empty,
+        obo.token_ttl_seconds = tracing::field::Empty,
+        allow = tracing::field::Empty,
+        deny_reason = tracing::field::Empty,
+    )
+)]
 async fn proxy_handler(
     State(state): State<AppState>,
     peer_identity: Option<Extension<PeerIdentity>>,
@@ -443,6 +510,7 @@ async fn proxy_handler(
     let source_principal = peer_identity.and_then(|Extension(PeerIdentity(id))| id);
     let obo_token = header_str(req.headers(), HEADER_OBO_TOKEN);
     let caller_chain = header_str(req.headers(), HEADER_CALLER_CHAIN);
+    let user_principal = header_str(req.headers(), HEADER_USER_PRINCIPAL);
 
     let request = ValidationRequest {
         destination: &state.protected_workload,
@@ -452,10 +520,32 @@ async fn proxy_handler(
     };
     let decision = validate(&state.registry, state.identity.verifier(), &request, now_unix_secs());
 
+    let span = tracing::Span::current();
+    span.record("allow", decision.is_allow());
+    span.record("deny_reason", decision.deny_reason_str());
+    span.record("obo.chain", caller_chain.as_deref().unwrap_or(""));
+    if let Some(up) = &user_principal {
+        span.record("obo.user_principal", up.as_str());
+    }
+    // Only meaningful once the decision is Allow -- re-verifying the token
+    // here is purely to read its claims for tracing (obo::validate doesn't
+    // expose them), not a second authorization decision.
+    if decision.is_allow() {
+        if let Some(token) = obo_token.as_deref() {
+            if let Ok(claims) = state.identity.verifier().verify_signature(token) {
+                span.record("obo.caller_principal", claims.sub.as_str());
+                span.record("obo.token_ttl_seconds", claims.exp - now_unix_secs());
+            }
+        } else if let Some(sp) = &source_principal {
+            span.record("obo.caller_principal", sp.to_string().as_str());
+        }
+    }
+
     // Structured fields deliberately mirror the blueprint Rego policies'
     // decision_log shape (allow, destination, obo_present, obo_chain,
-    // deny_reason) so this log line could feed the same kind of
-    // audit/OTEL pipeline described in ADR-0008.
+    // deny_reason) -- kept as a plain log line alongside the span
+    // attributes above, since stdout logs and OTEL traces serve different
+    // consumers (grep/kubectl logs vs. a tracing UI).
     tracing::info!(
         allow = decision.is_allow(),
         destination = %state.protected_workload,

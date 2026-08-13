@@ -131,6 +131,42 @@ cargo build
 cargo test
 ```
 
+## Running the full ecosystem in Kubernetes (local `kind` cluster)
+
+`deploy/k8s/` deploys `zt-gateway` as a real multi-service ecosystem, next
+to the identity and observability infrastructure it's meant to sit
+alongside — `api-gateway` / `orders-svc` / `inventory-svc` (matching
+`tests/fixtures/registry.yaml`), each fronted by its own `zt-gateway`
+instance (blueprint Topology A: backend bound to `127.0.0.1` only inside
+the pod), a real OTEL Collector + Jaeger receiving live traces, and a real
+SPIRE server + agent issuing real SVIDs (infrastructure only — `zt-gateway`
+still uses its own `LocalIssuer`/`LocalCa`, not SPIRE, in this version).
+
+Requires `docker`, `kubectl`, and `kind` (see `scripts/install-k8s-tools.sh`
+if you need them). From a shell with those on `PATH`:
+
+```bash
+scripts/create-kind-cluster.sh       # once, creates the "zero-trust" cluster
+scripts/build-and-load-image.sh      # build the zt-gateway image, load into kind
+scripts/deploy-all.sh                # api-gateway, orders-svc, inventory-svc
+scripts/deploy-spire.sh              # SPIRE server + agent + a debug client pod
+scripts/register-spire-entries.sh    # register the node + debug-client entries
+kubectl apply -f deploy/k8s/jaeger.yaml -f deploy/k8s/otel-collector.yaml
+
+scripts/port-forward-all.sh          # gateways on :18443-18445, Jaeger UI on :16686
+scripts/verify-topology.sh           # allow-list / chain-depth checks against all 3
+scripts/demo-obo-chain.sh            # a live 3-hop OBO chain, then check Jaeger
+```
+
+Jaeger's UI (after port-forwarding) is at `http://127.0.0.1:16686` —
+spans from `zt-gateway` carry `obo.caller_principal`, `obo.chain`,
+`obo.token_ttl_seconds`, `allow`, and `deny_reason`, matching the
+blueprint's ADR-0008 field naming.
+
+To prove SPIRE is really issuing identities: `kubectl logs -n
+zero-trust-demo spire-debug-client` after `register-spire-entries.sh` shows
+a real signed X.509 SVID for `spiffe://chakra.internal/ns/zero-trust-demo/sa/spire-debug-client`.
+
 ## License
 
 Licensed under either of

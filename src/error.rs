@@ -46,6 +46,13 @@ pub enum JwtError {
     InvalidKey(String),
     #[error("token decode/signature error: {0}")]
     Decode(#[from] jsonwebtoken::errors::Error),
+    /// The token has no `kid` header, but the verifier holds more than one
+    /// registered key — there's no safe way to guess which one applies.
+    #[error("token header is missing 'kid', and multiple keys are registered")]
+    MissingKeyId,
+    /// The token's `kid` header doesn't match any key the verifier trusts.
+    #[error("no registered key matches kid '{0}'")]
+    UnknownKeyId(String),
 }
 
 /// Errors from JWT SVID issuance.
@@ -59,6 +66,14 @@ pub enum IdentityError {
     InvalidAudience(#[from] SpiffeIdError),
     #[error(transparent)]
     Jwt(#[from] JwtError),
+    /// [`crate::LocalIssuer::with_jwks`]'s `active_kid` doesn't match any
+    /// `kid` present in the supplied JWKS document.
+    #[error("active_kid '{0}' is not present in the supplied JWKS")]
+    InvalidKeyId(String),
+    /// The JWKS document passed to [`crate::LocalIssuer::with_jwks`] isn't
+    /// valid JSON, or doesn't match the expected `{"keys": [...]}` shape.
+    #[error("failed to parse JWKS document: {0}")]
+    InvalidJwks(String),
 }
 
 /// Errors from loading a [`crate::config::GatewayConfig`].

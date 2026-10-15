@@ -2,13 +2,42 @@
 //! is decided, kept separate from `obo.rs` (which only ever consumes
 //! already-issued tokens) and from the HTTP layer.
 
+use jsonwebtoken::DecodingKey;
 use rsa::pkcs1::{DecodeRsaPrivateKey, EncodeRsaPrivateKey, EncodeRsaPublicKey, LineEnding};
 use rsa::{RsaPrivateKey, RsaPublicKey};
+use serde::Deserialize;
 
 use crate::error::{IdentityError, JwtError};
 use crate::jwt::{JwtSigner, JwtVerifier, OboClaims};
 use crate::registry::{CredentialCheck, Registry};
 use crate::spiffe_id::SpiffeId;
+
+/// One entry of a JWKS document loaded by [`LocalIssuer::with_jwks`].
+///
+/// A real-world JWKS carries only public key material (`n`, `e`) because
+/// it's meant to be published for anyone to fetch. This project has no
+/// such external fetch path — every gateway in a trust domain instead
+/// loads the *same* document from a file (or secret store) side-by-side,
+/// so it additionally embeds the PKCS#1 private key PEM for each `kid`.
+/// That's what lets each gateway both sign with its own `active_kid` and
+/// verify every other key in the set — including keys it never signs
+/// with itself, which is exactly what cross-gateway verification needs.
+#[derive(Debug, Deserialize)]
+struct JwksKeyEntry {
+    kid: String,
+    private_key_pem: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct JwksDocument {
+    keys: Vec<JwksKeyEntry>,
+}
+
+fn parse_jwks(jwks_data: &str) -> Result<Vec<JwksKeyEntry>, IdentityError> {
+    let document: JwksDocument =
+        serde_json::from_str(jwks_data).map_err(|source| IdentityError::InvalidJwks(source.to_string()))?;
+    Ok(document.keys)
+}
 
 /// A freshly minted JWT SVID and when it expires (Unix seconds).
 #[derive(Debug, Clone)]
@@ -102,6 +131,56 @@ impl LocalIssuer {
 
         let signer = JwtSigner::from_rsa_pem(private_key_pem)?;
         let verifier = JwtVerifier::from_rsa_pem(public_pem.as_bytes())?;
+
+        Ok(Self::new(registry, signer, verifier, ttl_seconds))
+    }
+
+    /// Builds a `LocalIssuer` from a JWKS document (see [`JwksKeyEntry`] for
+    /// its shape) shared across every gateway in a trust domain: this
+    /// instance signs with the key named `active_kid`, but its verifier
+    /// trusts *every* key in the document, so it can verify tokens signed
+    /// by another gateway's differently-chosen `active_kid` — the
+    /// cross-gateway verification this task exists for.
+    ///
+    /// Fails fast — before issuing a single token — if `jwks_data` isn't
+    /// valid JSON in the expected shape, or if `active_kid` doesn't name a
+    /// key actually present in it.
+    pub fn with_jwks(
+        registry: Registry,
+        jwks_data: &str,
+        active_kid: String,
+        ttl_seconds: i64,
+    ) -> Result<Self, IdentityError> {
+        let entries = parse_jwks(jwks_data)?;
+        if !entries.iter().any(|entry| entry.kid == active_kid) {
+            return Err(IdentityError::InvalidKeyId(active_kid));
+        }
+
+        let to_key_err =
+            |source: rsa::pkcs1::Error| IdentityError::Jwt(JwtError::InvalidKey(source.to_string()));
+
+        let mut decoding_entries = Vec::with_capacity(entries.len());
+        let mut active_signer = None;
+
+        for entry in &entries {
+            let private_key = RsaPrivateKey::from_pkcs1_pem(&entry.private_key_pem).map_err(to_key_err)?;
+            let public_key = RsaPublicKey::from(&private_key);
+            let public_pem = public_key.to_pkcs1_pem(LineEnding::LF).map_err(to_key_err)?;
+            let decoding_key = DecodingKey::from_rsa_pem(public_pem.as_bytes())
+                .map_err(|source| IdentityError::Jwt(JwtError::InvalidKey(source.to_string())))?;
+            decoding_entries.push((entry.kid.clone(), decoding_key));
+
+            if entry.kid == active_kid {
+                active_signer = Some(JwtSigner::from_rsa_pem_with_kid(
+                    entry.private_key_pem.as_bytes(),
+                    active_kid.clone(),
+                )?);
+            }
+        }
+
+        let verifier = JwtVerifier::from_jwks_entries(decoding_entries);
+        // `active_kid`'s presence was checked above, so this always succeeds.
+        let signer = active_signer.expect("active_kid was verified to be present in entries");
 
         Ok(Self::new(registry, signer, verifier, ttl_seconds))
     }
@@ -242,5 +321,121 @@ workloads:
             .issue_jwt_svid("orders-svc", "not-a-spiffe-id", "orders-secret")
             .unwrap_err();
         assert!(matches!(err, IdentityError::InvalidAudience(_)));
+    }
+
+    /// Builds a JWKS-style document (`{"keys": [...]}`) containing a fresh
+    /// 2048-bit RSA keypair per `kid`. This is the same JSON every gateway
+    /// in a trust domain would load `LocalIssuer::with_jwks` from.
+    fn generate_jwks_json(kids: &[&str]) -> String {
+        let mut rng = rand::rngs::OsRng;
+        let keys: Vec<_> = kids
+            .iter()
+            .map(|kid| {
+                let private_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+                let pem = private_key.to_pkcs1_pem(LineEnding::LF).unwrap();
+                serde_json::json!({ "kid": kid, "kty": "RSA", "private_key_pem": pem.to_string() })
+            })
+            .collect();
+        serde_json::json!({ "keys": keys }).to_string()
+    }
+
+    #[test]
+    fn with_jwks_loads_multiple_keys_and_signs_with_the_active_one() {
+        let jwks_json = generate_jwks_json(&["key-1", "key-2"]);
+        let issuer = LocalIssuer::with_jwks(test_registry(), &jwks_json, "key-1".to_string(), 300).unwrap();
+
+        let issued = issuer
+            .issue_jwt_svid(
+                "orders-svc",
+                "spiffe://chakra.internal/ns/inventory/sa/inventory-svc",
+                "orders-secret",
+            )
+            .unwrap();
+
+        // The signed token must carry the active kid in its header.
+        let header = jsonwebtoken::decode_header(&issued.token).unwrap();
+        assert_eq!(header.kid, Some("key-1".to_string()));
+
+        // And it must verify against this same issuer's verifier.
+        assert!(issuer.verifier().verify_signature(&issued.token).is_ok());
+    }
+
+    #[test]
+    fn with_jwks_rejects_an_active_kid_not_present_in_the_set() {
+        let jwks_json = generate_jwks_json(&["key-1"]);
+        // `LocalIssuer` doesn't implement `Debug`, so `unwrap_err()` isn't
+        // available (it requires the `Ok` side to be `Debug` too) — match
+        // instead.
+        let err = match LocalIssuer::with_jwks(test_registry(), &jwks_json, "does-not-exist".to_string(), 300) {
+            Err(err) => err,
+            Ok(_) => panic!("expected with_jwks to reject an unknown active_kid"),
+        };
+        assert!(matches!(err, IdentityError::InvalidKeyId(kid) if kid == "does-not-exist"));
+    }
+
+    #[test]
+    fn with_jwks_rejects_malformed_jwks_json() {
+        let err = match LocalIssuer::with_jwks(test_registry(), "not valid json", "key-1".to_string(), 300) {
+            Err(err) => err,
+            Ok(_) => panic!("expected with_jwks to reject malformed JWKS JSON"),
+        };
+        assert!(matches!(err, IdentityError::InvalidJwks(_)));
+    }
+
+    #[test]
+    fn cross_gateway_verification_with_a_shared_jwks() {
+        // Two independent gateways load the *same* JWKS, but each signs
+        // with a different active key — the whole point of distributing a
+        // shared key set rather than each gateway generating its own.
+        let jwks_json = generate_jwks_json(&["key-1", "key-2"]);
+
+        let issuer1 = LocalIssuer::with_jwks(test_registry(), &jwks_json, "key-1".to_string(), 300).unwrap();
+        let issuer2 = LocalIssuer::with_jwks(test_registry(), &jwks_json, "key-2".to_string(), 300).unwrap();
+
+        let issued = issuer1
+            .issue_jwt_svid(
+                "orders-svc",
+                "spiffe://chakra.internal/ns/inventory/sa/inventory-svc",
+                "orders-secret",
+            )
+            .unwrap();
+
+        // issuer2's active signing key is key-2, but its verifier trusts
+        // every key in the shared JWKS — including key-1, which actually
+        // signed this token.
+        let claims = issuer2.verifier().verify_signature(&issued.token).unwrap();
+        assert_eq!(claims.sub, "spiffe://chakra.internal/ns/orders/sa/orders-svc");
+
+        // And the reverse holds too.
+        let issued2 = issuer2
+            .issue_jwt_svid(
+                "orders-svc",
+                "spiffe://chakra.internal/ns/inventory/sa/inventory-svc",
+                "orders-secret",
+            )
+            .unwrap();
+        assert!(issuer1.verifier().verify_signature(&issued2.token).is_ok());
+    }
+
+    #[test]
+    fn verifier_rejects_a_token_with_an_unknown_kid() {
+        let jwks_json = generate_jwks_json(&["key-1"]);
+        let issuer = LocalIssuer::with_jwks(test_registry(), &jwks_json, "key-1".to_string(), 300).unwrap();
+
+        // A token signed by some other key entirely, not in this JWKS.
+        let mut rng = rand::rngs::OsRng;
+        let rogue_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let rogue_pem = rogue_key.to_pkcs1_pem(LineEnding::LF).unwrap();
+        let rogue_signer =
+            crate::jwt::JwtSigner::from_rsa_pem_with_kid(rogue_pem.as_bytes(), "unregistered".to_string()).unwrap();
+        let claims = crate::jwt::OboClaims {
+            sub: "spiffe://chakra.internal/ns/orders/sa/orders-svc".to_string(),
+            aud: vec!["spiffe://chakra.internal/ns/inventory/sa/inventory-svc".to_string()],
+            iat: 0,
+            exp: 9_999_999_999,
+        };
+        let rogue_token = rogue_signer.sign(&claims).unwrap();
+
+        assert!(issuer.verifier().verify_signature(&rogue_token).is_err());
     }
 }

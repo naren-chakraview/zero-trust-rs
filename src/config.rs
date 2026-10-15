@@ -100,6 +100,19 @@ pub struct GatewayConfig {
     #[serde(default)]
     pub signing_key_path: Option<PathBuf>,
 
+    /// Path to a JWKS document (see [`crate::LocalIssuer::with_jwks`]) shared
+    /// across every gateway in the trust domain. When set (together with
+    /// `active_kid`), this takes priority over `signing_key_path` — it lets
+    /// this gateway verify tokens signed by any other gateway's active key,
+    /// not just its own.
+    #[serde(default)]
+    pub jwks_path: Option<PathBuf>,
+
+    /// Which `kid` in `jwks_path` this gateway instance signs new tokens
+    /// with. Required when `jwks_path` is set; ignored otherwise.
+    #[serde(default)]
+    pub active_kid: Option<String>,
+
     #[serde(default = "default_token_ttl_seconds")]
     pub token_ttl_seconds: i64,
 
@@ -130,8 +143,9 @@ impl GatewayConfig {
     }
 
     /// `ZT_GATEWAY_LISTEN_ADDR`, `ZT_GATEWAY_UPSTREAM_ADDR`,
-    /// `ZT_GATEWAY_REGISTRY_PATH`, `ZT_GATEWAY_SIGNING_KEY_PATH` — each, if
-    /// set, overrides the corresponding value from the config file.
+    /// `ZT_GATEWAY_REGISTRY_PATH`, `ZT_GATEWAY_SIGNING_KEY_PATH`,
+    /// `ZT_GATEWAY_JWKS_PATH`, `ZT_GATEWAY_ACTIVE_KID` — each, if set,
+    /// overrides the corresponding value from the config file.
     ///
     /// Reading the process environment is a side effect, so it's a
     /// separate, explicit step rather than something `from_yaml_str` does
@@ -148,6 +162,12 @@ impl GatewayConfig {
         }
         if let Ok(v) = std::env::var("ZT_GATEWAY_SIGNING_KEY_PATH") {
             self.signing_key_path = Some(PathBuf::from(v));
+        }
+        if let Ok(v) = std::env::var("ZT_GATEWAY_JWKS_PATH") {
+            self.jwks_path = Some(PathBuf::from(v));
+        }
+        if let Ok(v) = std::env::var("ZT_GATEWAY_ACTIVE_KID") {
+            self.active_kid = Some(v);
         }
         self
     }
@@ -276,5 +296,33 @@ protected_workload: spiffe://chakra.internal/ns/inventory/sa/inventory-svc
         let yaml = format!("{MINIMAL}\nca:\n  cert_path: ca.pem\n  key_path: ca-key.pem\n  ttl_seconds: 900\n");
         let config = GatewayConfig::from_yaml_str(&yaml).unwrap();
         assert_eq!(config.ca.unwrap().ttl_seconds, 900);
+    }
+
+    #[test]
+    fn jwks_path_and_active_kid_are_absent_by_default() {
+        let config = GatewayConfig::from_yaml_str(MINIMAL).unwrap();
+        assert!(config.jwks_path.is_none());
+        assert!(config.active_kid.is_none());
+    }
+
+    #[test]
+    fn jwks_path_and_active_kid_parse_when_present() {
+        let yaml = format!("{MINIMAL}\njwks_path: jwks.json\nactive_kid: key-1\n");
+        let config = GatewayConfig::from_yaml_str(&yaml).unwrap();
+        assert_eq!(config.jwks_path, Some(PathBuf::from("jwks.json")));
+        assert_eq!(config.active_kid, Some("key-1".to_string()));
+    }
+
+    #[test]
+    fn env_vars_override_jwks_path_and_active_kid() {
+        std::env::set_var("ZT_GATEWAY_JWKS_PATH", "/etc/zt/jwks.json");
+        std::env::set_var("ZT_GATEWAY_ACTIVE_KID", "key-2");
+
+        let config = GatewayConfig::from_yaml_str(MINIMAL).unwrap().with_env_overrides();
+        assert_eq!(config.jwks_path, Some(PathBuf::from("/etc/zt/jwks.json")));
+        assert_eq!(config.active_kid, Some("key-2".to_string()));
+
+        std::env::remove_var("ZT_GATEWAY_JWKS_PATH");
+        std::env::remove_var("ZT_GATEWAY_ACTIVE_KID");
     }
 }

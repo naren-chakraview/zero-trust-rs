@@ -111,18 +111,37 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let registry = Registry::from_reader(std::fs::File::open(&config.registry_path)?)?;
     let protected_workload = config.protected_workload_id()?;
 
-    let issuer = match &config.signing_key_path {
-        Some(path) => {
-            let pem = std::fs::read(path)?;
-            LocalIssuer::from_rsa_private_pem(registry.clone(), &pem, config.token_ttl_seconds)?
+    let issuer = match (&config.jwks_path, &config.active_kid) {
+        (Some(jwks_path), Some(active_kid)) => {
+            let jwks_data = std::fs::read_to_string(jwks_path)?;
+            LocalIssuer::with_jwks(
+                registry.clone(),
+                &jwks_data,
+                active_kid.clone(),
+                config.token_ttl_seconds,
+            )?
         }
-        None => {
-            tracing::warn!(
-                "no signing_key_path configured — generating an ephemeral keypair; \
-                 issued tokens will not survive a restart"
+        (Some(_), None) => {
+            return Err(
+                "jwks_path is configured but active_kid is missing — set active_kid to \
+                 the kid this gateway should sign with"
+                    .into(),
             );
-            LocalIssuer::generate(registry.clone(), config.token_ttl_seconds)?
         }
+        (None, _) => match &config.signing_key_path {
+            Some(path) => {
+                let pem = std::fs::read(path)?;
+                LocalIssuer::from_rsa_private_pem(registry.clone(), &pem, config.token_ttl_seconds)?
+            }
+            None => {
+                tracing::warn!(
+                    "no signing_key_path or jwks_path configured — generating an ephemeral \
+                     keypair; issued tokens will not survive a restart and cannot be verified \
+                     by any other gateway"
+                );
+                LocalIssuer::generate(registry.clone(), config.token_ttl_seconds)?
+            }
+        },
     };
 
     let ca = resolve_ca(&config, &registry)?;

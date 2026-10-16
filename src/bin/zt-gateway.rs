@@ -39,10 +39,11 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
 use zero_trust::{
-    build_client_cert_verifier, build_server_config, exchange_token, load_certs, now_unix_secs, validate,
-    CaError, CertificateAuthority, ClientAuth, Decision, GatewayConfig, IdentityError, IdentityProvider,
-    LocalCa, LocalIssuer, Registry, ServerCertificate, SpiffeId, TokenExchangeError, TokenExchangeRequest,
-    TokenExchangeResponse, ValidationRequest, HEADER_CALLER_CHAIN, HEADER_OBO_TOKEN, HEADER_USER_PRINCIPAL,
+    build_client_cert_verifier, build_server_config, compute_cert_thumbprint_x5t_s256, exchange_token, load_certs,
+    now_unix_secs, validate_with_cert_binding, CaError, CertificateAuthority, ClientAuth, Decision, GatewayConfig,
+    IdentityError, IdentityProvider, LocalCa, LocalIssuer, Registry, ServerCertificate, SpiffeId,
+    TokenExchangeError, TokenExchangeRequest, TokenExchangeResponse, ValidationRequest, HEADER_CALLER_CHAIN,
+    HEADER_OBO_TOKEN, HEADER_USER_PRINCIPAL,
 };
 
 /// Everything a request handler needs, cheap to clone (every field is an
@@ -477,24 +478,42 @@ fn resolve_trust_root_der(
     Ok(None)
 }
 
-/// A connection's verified client-certificate identity, if any. Always
-/// present as a request extension (see `serve()`) regardless of whether
-/// TLS or client auth is in use at all — `None` in every case where there
-/// isn't a verified identity, so handlers never need to distinguish
-/// "no TLS," "TLS but no client cert," and "client cert with no SPIFFE
-/// SAN" — they all just mean "no source_principal."
+/// A connection's verified client-certificate identity, if any, plus (Task
+/// 8, F5) the RFC 8705 thumbprint of that same certificate for RFC
+/// 8705 cert-binding validation. Always present as a request extension
+/// (see `serve()`) regardless of whether TLS or client auth is in use at
+/// all — both fields are `None` in every case where there isn't a
+/// presented certificate, so handlers never need to distinguish "no TLS,"
+/// "TLS but no client cert," and "client cert with no SPIFFE SAN" — they
+/// all just mean "no source_principal" / "no cert to bind against."
+///
+/// `spiffe_id` is `None` whenever the cert has no parseable SPIFFE URI SAN
+/// even if a cert *was* presented; `cert_thumbprint`, by contrast, is
+/// `Some` for any presented cert regardless of its SAN shape — cert
+/// binding cares about "is this the same certificate," not about identity.
 #[derive(Clone)]
-struct PeerIdentity(Option<SpiffeId>);
+struct PeerIdentity {
+    spiffe_id: Option<SpiffeId>,
+    cert_thumbprint: Option<String>,
+}
 
-/// Pulls the verified peer certificate's SPIFFE ID (a URI SAN entry) out of
-/// a just-completed TLS handshake, if the caller presented one.
+impl PeerIdentity {
+    const NONE: PeerIdentity = PeerIdentity {
+        spiffe_id: None,
+        cert_thumbprint: None,
+    };
+}
+
+/// Pulls the verified peer certificate's SPIFFE ID (a URI SAN entry) and
+/// RFC 8705 thumbprint out of a just-completed TLS handshake, if the
+/// caller presented a certificate at all.
 fn extract_peer_identity(tls_stream: &tokio_rustls::server::TlsStream<tokio::net::TcpStream>) -> PeerIdentity {
     let (_io, connection) = tls_stream.get_ref();
-    let spiffe_id = connection
-        .peer_certificates()
-        .and_then(|certs| certs.first())
-        .and_then(|cert| extract_spiffe_id_from_der(cert));
-    PeerIdentity(spiffe_id)
+    let leaf_cert = connection.peer_certificates().and_then(|certs| certs.first());
+    PeerIdentity {
+        spiffe_id: leaf_cert.and_then(|cert| extract_spiffe_id_from_der(cert)),
+        cert_thumbprint: leaf_cert.map(|cert| compute_cert_thumbprint_x5t_s256(cert)),
+    }
 }
 
 fn extract_spiffe_id_from_der(der: &[u8]) -> Option<SpiffeId> {
@@ -542,7 +561,7 @@ async fn serve(listener: TcpListener, router: Router, tls_acceptor: Option<TlsAc
                     }
                 },
                 None => {
-                    let hyper_service = TowerToHyperService::new(router.layer(Extension(PeerIdentity(None))));
+                    let hyper_service = TowerToHyperService::new(router.layer(Extension(PeerIdentity::NONE)));
                     hyper::server::conn::http1::Builder::new()
                         .serve_connection(TokioIo::new(stream), hyper_service)
                         .await
@@ -673,7 +692,9 @@ async fn authorize(
     let Ok(destination) = req.destination.parse::<SpiffeId>() else {
         return error_response(StatusCode::BAD_REQUEST, "destination is not a valid SPIFFE ID");
     };
-    let source_principal = peer_identity.and_then(|Extension(PeerIdentity(id))| id);
+    let peer = peer_identity.map(|Extension(peer)| peer);
+    let source_principal = peer.as_ref().and_then(|peer| peer.spiffe_id.clone());
+    let peer_cert_thumbprint = peer.as_ref().and_then(|peer| peer.cert_thumbprint.clone());
 
     let request = ValidationRequest {
         destination: &destination,
@@ -687,7 +708,14 @@ async fn authorize(
         caller_chain: None,
         obo_token: req.obo_token.as_deref(),
     };
-    let decision = validate(&state.registry, state.identity.verifier(), &request, now_unix_secs());
+    // F5 fix: also enforce RFC 8705 cert binding, same as the proxy path.
+    let decision = validate_with_cert_binding(
+        &state.registry,
+        state.identity.verifier(),
+        &request,
+        peer_cert_thumbprint.as_deref(),
+        now_unix_secs(),
+    );
 
     (
         StatusCode::OK,
@@ -776,7 +804,9 @@ async fn proxy_handler(
         Err(_) => return error_response(StatusCode::BAD_REQUEST, "failed to read request body"),
     };
 
-    let source_principal = peer_identity.and_then(|Extension(PeerIdentity(id))| id);
+    let peer = peer_identity.map(|Extension(peer)| peer);
+    let source_principal = peer.as_ref().and_then(|peer| peer.spiffe_id.clone());
+    let peer_cert_thumbprint = peer.as_ref().and_then(|peer| peer.cert_thumbprint.clone());
     let obo_token = header_str(&parts.headers, HEADER_OBO_TOKEN);
     let caller_chain = header_str(&parts.headers, HEADER_CALLER_CHAIN);
     let user_principal = header_str(&parts.headers, HEADER_USER_PRINCIPAL);
@@ -793,7 +823,17 @@ async fn proxy_handler(
         // decision itself.
         caller_chain: None,
     };
-    let decision = validate(&state.registry, state.identity.verifier(), &request, now_unix_secs());
+    // F5 fix: enforce RFC 8705 cert binding -- a token minted with a
+    // signed `cnf.x5t#S256` claim is rejected outright unless this exact
+    // connection's client certificate thumbprint matches it. Tokens with
+    // no `cnf` claim (the backward-compatible default) are unaffected.
+    let decision = validate_with_cert_binding(
+        &state.registry,
+        state.identity.verifier(),
+        &request,
+        peer_cert_thumbprint.as_deref(),
+        now_unix_secs(),
+    );
 
     let span = tracing::Span::current();
     span.record("allow", decision.is_allow());
@@ -1513,6 +1553,102 @@ workloads:
         let response = send_request_over_tls(&addr, server_cert_der, Some((client_cert, client_key)), &token.token).await;
         assert!(response.starts_with("HTTP/1.1 403"), "got: {response}");
         assert!(response.contains("obo_token_subject_mismatch"), "got: {response}");
+    }
+
+    // --- Task 8: RFC 8705 certificate-bound tokens (F5), end-to-end over a
+    // real mTLS handshake ---
+
+    #[tokio::test]
+    async fn f5_cert_bound_token_accepted_when_matching_cert_is_presented() {
+        let registry = test_registry();
+        let ca = LocalCa::generate(registry.clone(), 3600).unwrap();
+        let issuer = LocalIssuer::generate(registry.clone(), 300).unwrap();
+        let (upstream_addr, hits) = spawn_test_upstream("hello from upstream").await;
+
+        let (client_cert, client_key) = build_client_cert(&ca, "orders-svc", ORDERS, "orders-secret");
+        let cert_thumbprint = compute_cert_thumbprint_x5t_s256(client_cert.as_ref());
+        let token = issuer
+            .issue_jwt_svid_with_cert_binding("orders-svc", INVENTORY, &cert_thumbprint, "orders-secret")
+            .unwrap();
+
+        let (addr, server_cert_der) =
+            spawn_mtls_server(registry, issuer, &ca, INVENTORY, ClientAuth::Optional, upstream_addr).await;
+
+        let response =
+            send_request_over_tls(&addr, server_cert_der, Some((client_cert, client_key)), &token.token).await;
+        assert!(response.starts_with("HTTP/1.1 200"), "got: {response}");
+        assert!(response.contains("hello from upstream"), "got: {response}");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn f5_cert_bound_token_rejected_when_mismatched_cert_is_presented() {
+        let registry = test_registry();
+        let ca = LocalCa::generate(registry.clone(), 3600).unwrap();
+        let issuer = LocalIssuer::generate(registry.clone(), 300).unwrap();
+
+        // Bind the token to orders-svc's own client cert thumbprint...
+        let (orders_cert, _orders_key) = build_client_cert(&ca, "orders-svc", ORDERS, "orders-secret");
+        let bound_thumbprint = compute_cert_thumbprint_x5t_s256(orders_cert.as_ref());
+        let token = issuer
+            .issue_jwt_svid_with_cert_binding("orders-svc", INVENTORY, &bound_thumbprint, "orders-secret")
+            .unwrap();
+
+        let (addr, server_cert_der) = spawn_mtls_server(
+            registry,
+            issuer,
+            &ca,
+            INVENTORY,
+            ClientAuth::Optional,
+            "http://unused.invalid".to_string(),
+        )
+        .await;
+
+        // ...but present a different, legitimately CA-issued client cert
+        // (api-gateway's) instead. This is exactly the "stolen token"
+        // scenario RFC 8705 defends against: even a validly-signed token
+        // is useless off the certificate it was bound to.
+        let (api_gateway_cert, api_gateway_key) =
+            build_client_cert(&ca, "api-gateway", API_GATEWAY, "api-gateway-secret");
+
+        let response = send_request_over_tls(
+            &addr,
+            server_cert_der,
+            Some((api_gateway_cert, api_gateway_key)),
+            &token.token,
+        )
+        .await;
+        assert!(response.starts_with("HTTP/1.1 403"), "got: {response}");
+        assert!(response.contains("certificate_binding_mismatch"), "got: {response}");
+    }
+
+    #[tokio::test]
+    async fn f5_cert_bound_token_rejected_when_no_cert_is_presented() {
+        let registry = test_registry();
+        let ca = LocalCa::generate(registry.clone(), 3600).unwrap();
+        let issuer = LocalIssuer::generate(registry.clone(), 300).unwrap();
+
+        let (orders_cert, _orders_key) = build_client_cert(&ca, "orders-svc", ORDERS, "orders-secret");
+        let bound_thumbprint = compute_cert_thumbprint_x5t_s256(orders_cert.as_ref());
+        let token = issuer
+            .issue_jwt_svid_with_cert_binding("orders-svc", INVENTORY, &bound_thumbprint, "orders-secret")
+            .unwrap();
+
+        // ClientAuth::Optional -- the handshake itself succeeds with no
+        // client cert at all, but the token demands one.
+        let (addr, server_cert_der) = spawn_mtls_server(
+            registry,
+            issuer,
+            &ca,
+            INVENTORY,
+            ClientAuth::Optional,
+            "http://unused.invalid".to_string(),
+        )
+        .await;
+
+        let response = send_request_over_tls(&addr, server_cert_der, None, &token.token).await;
+        assert!(response.starts_with("HTTP/1.1 403"), "got: {response}");
+        assert!(response.contains("certificate_binding_mismatch"), "got: {response}");
     }
 
     #[tokio::test]

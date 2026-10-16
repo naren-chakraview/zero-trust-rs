@@ -6,10 +6,26 @@
 //! `obo::validate` so each failure can map to a precise, distinct
 //! `DenyReason` instead of a single opaque "token invalid" error.
 
+use base64::engine::{general_purpose, Engine as _};
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::error::JwtError;
+
+/// Computes the RFC 8705 `x5t#S256` confirmation value for a client
+/// certificate: the SHA-256 digest of its DER encoding, base64url-encoded
+/// with no padding. Deterministic (same cert DER always yields the same
+/// thumbprint) and collision-resistant enough that two distinct certs are
+/// never expected to collide — this is what [`CertBinding::x5t_s256`]
+/// carries and what cert-binding validation (`obo::validate_with_cert_binding`)
+/// compares the presented TLS client cert's thumbprint against.
+pub fn compute_cert_thumbprint_x5t_s256(cert_der: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(cert_der);
+    let hash = hasher.finalize();
+    general_purpose::URL_SAFE_NO_PAD.encode(hash)
+}
 
 /// The claims carried by a JWT SVID, per ADR-0007: who is delegating
 /// (`sub`), who it's delegating to (`aud`), and the token's validity window.
@@ -466,6 +482,44 @@ mod tests {
 
         let round_tripped: CertBinding = serde_json::from_str(&json).unwrap();
         assert_eq!(round_tripped, binding);
+    }
+
+    // --- RFC 8705 certificate-binding thumbprint (Task 8) ---
+
+    /// A fresh self-signed cert's DER bytes, generated the same way
+    /// `ServerCertificate::generate_ephemeral` does in `tls.rs` — this
+    /// module has no fixture files of its own, so a freshly generated
+    /// cert stands in for "a real client cert" here.
+    fn generate_cert_der(subject_alt_name: &str) -> Vec<u8> {
+        let certified_key = rcgen::generate_simple_self_signed(vec![subject_alt_name.to_string()]).unwrap();
+        certified_key.cert.der().to_vec()
+    }
+
+    #[test]
+    fn test_compute_cert_thumbprint_x5t_s256() {
+        let cert_der = generate_cert_der("client-a");
+        let thumbprint = compute_cert_thumbprint_x5t_s256(&cert_der);
+
+        // base64url (no padding): only alphanumerics, '-', and '_'.
+        assert!(!thumbprint.is_empty());
+        assert!(thumbprint.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_'));
+        assert!(!thumbprint.contains('='));
+
+        // Deterministic: hashing the same DER bytes again gives the same
+        // thumbprint.
+        let thumbprint2 = compute_cert_thumbprint_x5t_s256(&cert_der);
+        assert_eq!(thumbprint, thumbprint2);
+    }
+
+    #[test]
+    fn test_different_certs_different_thumbprints() {
+        let cert_a = generate_cert_der("client-a");
+        let cert_b = generate_cert_der("client-b");
+
+        let thumb_a = compute_cert_thumbprint_x5t_s256(&cert_a);
+        let thumb_b = compute_cert_thumbprint_x5t_s256(&cert_b);
+
+        assert_ne!(thumb_a, thumb_b);
     }
 
     #[test]

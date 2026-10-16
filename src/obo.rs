@@ -95,6 +95,12 @@ pub enum DenyReason {
     InvalidUserPrincipal,
     /// The token's `nbf` is in the future, beyond the clock-skew allowance.
     OboTokenNotYetValid,
+    /// RFC 8705 (Task 8): the token carries a signed `cnf.x5t#S256` claim,
+    /// but the presented TLS client certificate's thumbprint doesn't match
+    /// it — or no client certificate was presented at all. Only ever
+    /// produced by [`validate_with_cert_binding`]; `validate` itself never
+    /// looks at certificate binding.
+    CertificateBindingMismatch,
 }
 
 impl DenyReason {
@@ -110,6 +116,7 @@ impl DenyReason {
             DenyReason::InvalidChainEntry => "invalid_chain_entry",
             DenyReason::InvalidUserPrincipal => "invalid_user_principal",
             DenyReason::OboTokenNotYetValid => "obo_token_not_yet_valid",
+            DenyReason::CertificateBindingMismatch => "certificate_binding_mismatch",
         }
     }
 }
@@ -207,6 +214,54 @@ pub fn validate(
         // fail-closed fallback rather than an `unreachable!()`.
         _ => Decision::Deny(DenyReason::CallerNotInAllowList),
     }
+}
+
+/// Like [`validate`], but additionally enforces RFC 8705 certificate
+/// binding (Task 8): if the token carries a signed `cnf.x5t#S256` claim,
+/// `peer_cert_thumbprint` — the thumbprint of whatever TLS client
+/// certificate (if any) the caller presented — must match it exactly, or
+/// the request is denied with [`DenyReason::CertificateBindingMismatch`].
+/// That includes the case where no certificate was presented at all
+/// (`peer_cert_thumbprint: None`): a token that demands cert binding and a
+/// missing cert both fail closed, never open.
+///
+/// Tokens with no `cnf` claim are completely unaffected — this check is
+/// simply skipped, and the decision falls straight through to [`validate`]
+/// — which is what makes old, unbound tokens (and every direct-call
+/// request, which never has a `cnf` claim to check) behave identically to
+/// before this function existed.
+///
+/// The cert-binding check runs first, independently of every other check
+/// `validate` performs, so a bound token presented with the wrong (or no)
+/// certificate is always reported as `CertificateBindingMismatch`, never
+/// shadowed by some other `DenyReason` that would otherwise have applied
+/// first (e.g. an expired token also presented with the wrong cert still
+/// reports the cert mismatch, not `OboTokenExpired`).
+///
+/// An invalid signature is deliberately *not* special-cased here: if
+/// `verify_signature` fails, this function skips the cert-binding check
+/// (there are no trustworthy claims to read a `cnf` from) and defers
+/// entirely to `validate`, which performs its own signature check and
+/// reports `DenyReason::OboTokenSignatureInvalid`.
+pub fn validate_with_cert_binding(
+    registry: &Registry,
+    verifier: &JwtVerifier,
+    request: &ValidationRequest<'_>,
+    peer_cert_thumbprint: Option<&str>,
+    now_unix_secs: i64,
+) -> Decision {
+    if let Some(token) = request.obo_token {
+        if let Ok(claims) = verifier.verify_signature(token) {
+            if let Some(cnf) = &claims.cnf {
+                let cert_matches = peer_cert_thumbprint.is_some_and(|thumb| thumb == cnf.x5t_s256);
+                if !cert_matches {
+                    return Decision::Deny(DenyReason::CertificateBindingMismatch);
+                }
+            }
+        }
+    }
+
+    validate(registry, verifier, request, now_unix_secs)
 }
 
 /// Convenience wrapper for long-lived call sites (a gateway holding one
@@ -789,6 +844,164 @@ workloads:
         assert_eq!(
             validate(&registry, &verifier, &request, 0),
             Decision::Deny(DenyReason::OboTokenSubjectMismatch)
+        );
+    }
+
+    // --- RFC 8705 certificate-bound tokens (Task 8, F5) ---
+
+    use crate::jwt::CertBinding;
+
+    fn mint_token_with_cnf(signer: &JwtSigner, sub: &str, aud: &[&str], cert_thumbprint: &str) -> String {
+        let claims = OboClaims {
+            sub: sub.to_string(),
+            aud: aud.iter().map(|s| s.to_string()).collect(),
+            user: None,
+            act: None,
+            iat: 0,
+            exp: 300,
+            nbf: None,
+            jti: None,
+            cnf: Some(CertBinding {
+                x5t_s256: cert_thumbprint.to_string(),
+            }),
+        };
+        signer.sign(&claims).unwrap()
+    }
+
+    #[test]
+    fn f5_token_with_binding_accepted_with_matching_cert() {
+        let registry = test_registry();
+        let (signer, verifier) = test_keys();
+        let destination = id(INVENTORY);
+        let token = mint_token_with_cnf(&signer, ORDERS, &[INVENTORY], "cert-a-thumbprint");
+
+        let request = ValidationRequest {
+            destination: &destination,
+            source_principal: None,
+            obo_token: Some(&token),
+            caller_chain: None,
+        };
+
+        assert_eq!(
+            validate_with_cert_binding(&registry, &verifier, &request, Some("cert-a-thumbprint"), 0),
+            Decision::Allow
+        );
+    }
+
+    #[test]
+    fn f5_token_with_binding_rejected_with_mismatched_cert() {
+        let registry = test_registry();
+        let (signer, verifier) = test_keys();
+        let destination = id(INVENTORY);
+        let token = mint_token_with_cnf(&signer, ORDERS, &[INVENTORY], "cert-a-thumbprint");
+
+        let request = ValidationRequest {
+            destination: &destination,
+            source_principal: None,
+            obo_token: Some(&token),
+            caller_chain: None,
+        };
+
+        assert_eq!(
+            validate_with_cert_binding(&registry, &verifier, &request, Some("cert-b-thumbprint"), 0),
+            Decision::Deny(DenyReason::CertificateBindingMismatch)
+        );
+    }
+
+    #[test]
+    fn f5_token_with_binding_rejected_with_no_cert_presented() {
+        let registry = test_registry();
+        let (signer, verifier) = test_keys();
+        let destination = id(INVENTORY);
+        let token = mint_token_with_cnf(&signer, ORDERS, &[INVENTORY], "cert-a-thumbprint");
+
+        let request = ValidationRequest {
+            destination: &destination,
+            source_principal: None,
+            obo_token: Some(&token),
+            caller_chain: None,
+        };
+
+        assert_eq!(
+            validate_with_cert_binding(&registry, &verifier, &request, None, 0),
+            Decision::Deny(DenyReason::CertificateBindingMismatch)
+        );
+    }
+
+    #[test]
+    fn f5_tokens_without_binding_still_work_with_or_without_a_cert() {
+        let registry = test_registry();
+        let (signer, verifier) = test_keys();
+        let destination = id(INVENTORY);
+        // Old-style token, no `cnf` claim at all.
+        let token = mint_token(&signer, ORDERS, &[INVENTORY], 0, 300);
+
+        let request = ValidationRequest {
+            destination: &destination,
+            source_principal: None,
+            obo_token: Some(&token),
+            caller_chain: None,
+        };
+
+        // No cert presented: still allowed, since there's no binding to check.
+        assert_eq!(
+            validate_with_cert_binding(&registry, &verifier, &request, None, 0),
+            Decision::Allow
+        );
+        // A cert presented anyway: also still allowed -- an unbound token
+        // doesn't care who presents it at the transport layer.
+        assert_eq!(
+            validate_with_cert_binding(&registry, &verifier, &request, Some("whatever-cert"), 0),
+            Decision::Allow
+        );
+    }
+
+    #[test]
+    fn f5_cert_binding_mismatch_is_reported_even_when_the_token_is_also_expired() {
+        // The cert-binding check runs independently of (and before)
+        // `validate`'s own checks, so it's the mismatch that's reported,
+        // not `OboTokenExpired` -- proving the two checks don't shadow
+        // each other in the wrong order.
+        let registry = test_registry();
+        let (signer, verifier) = test_keys();
+        let destination = id(INVENTORY);
+        let claims = OboClaims {
+            sub: ORDERS.to_string(),
+            aud: vec![INVENTORY.to_string()],
+            user: None,
+            act: None,
+            iat: 0,
+            exp: 1, // already expired by now=100 below
+            nbf: None,
+            jti: None,
+            cnf: Some(CertBinding {
+                x5t_s256: "cert-a-thumbprint".to_string(),
+            }),
+        };
+        let token = signer.sign(&claims).unwrap();
+
+        let request = ValidationRequest {
+            destination: &destination,
+            source_principal: None,
+            obo_token: Some(&token),
+            caller_chain: None,
+        };
+
+        assert_eq!(
+            validate_with_cert_binding(&registry, &verifier, &request, Some("wrong-cert"), 100),
+            Decision::Deny(DenyReason::CertificateBindingMismatch)
+        );
+    }
+
+    #[test]
+    fn f5_cert_binding_mismatch_deny_reason_has_a_populated_string() {
+        assert_ne!(
+            Decision::Deny(DenyReason::CertificateBindingMismatch).deny_reason_str(),
+            "none"
+        );
+        assert_eq!(
+            DenyReason::CertificateBindingMismatch.as_str(),
+            "certificate_binding_mismatch"
         );
     }
 }

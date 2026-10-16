@@ -23,8 +23,8 @@ pub use headers::{
     HEADER_USER_PRINCIPAL,
 };
 pub use identity::{IdentityProvider, IssuedToken, LocalIssuer};
-pub use jwt::{ActClaim, CertBinding, JwtSigner, JwtVerifier, OboClaims};
-pub use obo::{validate, Decision, DenyReason, ValidationRequest, Validator};
+pub use jwt::{compute_cert_thumbprint_x5t_s256, ActClaim, CertBinding, JwtSigner, JwtVerifier, OboClaims};
+pub use obo::{validate, validate_with_cert_binding, Decision, DenyReason, ValidationRequest, Validator};
 pub use registry::{CredentialCheck, Registry, WorkloadEntry, DEFAULT_MAX_OBO_CHAIN_DEPTH};
 pub use spiffe_id::SpiffeId;
 pub use tls::{build_client_cert_verifier, build_server_config, load_certs, ServerCertificate};

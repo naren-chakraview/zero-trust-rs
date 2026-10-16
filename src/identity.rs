@@ -8,7 +8,7 @@ use rsa::{RsaPrivateKey, RsaPublicKey};
 use serde::Deserialize;
 
 use crate::error::{IdentityError, JwtError};
-use crate::jwt::{JwtSigner, JwtVerifier, OboClaims};
+use crate::jwt::{CertBinding, JwtSigner, JwtVerifier, OboClaims};
 use crate::registry::{CredentialCheck, Registry};
 use crate::spiffe_id::SpiffeId;
 
@@ -199,6 +199,55 @@ impl LocalIssuer {
 
     pub fn registry(&self) -> &Registry {
         &self.registry
+    }
+
+    /// Like [`IdentityProvider::issue_jwt_svid`], but the issued token also
+    /// carries a signed `cnf.x5t#S256` claim (RFC 8705, Task 8) binding it
+    /// to `cert_thumbprint` — the thumbprint of the TLS client certificate
+    /// this token is meant to be presented alongside. Authentication
+    /// (`credential` against the requester's configured bootstrap token)
+    /// works identically to `issue_jwt_svid`; the only difference is the
+    /// extra signed claim on the resulting token, which later lets
+    /// `obo::validate_with_cert_binding` reject the token outright if it's
+    /// ever replayed from a connection presenting a different (or no)
+    /// client certificate.
+    pub fn issue_jwt_svid_with_cert_binding(
+        &self,
+        requester_workload_name: &str,
+        audience: &str,
+        cert_thumbprint: &str,
+        credential: &str,
+    ) -> Result<IssuedToken, IdentityError> {
+        let requester = match self.registry.check_bootstrap_token(requester_workload_name, credential) {
+            CredentialCheck::Ok(entry) => entry,
+            CredentialCheck::UnknownWorkload => {
+                return Err(IdentityError::UnknownWorkload(requester_workload_name.to_string()))
+            }
+            CredentialCheck::InvalidCredential => return Err(IdentityError::InvalidBootstrapToken),
+        };
+
+        let audience_id: SpiffeId = audience.parse()?;
+
+        let now = crate::now_unix_secs();
+        let claims = OboClaims {
+            sub: requester.spiffe_id.to_string(),
+            aud: vec![audience_id.to_string()],
+            user: None,
+            act: None,
+            iat: now,
+            exp: now + self.ttl_seconds,
+            nbf: None,
+            jti: None,
+            cnf: Some(CertBinding {
+                x5t_s256: cert_thumbprint.to_string(),
+            }),
+        };
+
+        let token = self.signer.sign(&claims)?;
+        Ok(IssuedToken {
+            token,
+            expires_at: claims.exp,
+        })
     }
 }
 
@@ -436,6 +485,45 @@ workloads:
             )
             .unwrap();
         assert!(issuer1.verifier().verify_signature(&issued2.token).is_ok());
+    }
+
+    // --- RFC 8705 certificate-bound issuance (Task 8, F5) ---
+
+    #[test]
+    fn issue_jwt_svid_with_cert_binding_signs_a_token_carrying_the_cnf_claim() {
+        let issuer = LocalIssuer::generate(test_registry(), 300).unwrap();
+
+        let issued = issuer
+            .issue_jwt_svid_with_cert_binding(
+                "orders-svc",
+                "spiffe://chakra.internal/ns/inventory/sa/inventory-svc",
+                "cert-a-thumbprint",
+                "orders-secret",
+            )
+            .unwrap();
+
+        let claims = issuer.verifier().verify_signature(&issued.token).unwrap();
+        assert_eq!(claims.sub, "spiffe://chakra.internal/ns/orders/sa/orders-svc");
+        assert_eq!(
+            claims.cnf,
+            Some(CertBinding {
+                x5t_s256: "cert-a-thumbprint".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn issue_jwt_svid_with_cert_binding_rejects_a_wrong_bootstrap_token() {
+        let issuer = LocalIssuer::generate(test_registry(), 300).unwrap();
+        let err = issuer
+            .issue_jwt_svid_with_cert_binding(
+                "orders-svc",
+                "spiffe://chakra.internal/ns/inventory/sa/inventory-svc",
+                "cert-a-thumbprint",
+                "not-the-secret",
+            )
+            .unwrap_err();
+        assert!(matches!(err, IdentityError::InvalidBootstrapToken));
     }
 
     #[test]

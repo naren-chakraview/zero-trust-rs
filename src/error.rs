@@ -114,6 +114,14 @@ pub enum CaError {
     MalformedCsr(String),
     #[error("CSR requests identity '{requested}' but the authenticated workload is '{expected}'")]
     SanMismatch { requested: String, expected: String },
+    /// Per the X.509-SVID spec, a CSR may only carry URI SANs — the CA
+    /// builds the leaf's identity from the registry, not from DNS/IP/email
+    /// SANs a workload might try to smuggle in.
+    #[error("CSR contains a non-URI SAN; only a single URI SAN is permitted")]
+    NonUriSanInCsr,
+    /// Per the X.509-SVID spec, a leaf must carry exactly one URI SAN.
+    #[error("CSR requests more than one URI SAN; exactly one is required")]
+    MultipleUriSans,
     #[error("failed to sign certificate: {0}")]
     Signing(String),
 }

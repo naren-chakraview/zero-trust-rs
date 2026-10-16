@@ -11,7 +11,7 @@ use std::path::Path;
 
 use rcgen::{
     BasicConstraints, Certificate, CertificateParams, CertificateSigningRequestParams,
-    DistinguishedName, DnType, IsCa, KeyPair, KeyUsagePurpose, SanType,
+    DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa, KeyPair, KeyUsagePurpose, SanType,
 };
 use time::{Duration, OffsetDateTime};
 
@@ -117,32 +117,62 @@ impl CertificateAuthority for LocalCa {
             CredentialCheck::InvalidCredential => return Err(CaError::InvalidBootstrapToken),
         };
 
-        let mut csr_params = CertificateSigningRequestParams::from_pem(csr_pem)
+        // The CSR is used only for its public key (proof of possession) and
+        // to carry the requested SAN for the mismatch check below — the
+        // leaf is built from scratch below, so nothing else in the CSR
+        // (its own distinguished_name, validity, etc.) ever reaches the
+        // signed certificate.
+        let csr_params = CertificateSigningRequestParams::from_pem(csr_pem)
             .map_err(|source| CaError::MalformedCsr(source.to_string()))?;
+
+        validate_csr_sans(&csr_params.params.subject_alt_names)?;
 
         let expected = requester.spiffe_id.to_string();
         let requested_uri = csr_params.params.subject_alt_names.iter().find_map(|san| match san {
-            SanType::URI(uri) => Some(uri.to_string()),
+            SanType::URI(uri) => Some(uri.clone()),
             _ => None,
         });
-        match requested_uri {
-            Some(requested) if requested == expected => {}
-            Some(requested) => return Err(CaError::SanMismatch { requested, expected }),
+        let san_uri = match requested_uri {
+            Some(uri) if uri.to_string() == expected => uri,
+            Some(uri) => {
+                return Err(CaError::SanMismatch {
+                    requested: uri.to_string(),
+                    expected,
+                })
+            }
             None => {
                 return Err(CaError::SanMismatch {
                     requested: String::new(),
                     expected,
                 })
             }
-        }
+        };
 
         let not_before = OffsetDateTime::now_utc();
         let not_after = not_before + Duration::seconds(self.ttl_seconds);
-        csr_params.params.not_before = not_before;
-        csr_params.params.not_after = not_after;
 
-        let signed = csr_params
-            .signed_by(&self.ca_cert, &self.ca_key)
+        // Built from scratch (not derived from `csr_params.params`): the
+        // leaf's identity, validity and constraints all come from this
+        // CA's policy, not from whatever a workload put in its CSR. Only
+        // the SAN URI that was just checked against the registry above
+        // survives into it, plus the CSR's public key below.
+        let mut leaf_params = CertificateParams::new(Vec::<String>::new())
+            .map_err(|source| CaError::Signing(source.to_string()))?;
+        let mut distinguished_name = DistinguishedName::new();
+        distinguished_name.push(DnType::CommonName, requester_workload_name);
+        leaf_params.distinguished_name = distinguished_name;
+        leaf_params.subject_alt_names = vec![SanType::URI(san_uri)];
+        leaf_params.not_before = not_before;
+        leaf_params.not_after = not_after;
+        // X.509-SVID leaf constraints: not a CA, and scoped to exactly the
+        // key usages/EKUs a workload identity needs for mTLS.
+        leaf_params.is_ca = IsCa::ExplicitNoCa;
+        leaf_params.key_usages =
+            vec![KeyUsagePurpose::DigitalSignature, KeyUsagePurpose::KeyEncipherment, KeyUsagePurpose::KeyAgreement];
+        leaf_params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth, ExtendedKeyUsagePurpose::ServerAuth];
+
+        let signed = leaf_params
+            .signed_by(&csr_params.public_key, &self.ca_cert, &self.ca_key)
             .map_err(|source| CaError::Signing(source.to_string()))?;
 
         Ok(SignedCert {
@@ -150,6 +180,23 @@ impl CertificateAuthority for LocalCa {
             expires_at: not_after.unix_timestamp(),
         })
     }
+}
+
+/// Rejects a CSR whose SAN list isn't exactly what the X.509-SVID spec
+/// allows a workload to request: a single URI SAN, nothing else. A CSR
+/// with a DNS/IP/email SAN, an `OtherName`, or more than one URI SAN is
+/// rejected outright rather than having the extras silently dropped — the
+/// workload asked for an identity this CA won't issue, and papering over
+/// that is a worse failure mode than an explicit error.
+fn validate_csr_sans(sans: &[SanType]) -> Result<(), CaError> {
+    let uri_count = sans.iter().filter(|san| matches!(san, SanType::URI(_))).count();
+    if uri_count != sans.len() {
+        return Err(CaError::NonUriSanInCsr);
+    }
+    if uri_count > 1 {
+        return Err(CaError::MultipleUriSans);
+    }
+    Ok(())
 }
 
 #[cfg(test)]

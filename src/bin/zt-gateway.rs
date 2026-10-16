@@ -26,7 +26,10 @@ use axum::routing::post;
 use axum::{Extension, Json, Router};
 use hyper_util::rt::TokioIo;
 use hyper_util::service::TowerToHyperService;
-use opentelemetry::trace::TracerProvider as _;
+use opentelemetry::propagation::{Extractor, Injector};
+use opentelemetry::trace::{Status, TraceContextExt, Tracer as _, TracerProvider as _};
+use opentelemetry::{global, Context as OtelContext, KeyValue};
+use opentelemetry_sdk::propagation::TraceContextPropagator;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
@@ -80,33 +83,37 @@ struct AppState {
 /// alive for the process lifetime — dropping it would tear down the batch
 /// exporter's background flush task.
 ///
-/// Local `cargo run` with no OTLP endpoint configured behaves exactly as
-/// before: `Option<Layer>` is itself a no-op `Layer` when `None`, so the
-/// OTEL half of the pipeline simply isn't there.
-fn init_tracing() -> Option<opentelemetry_sdk::trace::TracerProvider> {
-    let otel_provider = std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").ok().map(|_| {
+/// F12 fix: the W3C TraceContext propagator (`traceparent`/`tracestate`)
+/// and the `TracerProvider` itself are now configured *unconditionally* —
+/// both are needed for `proxy_handler` to extract/inject trace context and
+/// generate per-hop span IDs end-to-end (see `extract_trace_context`,
+/// `inject_trace_context`), independent of whether anything is actually
+/// exporting those spans anywhere. Only the OTLP *export* half remains
+/// conditional on `OTEL_EXPORTER_OTLP_ENDPOINT`: with no endpoint
+/// configured, `TracerProvider::builder()` is given no span processor at
+/// all, so spans are still created (real trace/span IDs, real sampling)
+/// and still propagate, but are simply never shipped anywhere — local
+/// `cargo run` otherwise behaves exactly as before.
+fn init_tracing() -> opentelemetry_sdk::trace::TracerProvider {
+    global::set_text_map_propagator(TraceContextPropagator::new());
+
+    let resource = opentelemetry_sdk::Resource::new(vec![opentelemetry::KeyValue::new(
+        "service.name",
+        "zt-gateway",
+    )]);
+
+    let mut builder = opentelemetry_sdk::trace::TracerProvider::builder().with_resource(resource);
+    if std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").is_ok() {
         let exporter = opentelemetry_otlp::SpanExporter::builder()
             .with_http()
             .build()
             .expect("failed to build OTLP span exporter");
+        builder = builder.with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio);
+    }
+    let provider = builder.build();
+    global::set_tracer_provider(provider.clone());
 
-        let resource = opentelemetry_sdk::Resource::new(vec![opentelemetry::KeyValue::new(
-            "service.name",
-            "zt-gateway",
-        )]);
-
-        let provider = opentelemetry_sdk::trace::TracerProvider::builder()
-            .with_batch_exporter(exporter, opentelemetry_sdk::runtime::Tokio)
-            .with_resource(resource)
-            .build();
-
-        opentelemetry::global::set_tracer_provider(provider.clone());
-        provider
-    });
-
-    let otel_layer = otel_provider
-        .as_ref()
-        .map(|provider| tracing_opentelemetry::layer().with_tracer(provider.tracer("zt-gateway")));
+    let otel_layer = tracing_opentelemetry::layer().with_tracer(provider.tracer("zt-gateway"));
 
     tracing_subscriber::registry()
         .with(tracing_subscriber::EnvFilter::from_default_env())
@@ -114,7 +121,7 @@ fn init_tracing() -> Option<opentelemetry_sdk::trace::TracerProvider> {
         .with(otel_layer)
         .init();
 
-    otel_provider
+    provider
 }
 
 #[tokio::main]
@@ -768,6 +775,134 @@ fn header_str(headers: &HeaderMap, name: &str) -> Option<String> {
     headers.get(name)?.to_str().ok().map(str::to_string)
 }
 
+// --- F12: W3C TraceContext propagation ---
+
+/// Adapts an axum `HeaderMap` so `opentelemetry`'s propagators (see
+/// `extract_trace_context`) can read `traceparent`/`tracestate` straight
+/// out of it.
+struct HeaderExtractor<'a>(&'a HeaderMap);
+
+impl<'a> Extractor for HeaderExtractor<'a> {
+    fn get(&self, key: &str) -> Option<&str> {
+        self.0.get(key).and_then(|value| value.to_str().ok())
+    }
+
+    fn keys(&self) -> Vec<&str> {
+        self.0.keys().map(|name| name.as_str()).collect()
+    }
+}
+
+/// The write-side counterpart to [`HeaderExtractor`] — lets a propagator
+/// write `traceparent`/`tracestate` straight into an outbound `HeaderMap`,
+/// whether that's the response going back to the caller or the request
+/// forwarded to the upstream. A header value a propagator produces that
+/// somehow isn't valid for an HTTP header is silently dropped rather than
+/// panicking — never hit in practice (`TraceContextPropagator` only ever
+/// emits ASCII hex and a restricted `tracestate` grammar), but `Injector`
+/// is a general-purpose trait and this keeps the impl total.
+struct HeaderInjector<'a>(&'a mut HeaderMap);
+
+impl<'a> Injector for HeaderInjector<'a> {
+    fn set(&mut self, key: &str, value: String) {
+        if let (Ok(name), Ok(value)) = (
+            axum::http::HeaderName::from_bytes(key.as_bytes()),
+            axum::http::HeaderValue::from_str(&value),
+        ) {
+            self.0.insert(name, value);
+        }
+    }
+}
+
+/// Extracts a W3C TraceContext from inbound request headers via the
+/// globally-configured propagator (see `init_tracing`). Absent or
+/// malformed `traceparent`/`tracestate` headers simply yield an empty
+/// context — the same as starting a fresh trace — never an error callers
+/// have to handle.
+fn extract_trace_context(headers: &HeaderMap) -> OtelContext {
+    global::get_text_map_propagator(|propagator| propagator.extract(&HeaderExtractor(headers)))
+}
+
+/// Injects `cx`'s span context back out as `traceparent`/`tracestate`
+/// headers. Called on both the response handed back to the caller and the
+/// request forwarded to the upstream (see `proxy_handler` and
+/// `forward_to_upstream`), so every hop of a delegation chain — including
+/// the original caller, who gets it echoed straight back — carries the
+/// same trace ID end-to-end.
+fn inject_trace_context(cx: &OtelContext, headers: &mut HeaderMap) {
+    global::get_text_map_propagator(|propagator| propagator.inject_context(cx, &mut HeaderInjector(headers)));
+}
+
+/// Attaches `cx`'s propagated trace headers onto an outgoing `Response`,
+/// whether the request was allowed (forwarded upstream) or denied —
+/// tracing needs the same trace ID back either way, and a 403 is exactly
+/// as interesting to a trace as a 200.
+fn with_trace_headers(mut response: Response, cx: &OtelContext) -> Response {
+    inject_trace_context(cx, response.headers_mut());
+    response
+}
+
+/// Records verified OBO claims onto `cx`'s span — never the unsigned
+/// `X-SPIFFE-*` headers (see this module's F2 note above `proxy_handler`),
+/// only claims `obo::validate_with_cert_binding` has already told us are
+/// trustworthy (`decision == Allow`) or, on a deny, whatever the signature
+/// verification alone can still vouch for, for audit purposes.
+///
+/// Attribute names follow the brief's F12 naming:
+/// - `obo.immediate_caller` — the verified direct caller (token `sub`, or
+///   the mTLS-verified `source_principal` for a direct, tokenless call).
+/// - `obo.user_principal` — the signed `user` claim, if the token carries
+///   one (the originating human/service the whole chain acts on behalf
+///   of).
+/// - `obo.delegation_depth` — `claims.delegation_chain().len()`: the
+///   signed chain's depth, never the unsigned `X-SPIFFE-Caller-Chain`
+///   header.
+/// - `obo.delegation_chain` — that same signed chain, rendered as a single
+///   string for a trace UI to display directly.
+fn record_obo_span_attributes(
+    cx: &OtelContext,
+    decision: &Decision,
+    verifier: &zero_trust::JwtVerifier,
+    obo_token: Option<&str>,
+    source_principal: Option<&SpiffeId>,
+) {
+    let span = cx.span();
+    let verified_claims = obo_token.and_then(|token| verifier.verify_signature(token).ok());
+
+    match decision {
+        Decision::Allow => {
+            if let Some(claims) = &verified_claims {
+                let chain = claims.delegation_chain();
+                span.set_attribute(KeyValue::new("obo.immediate_caller", claims.sub.clone()));
+                span.set_attribute(KeyValue::new("obo.delegation_depth", chain.len() as i64));
+                span.set_attribute(KeyValue::new("obo.delegation_chain", chain.join(" -> ")));
+                if let Some(user) = claims.extract_user_principal() {
+                    span.set_attribute(KeyValue::new("obo.user_principal", user));
+                }
+            } else if let Some(source) = source_principal {
+                // Direct-call path (no OBO token at all): the mTLS-verified
+                // peer identity is the only -- and entire -- delegation
+                // chain.
+                span.set_attribute(KeyValue::new("obo.immediate_caller", source.to_string()));
+                span.set_attribute(KeyValue::new("obo.delegation_depth", 1i64));
+                span.set_attribute(KeyValue::new("obo.delegation_chain", source.to_string()));
+            }
+        }
+        Decision::Deny(reason) => {
+            span.set_status(Status::error(reason.as_str().to_string()));
+            span.set_attribute(KeyValue::new("deny_reason", reason.as_str()));
+            // Audit-critical (per the brief): record whatever verified
+            // identity is available even on a deny, same signed-claims-only
+            // rule as the Allow path above -- an invalid/absent token or
+            // signature simply means there's nothing trustworthy to record.
+            if let Some(claims) = &verified_claims {
+                span.set_attribute(KeyValue::new("obo.attempted_caller", claims.sub.clone()));
+            } else if let Some(source) = source_principal {
+                span.set_attribute(KeyValue::new("obo.attempted_caller", source.to_string()));
+            }
+        }
+    }
+}
+
 // Field names deliberately match the blueprint's ADR-0008 OTEL span
 // attributes (`obo.caller_principal`, `obo.chain`, `obo.user_principal`,
 // `obo.token_ttl_seconds`) so traces from this project line up with what
@@ -803,6 +938,15 @@ async fn proxy_handler(
         Ok(bytes) => bytes,
         Err(_) => return error_response(StatusCode::BAD_REQUEST, "failed to read request body"),
     };
+
+    // F12 fix: extract whatever W3C TraceContext the caller sent (absent or
+    // malformed `traceparent`/`tracestate` just yields an empty context —
+    // the same as starting a fresh trace) and start this hop's span as its
+    // child, so a single delegation chain across multiple gateways shows up
+    // as one trace rather than several disconnected ones.
+    let parent_trace_cx = extract_trace_context(&parts.headers);
+    let otel_span = global::tracer("zt-gateway").start_with_context("gateway_request", &parent_trace_cx);
+    let trace_cx = parent_trace_cx.with_span(otel_span);
 
     let peer = peer_identity.map(|Extension(peer)| peer);
     let source_principal = peer.as_ref().and_then(|peer| peer.spiffe_id.clone());
@@ -881,8 +1025,20 @@ async fn proxy_handler(
         "authorization decision"
     );
 
-    match decision {
-        Decision::Allow => forward_to_upstream(&state, parts, body_bytes).await,
+    // F12 fix: record verified OBO claims onto the OTel span -- never the
+    // unsigned `X-SPIFFE-*` headers (`obo_token`/`source_principal` are
+    // already the verified inputs `validate_with_cert_binding` itself used
+    // for the decision above, not the raw headers read further up).
+    record_obo_span_attributes(
+        &trace_cx,
+        &decision,
+        state.identity.verifier(),
+        obo_token.as_deref(),
+        source_principal.as_ref(),
+    );
+
+    let response = match decision {
+        Decision::Allow => forward_to_upstream(&state, parts, body_bytes, &trace_cx).await,
         Decision::Deny(reason) => (
             StatusCode::FORBIDDEN,
             Json(DenyBody {
@@ -890,7 +1046,14 @@ async fn proxy_handler(
             }),
         )
             .into_response(),
-    }
+    };
+
+    // Closes out this hop's span (recording its end time) and makes sure
+    // the trace ID comes back out on the response regardless of whether
+    // the request was allowed or denied -- a 403 is exactly as interesting
+    // to a trace as a 200 (F12: "deny events traced with reason").
+    trace_cx.span().end();
+    with_trace_headers(response, &trace_cx)
 }
 
 /// Headers that describe *this* hop's transport framing, not the request
@@ -898,7 +1061,12 @@ async fn proxy_handler(
 /// for the new connection to the upstream instead of reusing stale values.
 const HOP_BY_HOP_HEADERS: [&str; 3] = ["host", "content-length", "connection"];
 
-async fn forward_to_upstream(state: &AppState, parts: axum::http::request::Parts, body_bytes: axum::body::Bytes) -> Response {
+async fn forward_to_upstream(
+    state: &AppState,
+    parts: axum::http::request::Parts,
+    body_bytes: axum::body::Bytes,
+    trace_cx: &OtelContext,
+) -> Response {
     // Check body size limit (F6 fix)
     if body_bytes.len() > state.max_body_bytes {
         return error_response(StatusCode::PAYLOAD_TOO_LARGE, "payload too large");
@@ -915,6 +1083,10 @@ async fn forward_to_upstream(state: &AppState, parts: axum::http::request::Parts
     for name in HOP_BY_HOP_HEADERS {
         headers.remove(name);
     }
+    // F12 fix: propagate the same trace context onward to the upstream, so
+    // a delegation chain that keeps going past this gateway still shows up
+    // as one trace rather than ending here.
+    inject_trace_context(trace_cx, &mut headers);
 
     let upstream_request = state
         .http_client
@@ -1994,5 +2166,339 @@ workloads:
             .layer(ConcurrencyLimitLayer::new(max_concurrent_connections as usize))
             .layer(TraceLayer::new_for_http())
             .with_state(state)
+    }
+
+    // --- Task 9: W3C TraceContext propagation (F12) ---
+
+    use opentelemetry_sdk::testing::trace::{InMemorySpanExporter, InMemorySpanExporterBuilder};
+    use opentelemetry_sdk::trace::TracerProvider as SdkTracerProvider;
+    use std::sync::OnceLock;
+
+    static TEST_SPAN_EXPORTER: OnceLock<InMemorySpanExporter> = OnceLock::new();
+
+    /// Installs one process-wide OTel `TracerProvider` (backed by an
+    /// in-memory exporter) and the W3C TraceContext propagator, the first
+    /// time any F12 test calls it -- `init_tracing()` itself is never
+    /// exercised by this test module (it also installs a global
+    /// `tracing_subscriber` default, which can only ever be set once per
+    /// process, and none of these tests need it).
+    ///
+    /// Because this is `cargo test`'s one shared process and tests run in
+    /// parallel, the returned exporter accumulates spans from *every* test
+    /// that touches `proxy_handler` for the rest of the run, not just the
+    /// caller's own request. Every test below copes with that by filtering
+    /// spans down to its own, randomly-chosen `traceparent` trace ID rather
+    /// than assuming the exporter is empty or reading it positionally.
+    fn test_span_exporter() -> InMemorySpanExporter {
+        TEST_SPAN_EXPORTER
+            .get_or_init(|| {
+                let exporter = InMemorySpanExporterBuilder::new().build();
+                let provider = SdkTracerProvider::builder()
+                    .with_simple_exporter(exporter.clone())
+                    .build();
+                global::set_tracer_provider(provider);
+                global::set_text_map_propagator(TraceContextPropagator::new());
+                exporter
+            })
+            .clone()
+    }
+
+    fn traceparent_header(trace_id: &str, span_id: &str) -> String {
+        format!("00-{trace_id}-{span_id}-01")
+    }
+
+    /// Spawns a real upstream that records the headers of the most recent
+    /// request it received (alongside returning 200 "ok"), so a test can
+    /// inspect what `forward_to_upstream` actually sent onward.
+    async fn spawn_header_capturing_upstream() -> (String, Arc<std::sync::Mutex<Option<HeaderMap>>>) {
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        let captured_for_handler = captured.clone();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let app = Router::new().fallback(move |headers: HeaderMap| {
+            let captured = captured_for_handler.clone();
+            async move {
+                *captured.lock().unwrap() = Some(headers);
+                (SC::OK, "ok")
+            }
+        });
+
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        (format!("http://{addr}"), captured)
+    }
+
+    #[tokio::test]
+    async fn trace_context_is_propagated_onto_the_response_even_when_denied() {
+        let _exporter = test_span_exporter(); // ensures the propagator is installed
+        let state = test_state("http://unused.invalid".to_string());
+        let router = build_router(state);
+
+        let trace_id = "4bf92f3577b34da6a3ce929d0e0e4736";
+        let request = Request::builder()
+            .method("GET")
+            .uri("/some/path")
+            .header("traceparent", traceparent_header(trace_id, "00f067aa0ba902b7"))
+            .body(Body::empty())
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        // No OBO token at all -> denied, but the trace ID must still come
+        // back: a 403 is exactly as interesting to a trace as a 200.
+        assert_eq!(response.status(), SC::FORBIDDEN);
+        let traceparent = response
+            .headers()
+            .get("traceparent")
+            .expect("response should carry a traceparent header")
+            .to_str()
+            .unwrap();
+        assert!(traceparent.contains(trace_id), "got: {traceparent}");
+    }
+
+    #[tokio::test]
+    async fn trace_context_is_injected_into_the_forwarded_upstream_request() {
+        let _exporter = test_span_exporter();
+        let (upstream_addr, captured_headers) = spawn_header_capturing_upstream().await;
+        let state = test_state(upstream_addr);
+        let issued = state
+            .identity
+            .issue_jwt_svid("orders-svc", INVENTORY, "orders-secret")
+            .unwrap();
+        let router = build_router(state);
+
+        let trace_id = "4bf92f3577b34da6a3ce929d0e0e4736";
+        let request = Request::builder()
+            .method("GET")
+            .uri("/some/path")
+            .header(HEADER_OBO_TOKEN, issued.token)
+            .header("traceparent", traceparent_header(trace_id, "00f067aa0ba902b7"))
+            .body(Body::empty())
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), SC::OK);
+
+        let headers = captured_headers
+            .lock()
+            .unwrap()
+            .take()
+            .expect("upstream should have been hit");
+        let forwarded_traceparent = headers
+            .get("traceparent")
+            .expect("forwarded request should carry a traceparent header")
+            .to_str()
+            .unwrap();
+        assert!(forwarded_traceparent.contains(trace_id), "got: {forwarded_traceparent}");
+    }
+
+    #[tokio::test]
+    async fn obo_attributes_are_recorded_on_the_span_when_allowed() {
+        let exporter = test_span_exporter();
+        let (upstream_addr, _hits) = spawn_test_upstream("hello from upstream").await;
+        let state = test_state(upstream_addr);
+        let issued = state
+            .identity
+            .issue_jwt_svid("orders-svc", INVENTORY, "orders-secret")
+            .unwrap();
+        let router = build_router(state);
+
+        let trace_id = "a1a12f3577b34da6a3ce929d0e0e4736";
+        let request = Request::builder()
+            .method("GET")
+            .uri("/some/path")
+            .header(HEADER_OBO_TOKEN, issued.token)
+            .header("traceparent", traceparent_header(trace_id, "00f067aa0ba902b7"))
+            .body(Body::empty())
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), SC::OK);
+
+        let spans = exporter.get_finished_spans().unwrap();
+        let span = spans
+            .iter()
+            .find(|s| s.name == "gateway_request" && s.span_context.trace_id().to_string() == trace_id)
+            .expect("expected a gateway_request span recorded for this trace id");
+
+        let attr = |key: &str| -> Option<String> {
+            span.attributes
+                .iter()
+                .find(|kv| kv.key.as_str() == key)
+                .map(|kv| kv.value.to_string())
+        };
+
+        assert_eq!(attr("obo.immediate_caller").as_deref(), Some(ORDERS));
+        assert_eq!(attr("obo.delegation_depth").as_deref(), Some("1"));
+        assert_eq!(attr("obo.delegation_chain").as_deref(), Some(ORDERS));
+        // No `user` claim on this token -> no obo.user_principal attribute,
+        // never falling back to any unverified header.
+        assert_eq!(attr("obo.user_principal"), None);
+    }
+
+    #[tokio::test]
+    async fn obo_user_principal_is_recorded_from_the_signed_claim_not_a_header() {
+        let exporter = test_span_exporter();
+        let (upstream_addr, _hits) = spawn_test_upstream("hello").await;
+        let mut state = test_state(upstream_addr);
+
+        // Mint a token with a signed `user` claim directly (issue_jwt_svid
+        // doesn't take one), the same way obo.rs's own tests do.
+        let registry = test_registry();
+        let (signer, verifier) = {
+            use rsa::pkcs1::{EncodeRsaPrivateKey, EncodeRsaPublicKey, LineEnding};
+            use rsa::{RsaPrivateKey, RsaPublicKey};
+            let mut rng = rand::rngs::OsRng;
+            let private_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+            let public_key = RsaPublicKey::from(&private_key);
+            let private_pem = private_key.to_pkcs1_pem(LineEnding::LF).unwrap();
+            let public_pem = public_key.to_pkcs1_pem(LineEnding::LF).unwrap();
+            (
+                zero_trust::JwtSigner::from_rsa_pem(private_pem.as_bytes()).unwrap(),
+                zero_trust::JwtVerifier::from_rsa_pem(public_pem.as_bytes()).unwrap(),
+            )
+        };
+        const ALICE: &str = "spiffe://chakra.internal/ns/users/sa/alice";
+        let claims = zero_trust::OboClaims {
+            sub: ORDERS.to_string(),
+            aud: vec![INVENTORY.to_string()],
+            user: Some(ALICE.to_string()),
+            act: None,
+            iat: 0,
+            exp: now_unix_secs() + 300,
+            nbf: None,
+            jti: None,
+            cnf: None,
+        };
+        let token = signer.sign(&claims).unwrap();
+        state.identity = Arc::new(LocalIssuer::new(registry, signer, verifier, 300));
+        let router = build_router(state);
+
+        let trace_id = "b2b22f3577b34da6a3ce929d0e0e4736";
+        let request = Request::builder()
+            .method("GET")
+            .uri("/some/path")
+            .header(HEADER_OBO_TOKEN, token)
+            // Attacker-controlled header claims a different user entirely --
+            // must never override the signed claim above (F2).
+            .header(HEADER_USER_PRINCIPAL, "spiffe://chakra.internal/ns/users/sa/mallory")
+            .header("traceparent", traceparent_header(trace_id, "00f067aa0ba902b7"))
+            .body(Body::empty())
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), SC::OK);
+
+        let spans = exporter.get_finished_spans().unwrap();
+        let span = spans
+            .iter()
+            .find(|s| s.name == "gateway_request" && s.span_context.trace_id().to_string() == trace_id)
+            .expect("expected a gateway_request span recorded for this trace id");
+        let attr = |key: &str| -> Option<String> {
+            span.attributes
+                .iter()
+                .find(|kv| kv.key.as_str() == key)
+                .map(|kv| kv.value.to_string())
+        };
+        assert_eq!(attr("obo.user_principal").as_deref(), Some(ALICE));
+    }
+
+    #[tokio::test]
+    async fn deny_reason_is_recorded_on_the_span() {
+        let exporter = test_span_exporter();
+        let state = test_state("http://unused.invalid".to_string());
+        let router = build_router(state);
+
+        let trace_id = "c3c32f3577b34da6a3ce929d0e0e4736";
+        let request = Request::builder()
+            .method("GET")
+            .uri("/some/path")
+            .header("traceparent", traceparent_header(trace_id, "00f067aa0ba902b7"))
+            .body(Body::empty())
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), SC::FORBIDDEN);
+
+        let spans = exporter.get_finished_spans().unwrap();
+        let span = spans
+            .iter()
+            .find(|s| s.name == "gateway_request" && s.span_context.trace_id().to_string() == trace_id)
+            .expect("expected a gateway_request span recorded for this trace id");
+        let deny_reason = span
+            .attributes
+            .iter()
+            .find(|kv| kv.key.as_str() == "deny_reason")
+            .map(|kv| kv.value.to_string());
+        assert_eq!(deny_reason.as_deref(), Some("caller_not_in_allow_list"));
+    }
+
+    /// The core F12 acceptance criterion, in miniature: a delegation chain
+    /// that crosses multiple independent gateway instances (simulated here
+    /// as two separate `AppState`s/routers, the same way the rest of this
+    /// suite stands in for separate processes) must still appear as a
+    /// single trace -- every hop's `gateway_request` span sharing one trace
+    /// ID -- rather than several disconnected ones.
+    #[tokio::test]
+    async fn delegation_across_two_gateway_hops_shares_one_trace_id() {
+        let exporter = test_span_exporter();
+        let (upstream_addr, _hits) = spawn_test_upstream("ok").await;
+
+        let trace_id = "d4d42f3577b34da6a3ce929d0e0e4736";
+        let traceparent = traceparent_header(trace_id, "00f067aa0ba902b7");
+
+        let state1 = test_state(upstream_addr.clone());
+        let token1 = state1
+            .identity
+            .issue_jwt_svid("orders-svc", INVENTORY, "orders-secret")
+            .unwrap();
+        let router1 = build_router(state1);
+        let resp1 = router1
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/some/path")
+                    .header(HEADER_OBO_TOKEN, token1.token)
+                    .header("traceparent", traceparent.clone())
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp1.status(), SC::OK);
+
+        let state2 = test_state(upstream_addr);
+        let token2 = state2
+            .identity
+            .issue_jwt_svid("orders-svc", INVENTORY, "orders-secret")
+            .unwrap();
+        let router2 = build_router(state2);
+        let resp2 = router2
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/some/path")
+                    .header(HEADER_OBO_TOKEN, token2.token)
+                    .header("traceparent", traceparent)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp2.status(), SC::OK);
+
+        let spans = exporter.get_finished_spans().unwrap();
+        let matching: Vec<_> = spans
+            .iter()
+            .filter(|s| s.name == "gateway_request" && s.span_context.trace_id().to_string() == trace_id)
+            .collect();
+        assert_eq!(
+            matching.len(),
+            2,
+            "expected both hops to share one trace id, got {matching:?}"
+        );
     }
 }

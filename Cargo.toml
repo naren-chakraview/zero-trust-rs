@@ -40,3 +40,8 @@ tower = { version = "0.4", features = ["util", "limit", "buffer"] }
 subtle = "2"
 sha2 = "0.10"
 base64 = "0.22"
+
+[dev-dependencies]
+# F12 tests: `InMemorySpanExporter`, for asserting on recorded span
+# attributes/status without a real OTLP collector.
+opentelemetry_sdk = { version = "0.27", features = ["testing"] }

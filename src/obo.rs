@@ -19,8 +19,18 @@
 //!   runs — Rego only ever sees already-verified claims. This crate has no
 //!   upstream filter doing that, so `validate` verifies the signature
 //!   itself and needs a reason when that fails.
+//!
+//! ## F1 / F2 fix (review 0001)
+//!
+//! Chain depth, chain membership and the originating user principal used to
+//! be read from unsigned headers (`X-SPIFFE-Caller-Chain`,
+//! `X-SPIFFE-User-Principal`), which any caller could forge or omit. They
+//! are now read exclusively from the *signed* `act`/`user` claims on the
+//! verified OBO token (`OboClaims::delegation_chain`,
+//! `OboClaims::extract_user_principal`, from Task 3). `request.caller_chain`
+//! remains on [`ValidationRequest`] only for callers that want to log or
+//! trace the raw header value — `validate` never reads it.
 
-use crate::headers::CallerChain;
 use crate::jwt::JwtVerifier;
 use crate::registry::Registry;
 use crate::spiffe_id::SpiffeId;
@@ -31,6 +41,13 @@ use crate::spiffe_id::SpiffeId;
 /// (`source_principal`, `None` when there's no independently-verified
 /// channel identity — the case for v0.1's plain-HTTP proxy), and the OBO
 /// delegation headers, if present.
+///
+/// `caller_chain` is **advisory only**: it used to drive the chain-depth
+/// decision (the F1 gap), but `validate` now computes depth and chain
+/// membership from the signed `act` claim on `obo_token` instead. The field
+/// is kept here purely so callers have somewhere to carry the raw
+/// `X-SPIFFE-Caller-Chain` header through for logging/tracing — `validate`
+/// never reads it.
 #[derive(Debug, Clone)]
 pub struct ValidationRequest<'a> {
     pub destination: &'a SpiffeId,
@@ -70,6 +87,14 @@ pub enum DenyReason {
     OboTokenInvalidAudience,
     OboTokenSignatureInvalid,
     OboTokenSubjectMismatch,
+    /// F1 fix: a hop recorded in the signed delegation chain (`sub`, or any
+    /// `act.sub`) is not a well-formed SPIFFE ID.
+    InvalidChainEntry,
+    /// F2 fix: the signed `user` claim is present but is not a well-formed
+    /// SPIFFE ID.
+    InvalidUserPrincipal,
+    /// The token's `nbf` is in the future, beyond the clock-skew allowance.
+    OboTokenNotYetValid,
 }
 
 impl DenyReason {
@@ -82,6 +107,9 @@ impl DenyReason {
             DenyReason::OboTokenInvalidAudience => "obo_token_invalid_audience",
             DenyReason::OboTokenSignatureInvalid => "obo_token_signature_invalid",
             DenyReason::OboTokenSubjectMismatch => "obo_token_subject_mismatch",
+            DenyReason::InvalidChainEntry => "invalid_chain_entry",
+            DenyReason::InvalidUserPrincipal => "invalid_user_principal",
+            DenyReason::OboTokenNotYetValid => "obo_token_not_yet_valid",
         }
     }
 }
@@ -102,17 +130,10 @@ pub fn validate(
         return Decision::Deny(DenyReason::UnknownDestination);
     };
 
-    // Depth check applies unconditionally, independent of OBO-token
-    // presence — matches ADR-0007's worked example ("a,b,c,d" = depth 4
-    // exceeds max 3, denied regardless of anything else about the request).
-    let chain = CallerChain::parse(request.caller_chain.unwrap_or(""));
-    if chain.depth() > destination_entry.max_obo_chain_depth as usize {
-        return Decision::Deny(DenyReason::OboChainDepthExceeded);
-    }
-
     let Some(token) = request.obo_token else {
         // Direct-call path: no OBO token, so the transport-verified peer
-        // (if any) must itself be allow-listed for this destination.
+        // (if any) must itself be allow-listed for this destination. No
+        // delegation chain exists to check depth or membership on.
         return match request.source_principal {
             Some(source) if destination_entry.allowed_callers.contains(source) => Decision::Allow,
             _ => Decision::Deny(DenyReason::CallerNotInAllowList),
@@ -124,8 +145,46 @@ pub fn validate(
         return Decision::Deny(DenyReason::OboTokenSignatureInvalid);
     };
 
+    // --- F1 fix: signed chain depth + membership, not the header --------
+    // `delegation_chain()` is `[sub, act.sub, act.act.sub, ...]` — the
+    // immediate caller plus every hop recorded before it in the signed
+    // `act` nesting — so its length is the same quantity the old
+    // header-based check compared against `max_obo_chain_depth` (the
+    // header, too, included the immediate sender as its last-appended
+    // entry). The difference is entirely about *where the number comes
+    // from*: `request.caller_chain` (unsigned, attacker-controlled) is
+    // never read here.
+    let chain = claims.delegation_chain();
+    if chain.len() > destination_entry.max_obo_chain_depth as usize {
+        return Decision::Deny(DenyReason::OboChainDepthExceeded);
+    }
+    for entry in &chain {
+        if entry.parse::<SpiffeId>().is_err() {
+            return Decision::Deny(DenyReason::InvalidChainEntry);
+        }
+    }
+
+    // --- F2 fix: signed user principal, not the header -------------------
+    // `request.caller_chain`'s unsigned sibling header
+    // (`X-SPIFFE-User-Principal`) is never consulted here at all — only
+    // the signed `user` claim, if the token carries one.
+    if let Some(user) = claims.extract_user_principal() {
+        if user.parse::<SpiffeId>().is_err() {
+            return Decision::Deny(DenyReason::InvalidUserPrincipal);
+        }
+    }
+
     if now_unix_secs >= claims.exp {
         return Decision::Deny(DenyReason::OboTokenExpired);
+    }
+
+    // Not-before, with a short clock-skew allowance (unlike `exp` above,
+    // which is checked strictly, with none).
+    if let Some(nbf) = claims.nbf {
+        const CLOCK_SKEW_SECS: i64 = 30;
+        if nbf > now_unix_secs + CLOCK_SKEW_SECS {
+            return Decision::Deny(DenyReason::OboTokenNotYetValid);
+        }
     }
 
     let destination_str = request.destination.to_string();
@@ -143,6 +202,9 @@ pub fn validate(
 
     match claims.sub.parse::<SpiffeId>() {
         Ok(sub_id) if destination_entry.allowed_callers.contains(&sub_id) => Decision::Allow,
+        // Unreachable in practice: an unparseable `sub` is already caught
+        // by the chain-entry check above (`sub` is `chain[0]`). Kept as a
+        // fail-closed fallback rather than an `unreachable!()`.
         _ => Decision::Deny(DenyReason::CallerNotInAllowList),
     }
 }
@@ -168,7 +230,7 @@ impl Validator {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jwt::{JwtSigner, OboClaims};
+    use crate::jwt::{ActClaim, JwtSigner, OboClaims};
     use rsa::pkcs1::{EncodeRsaPrivateKey, EncodeRsaPublicKey, LineEnding};
     use rsa::{RsaPrivateKey, RsaPublicKey};
 
@@ -176,21 +238,29 @@ mod tests {
     const ORDERS: &str = "spiffe://chakra.internal/ns/orders/sa/orders-svc";
     const API_GATEWAY: &str = "spiffe://chakra.internal/ns/api-gateway/sa/api-gateway";
     const UNKNOWN: &str = "spiffe://chakra.internal/ns/ghost/sa/ghost";
+    const ALICE: &str = "spiffe://chakra.internal/ns/users/sa/alice";
+    const GW1: &str = "spiffe://chakra.internal/ns/gw1/sa/gw1";
+    const GW2: &str = "spiffe://chakra.internal/ns/gw2/sa/gw2";
+    const GW3: &str = "spiffe://chakra.internal/ns/gw3/sa/gw3";
 
-    fn test_registry() -> Registry {
+    fn test_registry_with_max_depth(max_obo_chain_depth: u32) -> Registry {
         let yaml = format!(
             r#"
 trust_domain: chakra.internal
 workloads:
   - name: inventory-svc
     spiffe_id: {INVENTORY}
-    max_obo_chain_depth: 3
+    max_obo_chain_depth: {max_obo_chain_depth}
     allowed_callers:
       - {ORDERS}
       - {API_GATEWAY}
 "#
         );
         Registry::from_yaml_str(&yaml).unwrap()
+    }
+
+    fn test_registry() -> Registry {
+        test_registry_with_max_depth(3)
     }
 
     fn id(s: &str) -> SpiffeId {
@@ -264,24 +334,321 @@ workloads:
         );
     }
 
+    /// F1 fix — deviation note: this test originally drove the deny from
+    /// the unsigned `X-SPIFFE-Caller-Chain` header alone
+    /// (`caller_chain: Some("a,b,c,d")`, depth 4 > max 3), with no signed
+    /// chain at all. That mechanism is *exactly* the F1 vulnerability this
+    /// task fixes — the header is no longer read by `validate` for any
+    /// decision — so the old assertion could not survive unchanged. The
+    /// test is rewritten here to reach the same depth (4: `sub` + 3 signed
+    /// `act` hops) through the fixed mechanism instead, with no
+    /// `caller_chain` header at all, preserving the original test's intent
+    /// ("depth exceeded denies regardless of an otherwise valid setup").
     #[test]
     fn chain_depth_exceeded_denies_regardless_of_an_otherwise_valid_setup() {
         let registry = test_registry();
         let (signer, verifier) = test_keys();
         let destination = id(INVENTORY);
-        let token = mint_token(&signer, ORDERS, &[INVENTORY], 0, 300);
+        let claims = OboClaims {
+            sub: ORDERS.to_string(),
+            aud: vec![INVENTORY.to_string()],
+            user: None,
+            act: Some(Box::new(ActClaim {
+                sub: GW1.to_string(),
+                act: Some(Box::new(ActClaim {
+                    sub: GW2.to_string(),
+                    act: Some(Box::new(ActClaim {
+                        sub: GW3.to_string(),
+                        act: None,
+                    })),
+                })),
+            })),
+            iat: 0,
+            exp: 300,
+            nbf: None,
+            jti: None,
+            cnf: None,
+        };
+        let token = signer.sign(&claims).unwrap();
 
         let request = ValidationRequest {
             destination: &destination,
             source_principal: None,
             obo_token: Some(&token),
-            caller_chain: Some("a,b,c,d"), // depth 4, max is 3
+            caller_chain: None, // the header this test used to rely on is gone
         };
 
         assert_eq!(
             validate(&registry, &verifier, &request, 0),
             Decision::Deny(DenyReason::OboChainDepthExceeded)
         );
+    }
+
+    // --- F1, F2 fixed: signed chain depth, chain membership and user
+    // principal are enforced from the token, never from headers. These
+    // invert gap probes F1 and F2 from
+    // docs/reviews/0001-security-gap-review.md into regression tests (see
+    // also tests/gap_probes.rs, which exercises the same fix through the
+    // crate's public API).
+
+    #[test]
+    fn f1_signed_chain_depth_enforced() {
+        let registry = test_registry_with_max_depth(3);
+        let (signer, verifier) = test_keys();
+        let destination = id(INVENTORY);
+
+        // 4-deep signed chain (sub + 3 act hops) exceeds max depth 3.
+        let claims = OboClaims {
+            sub: ORDERS.to_string(),
+            aud: vec![INVENTORY.to_string()],
+            user: Some(ALICE.to_string()),
+            act: Some(Box::new(ActClaim {
+                sub: GW1.to_string(),
+                act: Some(Box::new(ActClaim {
+                    sub: GW2.to_string(),
+                    act: Some(Box::new(ActClaim {
+                        sub: GW3.to_string(),
+                        act: None,
+                    })),
+                })),
+            })),
+            iat: 0,
+            exp: 300,
+            nbf: None,
+            jti: None,
+            cnf: None,
+        };
+        let token = signer.sign(&claims).unwrap();
+
+        let request = ValidationRequest {
+            destination: &destination,
+            source_principal: None,
+            obo_token: Some(&token),
+            caller_chain: None, // header absent entirely
+        };
+
+        assert_eq!(
+            validate(&registry, &verifier, &request, 0),
+            Decision::Deny(DenyReason::OboChainDepthExceeded)
+        );
+    }
+
+    #[test]
+    fn f1_chain_entries_validated_as_spiffe_ids() {
+        let registry = test_registry();
+        let (signer, verifier) = test_keys();
+        let destination = id(INVENTORY);
+
+        let claims = OboClaims {
+            sub: ORDERS.to_string(),
+            aud: vec![INVENTORY.to_string()],
+            user: Some(ALICE.to_string()),
+            act: Some(Box::new(ActClaim {
+                sub: "not-a-spiffe-id".to_string(), // invalid chain entry
+                act: None,
+            })),
+            iat: 0,
+            exp: 300,
+            nbf: None,
+            jti: None,
+            cnf: None,
+        };
+        let token = signer.sign(&claims).unwrap();
+
+        let request = ValidationRequest {
+            destination: &destination,
+            source_principal: None,
+            obo_token: Some(&token),
+            caller_chain: None,
+        };
+
+        assert_eq!(
+            validate(&registry, &verifier, &request, 0),
+            Decision::Deny(DenyReason::InvalidChainEntry)
+        );
+    }
+
+    #[test]
+    fn f2_user_principal_validated() {
+        let registry = test_registry();
+        let (signer, verifier) = test_keys();
+        let destination = id(INVENTORY);
+
+        let claims = OboClaims {
+            sub: ORDERS.to_string(),
+            aud: vec![INVENTORY.to_string()],
+            user: Some("not-a-user-id".to_string()), // invalid user principal
+            act: None,
+            iat: 0,
+            exp: 300,
+            nbf: None,
+            jti: None,
+            cnf: None,
+        };
+        let token = signer.sign(&claims).unwrap();
+
+        let request = ValidationRequest {
+            destination: &destination,
+            source_principal: None,
+            obo_token: Some(&token),
+            caller_chain: None,
+        };
+
+        assert_eq!(
+            validate(&registry, &verifier, &request, 0),
+            Decision::Deny(DenyReason::InvalidUserPrincipal)
+        );
+    }
+
+    #[test]
+    fn f2_valid_signed_user_principal_is_allowed() {
+        let registry = test_registry();
+        let (signer, verifier) = test_keys();
+        let destination = id(INVENTORY);
+
+        let claims = OboClaims {
+            sub: ORDERS.to_string(),
+            aud: vec![INVENTORY.to_string()],
+            user: Some(ALICE.to_string()), // valid SPIFFE ID
+            act: None,
+            iat: 0,
+            exp: 300,
+            nbf: None,
+            jti: None,
+            cnf: None,
+        };
+        let token = signer.sign(&claims).unwrap();
+
+        let request = ValidationRequest {
+            destination: &destination,
+            source_principal: None,
+            obo_token: Some(&token),
+            caller_chain: None,
+        };
+
+        assert_eq!(validate(&registry, &verifier, &request, 0), Decision::Allow);
+    }
+
+    #[test]
+    fn f1_f2_header_override_impossible() {
+        let registry = test_registry_with_max_depth(2);
+        let (signer, verifier) = test_keys();
+        let destination = id(INVENTORY);
+
+        // 3-deep signed chain (sub + 2 act hops) exceeds max depth 2.
+        let claims = OboClaims {
+            sub: ORDERS.to_string(),
+            aud: vec![INVENTORY.to_string()],
+            user: Some(ALICE.to_string()),
+            act: Some(Box::new(ActClaim {
+                sub: GW1.to_string(),
+                act: Some(Box::new(ActClaim {
+                    sub: GW2.to_string(),
+                    act: None,
+                })),
+            })),
+            iat: 0,
+            exp: 300,
+            nbf: None,
+            jti: None,
+            cnf: None,
+        };
+        let token = signer.sign(&claims).unwrap();
+
+        // Attacker-controlled header claims a short, harmless chain.
+        let request = ValidationRequest {
+            destination: &destination,
+            source_principal: None,
+            obo_token: Some(&token),
+            caller_chain: Some("fake,chain"),
+        };
+
+        assert_eq!(
+            validate(&registry, &verifier, &request, 0),
+            Decision::Deny(DenyReason::OboChainDepthExceeded)
+        );
+
+        // Proof the header truly has no effect: omitting it entirely yields
+        // the identical decision.
+        let request_no_header = ValidationRequest {
+            caller_chain: None,
+            ..request
+        };
+        assert_eq!(
+            validate(&registry, &verifier, &request_no_header, 0),
+            Decision::Deny(DenyReason::OboChainDepthExceeded)
+        );
+    }
+
+    #[test]
+    fn obo_token_not_yet_valid_is_denied() {
+        let registry = test_registry();
+        let (signer, verifier) = test_keys();
+        let destination = id(INVENTORY);
+        let mut claims = OboClaims {
+            sub: ORDERS.to_string(),
+            aud: vec![INVENTORY.to_string()],
+            user: None,
+            act: None,
+            iat: 0,
+            exp: 300,
+            nbf: Some(1_000), // far beyond the 30s clock-skew allowance at now=0
+            jti: None,
+            cnf: None,
+        };
+        claims.exp = 2_000;
+        let token = signer.sign(&claims).unwrap();
+
+        let request = ValidationRequest {
+            destination: &destination,
+            source_principal: None,
+            obo_token: Some(&token),
+            caller_chain: None,
+        };
+
+        assert_eq!(
+            validate(&registry, &verifier, &request, 0),
+            Decision::Deny(DenyReason::OboTokenNotYetValid)
+        );
+    }
+
+    #[test]
+    fn obo_token_nbf_within_clock_skew_is_allowed() {
+        let registry = test_registry();
+        let (signer, verifier) = test_keys();
+        let destination = id(INVENTORY);
+        let claims = OboClaims {
+            sub: ORDERS.to_string(),
+            aud: vec![INVENTORY.to_string()],
+            user: None,
+            act: None,
+            iat: 0,
+            exp: 300,
+            nbf: Some(20), // within the 30s clock-skew allowance at now=0
+            jti: None,
+            cnf: None,
+        };
+        let token = signer.sign(&claims).unwrap();
+
+        let request = ValidationRequest {
+            destination: &destination,
+            source_principal: None,
+            obo_token: Some(&token),
+            caller_chain: None,
+        };
+
+        assert_eq!(validate(&registry, &verifier, &request, 0), Decision::Allow);
+    }
+
+    #[test]
+    fn new_deny_reasons_have_populated_strings() {
+        for reason in [
+            DenyReason::InvalidChainEntry,
+            DenyReason::InvalidUserPrincipal,
+            DenyReason::OboTokenNotYetValid,
+        ] {
+            assert_ne!(Decision::Deny(reason).deny_reason_str(), "none");
+        }
     }
 
     #[test]

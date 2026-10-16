@@ -454,6 +454,11 @@ async fn issue_x509_svid(State(state): State<AppState>, Json(req): Json<IssueX50
 struct AuthorizeRequest {
     destination: String,
     obo_token: Option<String>,
+    /// Accepted for backward wire-compatibility with existing callers (see
+    /// README's `/v1/authorize` shape), but deliberately never read: the
+    /// F1 fix means chain depth/membership come only from `obo_token`'s
+    /// signed `act` claim, never from a caller-supplied chain string.
+    #[allow(dead_code)]
     caller_chain: Option<String>,
 }
 
@@ -476,8 +481,14 @@ async fn authorize(
     let request = ValidationRequest {
         destination: &destination,
         source_principal: source_principal.as_ref(),
+        // F1 fix: `obo::validate` never reads `caller_chain` for a
+        // decision — chain depth and membership come from the signed
+        // `act` claim on `obo_token` instead (see `obo.rs`'s doc comment).
+        // A caller-supplied chain string is never forwarded into the
+        // decision path, even though validate() would ignore it anyway —
+        // this keeps the call site honest about what actually matters.
+        caller_chain: None,
         obo_token: req.obo_token.as_deref(),
-        caller_chain: req.caller_chain.as_deref(),
     };
     let decision = validate(&state.registry, state.identity.verifier(), &request, now_unix_secs());
 
@@ -516,6 +527,11 @@ fn header_str(headers: &HeaderMap, name: &str) -> Option<String> {
         obo.caller_principal = tracing::field::Empty,
         obo.chain = tracing::field::Empty,
         obo.user_principal = tracing::field::Empty,
+        // F2 fix: the raw, unverified `X-SPIFFE-User-Principal` header is
+        // recorded under this clearly-unverified attribute, never under
+        // `obo.user_principal` -- see the deny_reason reasoning in
+        // `proxy_handler` below.
+        obo.user_principal_unverified = tracing::field::Empty,
         obo.token_ttl_seconds = tracing::field::Empty,
         allow = tracing::field::Empty,
         deny_reason = tracing::field::Empty,
@@ -535,7 +551,13 @@ async fn proxy_handler(
         destination: &state.protected_workload,
         source_principal: source_principal.as_ref(),
         obo_token: obo_token.as_deref(),
-        caller_chain: caller_chain.as_deref(),
+        // F1 fix: never feed the unsigned `X-SPIFFE-Caller-Chain` header
+        // into the decision -- `obo::validate` computes chain depth and
+        // membership from the signed `act` claim instead. `caller_chain`
+        // (the local variable) is still read below, but only for tracing
+        // (`obo.chain`) and the structured log line, never for the
+        // decision itself.
+        caller_chain: None,
     };
     let decision = validate(&state.registry, state.identity.verifier(), &request, now_unix_secs());
 
@@ -543,8 +565,15 @@ async fn proxy_handler(
     span.record("allow", decision.is_allow());
     span.record("deny_reason", decision.deny_reason_str());
     span.record("obo.chain", caller_chain.as_deref().unwrap_or(""));
+    // F2 fix: the raw `X-SPIFFE-User-Principal` header is never trustworthy
+    // (any caller can set it to anything), so it is recorded only under
+    // this distinctly-named, clearly-unverified attribute -- never under
+    // `obo.user_principal`, which below is populated exclusively from the
+    // OBO token's *signed* `user` claim, already validated by
+    // `obo::validate` as a well-formed SPIFFE ID whenever the decision is
+    // Allow.
     if let Some(up) = &user_principal {
-        span.record("obo.user_principal", up.as_str());
+        span.record("obo.user_principal_unverified", up.as_str());
     }
     // Only meaningful once the decision is Allow -- re-verifying the token
     // here is purely to read its claims for tracing (obo::validate doesn't
@@ -554,6 +583,9 @@ async fn proxy_handler(
             if let Ok(claims) = state.identity.verifier().verify_signature(token) {
                 span.record("obo.caller_principal", claims.sub.as_str());
                 span.record("obo.token_ttl_seconds", claims.exp - now_unix_secs());
+                if let Some(user) = claims.user.as_deref() {
+                    span.record("obo.user_principal", user);
+                }
             }
         } else if let Some(sp) = &source_principal {
             span.record("obo.caller_principal", sp.to_string().as_str());

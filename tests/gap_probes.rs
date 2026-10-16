@@ -7,7 +7,23 @@
 //! tests assert the *fixed* (safe) behavior and double as regression tests
 //! for the fix. `f8_ca_rejects_ca_true_csr` preserves a probe for existing
 //! good behavior that predates this fix.
+//!
+//! F1 and F2 were found against `src/obo.rs` at the same review: the
+//! delegation-chain depth limit was enforced against the unsigned
+//! `X-SPIFFE-Caller-Chain` header (bypassable by simply omitting it, and
+//! never validated as SPIFFE IDs), and the originating user principal was
+//! an unvalidated, unsigned `X-SPIFFE-User-Principal` header recorded as an
+//! audit fact. The original review's probes for these
+//! (`f1_depth_limit_bypassed_by_omitting_chain_header`,
+//! `f1_chain_entries_not_validated`, `f2_token_has_no_user_or_chain_claims`)
+//! asserted that vulnerable behavior but were never checked into this file.
+//! Both are now fixed (signed `act`/`user` claims, from Task 3's
+//! `OboClaims::delegation_chain`/`extract_user_principal`, drive the
+//! decision instead); the tests below assert the fixed behavior directly
+//! and serve as F1/F2's regression tests.
 use rcgen::{CertificateParams, KeyPair, SanType};
+use rsa::pkcs1::{EncodeRsaPrivateKey, EncodeRsaPublicKey, LineEnding};
+use rsa::{RsaPrivateKey, RsaPublicKey};
 use zero_trust::*;
 
 const INV: &str = "spiffe://chakra.internal/ns/inventory/sa/inventory-svc";
@@ -115,4 +131,165 @@ fn f9_leaf_has_svid_constraints() {
     let eku = cert.extended_key_usage().unwrap().unwrap();
     assert!(eku.value.client_auth);
     assert!(eku.value.server_auth);
+}
+
+/// A fresh TEST-ONLY RSA keypair for `obo::validate`'s token signature
+/// checks, independent of `LocalIssuer` (which doesn't yet support minting
+/// tokens with a delegation chain or user principal — that's Task 5's
+/// token-exchange endpoint). Mirrors `src/obo.rs`'s own `test_keys` helper.
+fn gap_test_keys() -> (JwtSigner, JwtVerifier) {
+    let mut rng = rand::rngs::OsRng;
+    let private_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+    let public_key = RsaPublicKey::from(&private_key);
+    let private_pem = private_key.to_pkcs1_pem(LineEnding::LF).unwrap();
+    let public_pem = public_key.to_pkcs1_pem(LineEnding::LF).unwrap();
+    (
+        JwtSigner::from_rsa_pem(private_pem.as_bytes()).unwrap(),
+        JwtVerifier::from_rsa_pem(public_pem.as_bytes()).unwrap(),
+    )
+}
+
+/// F1, fixed: chain depth is enforced from the signed `act` nesting, not
+/// the unsigned `X-SPIFFE-Caller-Chain` header. A forged, short header
+/// claiming an innocuous chain has no effect, and omitting the header
+/// entirely yields the identical decision — directly inverting
+/// `f1_depth_limit_bypassed_by_omitting_chain_header`'s premise.
+#[test]
+fn f1_signed_chain_depth_enforced_header_has_no_effect() {
+    let registry = reg();
+    let (signer, verifier) = gap_test_keys();
+    let dest: SpiffeId = INV.parse().unwrap();
+    let now = now_unix_secs();
+
+    // reg()'s inventory-svc caps max_obo_chain_depth at 3. This chain is
+    // 4 deep: sub (orders) + 3 signed act hops.
+    let claims = OboClaims {
+        sub: ORD.to_string(),
+        aud: vec![INV.to_string()],
+        user: Some("spiffe://chakra.internal/ns/users/sa/alice".to_string()),
+        act: Some(Box::new(ActClaim {
+            sub: "spiffe://chakra.internal/ns/gw1/sa/gw1".to_string(),
+            act: Some(Box::new(ActClaim {
+                sub: "spiffe://chakra.internal/ns/gw2/sa/gw2".to_string(),
+                act: Some(Box::new(ActClaim {
+                    sub: "spiffe://chakra.internal/ns/gw3/sa/gw3".to_string(),
+                    act: None,
+                })),
+            })),
+        })),
+        iat: now,
+        exp: now + 300,
+        nbf: None,
+        jti: None,
+        cnf: None,
+    };
+    let token = signer.sign(&claims).unwrap();
+
+    let request = ValidationRequest {
+        destination: &dest,
+        source_principal: None,
+        obo_token: Some(&token),
+        caller_chain: Some("x"), // forged/irrelevant; never read for decisions
+    };
+    assert_eq!(
+        validate(&registry, &verifier, &request, now),
+        Decision::Deny(DenyReason::OboChainDepthExceeded)
+    );
+
+    let request_no_header = ValidationRequest {
+        caller_chain: None,
+        ..request
+    };
+    assert_eq!(
+        validate(&registry, &verifier, &request_no_header, now),
+        Decision::Deny(DenyReason::OboChainDepthExceeded)
+    );
+}
+
+/// F1, fixed: every entry in the signed delegation chain must itself be a
+/// well-formed SPIFFE ID — directly inverting
+/// `f1_chain_entries_not_validated`'s premise.
+#[test]
+fn f1_chain_entries_must_be_valid_spiffe_ids() {
+    let registry = reg();
+    let (signer, verifier) = gap_test_keys();
+    let dest: SpiffeId = INV.parse().unwrap();
+    let now = now_unix_secs();
+
+    let claims = OboClaims {
+        sub: ORD.to_string(),
+        aud: vec![INV.to_string()],
+        user: None,
+        act: Some(Box::new(ActClaim {
+            sub: "not-an-id".to_string(),
+            act: None,
+        })),
+        iat: now,
+        exp: now + 300,
+        nbf: None,
+        jti: None,
+        cnf: None,
+    };
+    let token = signer.sign(&claims).unwrap();
+
+    let request = ValidationRequest {
+        destination: &dest,
+        source_principal: None,
+        obo_token: Some(&token),
+        caller_chain: None,
+    };
+    assert_eq!(
+        validate(&registry, &verifier, &request, now),
+        Decision::Deny(DenyReason::InvalidChainEntry)
+    );
+}
+
+/// F2, fixed: the originating user principal is a signed `user` claim,
+/// validated as a SPIFFE ID — directly inverting
+/// `f2_token_has_no_user_or_chain_claims`'s premise (that no such signed
+/// claim existed at all).
+#[test]
+fn f2_user_principal_is_signed_and_validated() {
+    let registry = reg();
+    let (signer, verifier) = gap_test_keys();
+    let dest: SpiffeId = INV.parse().unwrap();
+    let now = now_unix_secs();
+
+    let good_claims = OboClaims {
+        sub: ORD.to_string(),
+        aud: vec![INV.to_string()],
+        user: Some("spiffe://chakra.internal/ns/users/sa/alice".to_string()),
+        act: None,
+        iat: now,
+        exp: now + 300,
+        nbf: None,
+        jti: None,
+        cnf: None,
+    };
+    let good_token = signer.sign(&good_claims).unwrap();
+    let good_request = ValidationRequest {
+        destination: &dest,
+        source_principal: None,
+        obo_token: Some(&good_token),
+        caller_chain: None,
+    };
+    // A well-formed signed user claim round-trips and does not block the
+    // decision.
+    assert_eq!(validate(&registry, &verifier, &good_request, now), Decision::Allow);
+
+    let mut bad_claims = good_claims;
+    bad_claims.user = Some("not-a-user-id".to_string());
+    let bad_token = signer.sign(&bad_claims).unwrap();
+    let bad_request = ValidationRequest {
+        destination: &dest,
+        source_principal: None,
+        obo_token: Some(&bad_token),
+        caller_chain: None,
+    };
+    // An invalid signed user claim is rejected outright -- it is never
+    // taken from (or bypassed via) an unsigned header.
+    assert_eq!(
+        validate(&registry, &verifier, &bad_request, now),
+        Decision::Deny(DenyReason::InvalidUserPrincipal)
+    );
 }

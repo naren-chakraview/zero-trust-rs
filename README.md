@@ -167,6 +167,63 @@ To prove SPIRE is really issuing identities: `kubectl logs -n
 zero-trust-demo spire-debug-client` after `register-spire-entries.sh` shows
 a real signed X.509 SVID for `spiffe://chakra.internal/ns/zero-trust-demo/sa/spire-debug-client`.
 
+## Three-Hop Delegation Demo
+
+With F3 (RFC 8693 token exchange, `POST /v1/token-exchange`) landed,
+delegation across multiple gateways is backed by a signed `act` chain
+rather than hand-written `X-SPIFFE-Caller-Chain` headers — each hop
+exchanges the token it received for a new one scoped to the next hop,
+with itself appended to the chain inside the signed JWT.
+
+### Setup
+1. Deploy three gateways (`gw-a`, `gw-b`, `gw-c`) sharing one JWKS trust
+   anchor (see `docs/design/0001-tls-mtls-termination.md` and F4's
+   JWKS support for cross-gateway verification).
+2. Run the demo script:
+   ```bash
+   ./scripts/demo-three-hop-delegation.sh
+   ```
+   (Not yet checked in — build it on top of `scripts/demo-obo-chain.sh`,
+   replacing the header-based hops with real `POST /v1/token-exchange`
+   calls per the sequence below.)
+
+### What happens
+1. **Originator → Gateway A**: the originator calls `gw-a` with a signed
+   OBO token asserting its own identity (chain depth 0).
+2. **Gateway A → Gateway B**: `gw-a` calls `POST /v1/token-exchange` on
+   itself with `subject_token` = the inbound token and `audience` =
+   `gw-b`'s SPIFFE ID, getting back a new token with `gw-a` appended to
+   the `act` chain, then forwards it to `gw-b`.
+3. **Gateway B → Gateway C**: `gw-b` repeats the exchange, scoping a new
+   token to `gw-c`'s audience; the chain is now `[originator, gw-a, gw-b]`.
+4. **Gateway C → Backend**: `gw-c` forwards the final token (or exchanges
+   again if the backend sits behind its own `zt-gateway`, extending the
+   chain to include `gw-c`).
+
+Each exchange is validated against `max_obo_chain_depth` and the
+`allowed_callers` list in the workload registry (`registry.rs`), so a
+chain that's too deep or an unauthorized hop is denied with a
+`deny_reason` before it reaches the next gateway.
+
+### Verify the trace
+Open Jaeger at `http://localhost:16686` (see `scripts/port-forward-all.sh`)
+and search for a trace containing the originator's ID. You should see:
+- A single trace spanning all three gateways (W3C TraceContext
+  propagation, F12).
+- Each gateway's span carrying verified OBO attributes
+  (`obo.caller_principal`, `obo.chain`, `allow`).
+- No hand-written chain headers — delegation is entirely signed inside
+  the exchanged JWTs.
+
+### Troubleshooting
+- Ensure all three gateways load the same JWKS (F4) so each can verify
+  tokens minted by the others.
+- Check that token TTLs (`token_ttl_seconds` / `token_exchange_ttl_secs`)
+  are long enough to cover the full three-hop round trip.
+- A `403` with `deny_reason` at any hop means the chain depth or
+  caller allow-list was violated — check `tests/fixtures/registry.yaml`
+  for the actual limits in the example config.
+
 ## License
 
 Licensed under either of

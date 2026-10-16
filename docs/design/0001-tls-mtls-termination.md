@@ -1,7 +1,26 @@
 # Design: TLS / mTLS Termination for zt-gateway
 
-**Status**: Approved for implementation (both phases in one pass) — spec
-only as of this revision, implementation not yet started.
+**Status**: Implementation complete as of 2026-10-15 (commits `4e6b5ad`
+through `6c1eb62`). Both phases (server TLS and mTLS + X.509 issuance)
+landed together, as planned below, plus the follow-on security-gap fixes
+tracked alongside this work:
+- JWKS-backed multi-gateway verification (F4, `4e6b5ad`)
+- X.509 leaf hygiene per spec — exactly one URI SAN, basicConstraints/
+  keyUsage/EKU (F8, F9, `8d5ce72`)
+- RFC 8693 signed delegation chains and token exchange (F1, F2, F3,
+  `9b40145`, `80365b7`, `839ebf0`)
+- Separate admin/proxy listeners, rate limiting, constant-time token
+  compare (F7, F10, `e26438b`)
+- Request/response body limits, timeouts, concurrency limits (F6,
+  `9e10d8f`)
+- RFC 8705 certificate-bound tokens, binding validated on use (F5,
+  `f5e278e`)
+- W3C TraceContext propagation, verified OBO claims recorded in spans
+  (F12, `6c1eb62`)
+
+See `docs/reviews/0001-security-gap-review.md` for the full security audit
+and findings reference.
+
 **Supersedes**: the "v0.1 limitation" section of `README.md`.
 
 **Decisions locked in from the previous revision** (see "Decisions" at the

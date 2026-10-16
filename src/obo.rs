@@ -214,8 +214,13 @@ workloads:
         let claims = OboClaims {
             sub: sub.to_string(),
             aud: aud.iter().map(|s| s.to_string()).collect(),
+            user: None,
+            act: None,
             iat: now,
             exp: now + ttl,
+            nbf: None,
+            jti: None,
+            cnf: None,
         };
         signer.sign(&claims).unwrap()
     }

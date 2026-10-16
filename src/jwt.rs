@@ -13,14 +13,94 @@ use crate::error::JwtError;
 
 /// The claims carried by a JWT SVID, per ADR-0007: who is delegating
 /// (`sub`), who it's delegating to (`aud`), and the token's validity window.
+///
+/// Extended per RFC 8693 (token exchange) to optionally carry a signed
+/// delegation chain: `user` is the originating principal who kicked off the
+/// delegation, `act` is a recursively nested chain of intermediate actors
+/// (each hop appending itself), `cnf` binds the token to a client
+/// certificate (RFC 8705, consumed by cert-binding validation), and `nbf`/
+/// `jti` support not-before and replay-cache checks. All five are optional
+/// and skip serialization when absent, so tokens minted without delegation
+/// are byte-for-byte unchanged from before this extension.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct OboClaims {
     pub sub: String,
     pub aud: Vec<String>,
+    /// Signed originating principal (who started the delegation), per RFC
+    /// 8693. `None` for a plain, non-delegated OBO token.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    /// RFC 8693 delegation chain: the actor that most recently acted on
+    /// behalf of `user`, which may itself nest further actors.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub act: Option<Box<ActClaim>>,
     /// Unix seconds.
     pub exp: i64,
     /// Unix seconds.
     pub iat: i64,
+    /// Not-before (Unix seconds); `None` means no not-before check applies.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nbf: Option<i64>,
+    /// JWT ID, for replay-cache checks.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jti: Option<String>,
+    /// Certificate binding (RFC 8705), checked by Task 8's cert-binding
+    /// validation.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cnf: Option<CertBinding>,
+}
+
+impl OboClaims {
+    /// Number of delegation hops recorded in the `act` chain — 0 when
+    /// there's no `act` claim at all, 1 for a single intermediate actor,
+    /// and so on for each further level of nesting.
+    pub fn delegation_depth(&self) -> usize {
+        let mut depth = 0;
+        let mut act = self.act.as_deref();
+        while let Some(a) = act {
+            depth += 1;
+            act = a.act.as_deref();
+        }
+        depth
+    }
+
+    /// The full chain of identities that have held this token, outermost
+    /// first: `[sub, act.sub, act.act.sub, ...]`. With no `act` claim this
+    /// is just `[sub]`.
+    pub fn delegation_chain(&self) -> Vec<String> {
+        let mut chain = vec![self.sub.clone()];
+        let mut act = self.act.as_deref();
+        while let Some(a) = act {
+            chain.push(a.sub.clone());
+            act = a.act.as_deref();
+        }
+        chain
+    }
+
+    /// The signed originating user principal, if this token carries one.
+    pub fn extract_user_principal(&self) -> Option<String> {
+        self.user.clone()
+    }
+}
+
+/// One hop of an RFC 8693 delegation chain: `{"sub": "...", "act": {...}}`.
+/// Each `act` claim may itself nest a further `act`, recording every actor
+/// that has acted on behalf of the original `user` in order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ActClaim {
+    pub sub: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub act: Option<Box<ActClaim>>,
+}
+
+/// Certificate binding confirmation key (RFC 8705): the base64url-encoded
+/// SHA-256 thumbprint of the client certificate this token is bound to.
+/// Serializes under the standard `x5t#S256` JSON field name, not the Rust
+/// field name.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CertBinding {
+    #[serde(rename = "x5t#S256")]
+    pub x5t_s256: String,
 }
 
 /// Signs JWT SVIDs with an RS256 private key.
@@ -156,8 +236,13 @@ mod tests {
         OboClaims {
             sub: "spiffe://chakra.internal/ns/orders/sa/orders-svc".to_string(),
             aud: vec!["spiffe://chakra.internal/ns/inventory/sa/inventory-svc".to_string()],
+            user: None,
+            act: None,
             exp,
             iat: 0,
+            nbf: None,
+            jti: None,
+            cnf: None,
         }
     }
 
@@ -276,5 +361,130 @@ mod tests {
 
         let err = verifier.verify_signature(&token).unwrap_err();
         assert!(matches!(err, JwtError::MissingKeyId));
+    }
+
+    // --- RFC 8693 delegation chain (Task 3) ---
+
+    #[test]
+    fn delegation_depth_is_zero_with_no_act_claim() {
+        let claims = sample_claims(2000);
+        assert_eq!(claims.delegation_depth(), 0);
+        assert_eq!(
+            claims.delegation_chain(),
+            vec!["spiffe://chakra.internal/ns/orders/sa/orders-svc".to_string()]
+        );
+    }
+
+    #[test]
+    fn delegation_depth_counts_nested_act_hops() {
+        let mut claims = sample_claims(2000);
+        claims.sub = "spiffe://backend".to_string();
+        claims.user = Some("spiffe://alice".to_string());
+        claims.act = Some(Box::new(ActClaim {
+            sub: "spiffe://gateway-a".to_string(),
+            act: Some(Box::new(ActClaim {
+                sub: "spiffe://gateway-b".to_string(),
+                act: None,
+            })),
+        }));
+
+        assert_eq!(claims.delegation_depth(), 2);
+    }
+
+    #[test]
+    fn delegation_chain_extracts_all_subs_in_order() {
+        let mut claims = sample_claims(2000);
+        claims.sub = "spiffe://backend".to_string();
+        claims.user = Some("spiffe://alice".to_string());
+        claims.act = Some(Box::new(ActClaim {
+            sub: "spiffe://gw-a".to_string(),
+            act: Some(Box::new(ActClaim {
+                sub: "spiffe://gw-b".to_string(),
+                act: None,
+            })),
+        }));
+
+        assert_eq!(
+            claims.delegation_chain(),
+            vec![
+                "spiffe://backend".to_string(),
+                "spiffe://gw-a".to_string(),
+                "spiffe://gw-b".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_user_principal_returns_the_user_claim() {
+        let mut claims = sample_claims(2000);
+        claims.user = Some("spiffe://alice".to_string());
+        assert_eq!(claims.extract_user_principal(), Some("spiffe://alice".to_string()));
+
+        let no_user_claims = sample_claims(2000);
+        assert_eq!(no_user_claims.extract_user_principal(), None);
+    }
+
+    #[test]
+    fn claims_serialization_skips_none_optional_fields() {
+        let claims = sample_claims(2000);
+        let json = serde_json::to_string(&claims).unwrap();
+
+        assert!(!json.contains("\"user\""));
+        assert!(!json.contains("\"act\""));
+        assert!(!json.contains("\"cnf\""));
+        assert!(!json.contains("\"nbf\""));
+        assert!(!json.contains("\"jti\""));
+    }
+
+    #[test]
+    fn claims_serialization_includes_set_optional_fields() {
+        let mut claims = sample_claims(2000);
+        claims.user = Some("spiffe://alice".to_string());
+        claims.act = Some(Box::new(ActClaim {
+            sub: "spiffe://gw-a".to_string(),
+            act: None,
+        }));
+        claims.nbf = Some(900);
+        claims.jti = Some("token-id-1".to_string());
+        claims.cnf = Some(CertBinding {
+            x5t_s256: "base64url_thumbprint".to_string(),
+        });
+
+        let json = serde_json::to_string(&claims).unwrap();
+        let round_tripped: OboClaims = serde_json::from_str(&json).unwrap();
+        assert_eq!(round_tripped, claims);
+    }
+
+    #[test]
+    fn cert_binding_serializes_with_the_rfc_8705_field_name() {
+        let binding = CertBinding {
+            x5t_s256: "base64url_thumbprint".to_string(),
+        };
+        let json = serde_json::to_string(&binding).unwrap();
+        assert!(json.contains("\"x5t#S256\""));
+        assert!(!json.contains("x5t_s256"));
+
+        let round_tripped: CertBinding = serde_json::from_str(&json).unwrap();
+        assert_eq!(round_tripped, binding);
+    }
+
+    #[test]
+    fn old_tokens_without_delegation_fields_still_deserialize() {
+        // Shape produced by the pre-Task-3 `OboClaims` — no user/act/cnf/
+        // nbf/jti at all. Backward compatibility requires this to still
+        // deserialize cleanly, with the new fields defaulting to `None`.
+        let old_json = r#"{"sub":"spiffe://test","aud":["spiffe://test-aud"],"exp":2000,"iat":1000}"#;
+        let claims: OboClaims = serde_json::from_str(old_json).unwrap();
+
+        assert_eq!(claims.sub, "spiffe://test");
+        assert_eq!(claims.aud, vec!["spiffe://test-aud".to_string()]);
+        assert_eq!(claims.exp, 2000);
+        assert_eq!(claims.iat, 1000);
+        assert_eq!(claims.user, None);
+        assert_eq!(claims.act, None);
+        assert_eq!(claims.nbf, None);
+        assert_eq!(claims.jti, None);
+        assert_eq!(claims.cnf, None);
+        assert_eq!(claims.delegation_depth(), 0);
     }
 }

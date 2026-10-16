@@ -211,8 +211,13 @@ impl IdentityProvider for LocalIssuer {
         let claims = OboClaims {
             sub: requester.spiffe_id.to_string(),
             aud: vec![audience_id.to_string()],
+            user: None,
+            act: None,
             iat: now,
             exp: now + self.ttl_seconds,
+            nbf: None,
+            jti: None,
+            cnf: None,
         };
 
         let token = self.signer.sign(&claims)?;
@@ -431,8 +436,13 @@ workloads:
         let claims = crate::jwt::OboClaims {
             sub: "spiffe://chakra.internal/ns/orders/sa/orders-svc".to_string(),
             aud: vec!["spiffe://chakra.internal/ns/inventory/sa/inventory-svc".to_string()],
+            user: None,
+            act: None,
             iat: 0,
             exp: 9_999_999_999,
+            nbf: None,
+            jti: None,
+            cnf: None,
         };
         let rogue_token = rogue_signer.sign(&claims).unwrap();
 

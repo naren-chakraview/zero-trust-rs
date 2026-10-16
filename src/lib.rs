@@ -22,7 +22,7 @@ pub use headers::{
     HEADER_USER_PRINCIPAL,
 };
 pub use identity::{IdentityProvider, IssuedToken, LocalIssuer};
-pub use jwt::{JwtSigner, JwtVerifier, OboClaims};
+pub use jwt::{ActClaim, CertBinding, JwtSigner, JwtVerifier, OboClaims};
 pub use obo::{validate, Decision, DenyReason, ValidationRequest, Validator};
 pub use registry::{CredentialCheck, Registry, WorkloadEntry, DEFAULT_MAX_OBO_CHAIN_DEPTH};
 pub use spiffe_id::SpiffeId;

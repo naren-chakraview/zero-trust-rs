@@ -119,6 +119,97 @@ pub struct CaConfig {
     pub ttl_seconds: i64,
 }
 
+fn default_route_host_pattern() -> String {
+    "*".to_string()
+}
+
+/// A single multi-backend routing rule (F14 / Task 1: multi-backend
+/// routing). Requests whose host and path match this route's wildcard
+/// patterns are forwarded to `upstream_addr` under the identity
+/// `workload_id`, instead of the gateway's single
+/// `protected_workload`/`upstream_addr`.
+///
+/// Patterns support one kind of wildcard, `*`, matching any (possibly
+/// empty) run of characters — e.g. `*.example.com` matches
+/// `api.example.com`, and `/api/*` matches `/api/inventory/items`. A bare
+/// `*` matches anything.
+#[derive(Debug, Clone, Deserialize)]
+pub struct Route {
+    /// Wildcard pattern matched against the request's `Host` header.
+    /// Defaults to `*` (matches any host) when omitted — most
+    /// deployments route purely by path.
+    #[serde(default = "default_route_host_pattern")]
+    pub host_pattern: String,
+
+    /// Wildcard pattern matched against the request's path, e.g.
+    /// `/api/inventory/*`.
+    pub path_pattern: String,
+
+    /// The SPIFFE ID of the workload this route forwards to. Validated
+    /// against the registry at request time, before forwarding — see
+    /// `zt-gateway`'s `resolve_route`.
+    pub workload_id: String,
+
+    /// Base URL of the backend this route forwards to, e.g.
+    /// `http://127.0.0.1:8081`.
+    pub upstream_addr: String,
+}
+
+/// Ordered collection of [`Route`]s, matched first-match-wins (the
+/// ordering most reverse proxies use for route tables) by
+/// [`RouteTable::resolve`]. Built from [`GatewayConfig::routes`] — an
+/// empty table (the default) deliberately resolves nothing, leaving the
+/// backward-compatible single-upstream fallback entirely to the caller
+/// (`resolve_route` in `zt-gateway`), not to `RouteTable` itself.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct RouteTable {
+    routes: Vec<Route>,
+}
+
+impl RouteTable {
+    pub fn new(routes: Vec<Route>) -> Self {
+        Self { routes }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.routes.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.routes.len()
+    }
+
+    /// Resolves `(workload_id, upstream_addr)` for a request: tries each
+    /// route in configured order, returning the first whose
+    /// `host_pattern` and `path_pattern` both match. `method` is accepted
+    /// for forward compatibility with method-scoped routes but isn't
+    /// matched against anything yet — every current `Route` matches any
+    /// method. Returns `None` when no configured route matches (including
+    /// when the table is empty).
+    pub fn resolve(&self, _method: &str, path: &str, host: Option<&str>) -> Option<(String, String)> {
+        let host = host.unwrap_or("");
+        self.routes
+            .iter()
+            .find(|route| wildcard_matches(&route.host_pattern, host) && wildcard_matches(&route.path_pattern, path))
+            .map(|route| (route.workload_id.clone(), route.upstream_addr.clone()))
+    }
+}
+
+/// Matches `value` against `pattern`, where `*` in `pattern` matches any
+/// (possibly empty) run of characters. Plain recursive glob matching —
+/// route tables are small and operator-authored, so the worst-case
+/// backtracking cost here is never a practical concern.
+fn wildcard_matches(pattern: &str, value: &str) -> bool {
+    fn do_match(pattern: &[u8], value: &[u8]) -> bool {
+        match pattern.first() {
+            None => value.is_empty(),
+            Some(b'*') => (0..=value.len()).any(|i| do_match(&pattern[1..], &value[i..])),
+            Some(&c) => value.first() == Some(&c) && do_match(&pattern[1..], &value[1..]),
+        }
+    }
+    do_match(pattern.as_bytes(), value.as_bytes())
+}
+
 /// Loaded from a YAML file, with a handful of fields overridable by
 /// environment variables — the usual "file for structure, env for
 /// per-deployment values" split, handy when the same config file is reused
@@ -227,6 +318,15 @@ pub struct GatewayConfig {
     /// Default: 1000.
     #[serde(default = "default_max_concurrent_connections")]
     pub max_concurrent_connections: u32,
+
+    /// Multi-backend routing table (F14 / Task 1). Empty (the default)
+    /// means every request forwards to the single
+    /// `upstream_addr`/`protected_workload` — exact pre-F14 behavior.
+    /// When non-empty, each proxied request is matched against these
+    /// routes in order (see `RouteTable::resolve`); no match also falls
+    /// back to `upstream_addr`/`protected_workload`.
+    #[serde(default)]
+    pub routes: Vec<Route>,
 }
 
 impl GatewayConfig {
@@ -345,6 +445,7 @@ impl GatewayConfig {
             read_timeout_secs: default_read_timeout_secs(),
             request_timeout_secs: default_request_timeout_secs(),
             max_concurrent_connections: default_max_concurrent_connections(),
+            routes: Vec::new(),
         }
     }
 

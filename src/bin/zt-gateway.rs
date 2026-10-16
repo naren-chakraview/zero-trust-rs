@@ -44,7 +44,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 use zero_trust::{
     build_client_cert_verifier, build_server_config, compute_cert_thumbprint_x5t_s256, exchange_token, load_certs,
     now_unix_secs, validate_with_cert_binding, CaError, CertificateAuthority, ClientAuth, Decision, GatewayConfig,
-    IdentityError, IdentityProvider, LocalCa, LocalIssuer, Registry, ServerCertificate, SpiffeId,
+    IdentityError, IdentityProvider, LocalCa, LocalIssuer, Registry, RouteTable, ServerCertificate, SpiffeId,
     TokenExchangeError, TokenExchangeRequest, TokenExchangeResponse, ValidationRequest, HEADER_CALLER_CHAIN,
     HEADER_OBO_TOKEN, HEADER_USER_PRINCIPAL,
 };
@@ -74,6 +74,10 @@ struct AppState {
     token_exchange_ttl_secs: u64,
     /// Max body size in bytes (F6 fix).
     max_body_bytes: usize,
+    /// Multi-backend routing table (F14 / Task 1). Empty whenever
+    /// `GatewayConfig::routes` is unset — see `resolve_route`'s doc
+    /// comment for the backward-compatible fallback this enables.
+    route_table: Arc<RouteTable>,
 }
 
 /// Sets up structured stdout logs (always) plus, when
@@ -224,6 +228,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         gateway_id: Arc::new(gateway_id),
         token_exchange_ttl_secs: config.token_ttl_seconds.max(0) as u64,
         max_body_bytes: (config.max_body_mb as usize) * 1024 * 1024,
+        route_table: Arc::new(RouteTable::new(config.routes.clone())),
     };
 
     let listener_config = ListenerConfig {
@@ -911,6 +916,23 @@ fn record_obo_span_attributes(
 // below) because a `tracing` span's field set is fixed at creation time —
 // `Span::record` can only fill in a value for a field that was already
 // declared, never add a new one.
+/// Resolves which workload identity and upstream backend a proxied
+/// request should be forwarded to (F14 / Task 1: multi-backend routing).
+///
+/// Tries `state.route_table` first; when it's empty, or no configured
+/// route matches this request's method/path/host, falls back to the
+/// gateway's single `protected_workload`/`upstream_addr` -- exact pre-F14
+/// behavior, so a gateway that never configures `routes:` is completely
+/// unaffected by this function's existence.
+fn resolve_route(state: &AppState, method: &str, path: &str, host: Option<&str>) -> (String, String) {
+    if !state.route_table.is_empty() {
+        if let Some(resolved) = state.route_table.resolve(method, path, host) {
+            return resolved;
+        }
+    }
+    (state.protected_workload.to_string(), state.upstream_addr.clone())
+}
+
 #[tracing::instrument(
     skip_all,
     fields(
@@ -955,8 +977,36 @@ async fn proxy_handler(
     let caller_chain = header_str(&parts.headers, HEADER_CALLER_CHAIN);
     let user_principal = header_str(&parts.headers, HEADER_USER_PRINCIPAL);
 
+    // F14 / Task 1: resolve which workload/upstream this request targets
+    // -- either a matching `state.route_table` entry, or (empty table / no
+    // match) the gateway's single `protected_workload`/`upstream_addr`,
+    // exactly as before this feature existed.
+    let host_header = header_str(&parts.headers, "host");
+    let (routed_workload_id, routed_upstream_addr) =
+        resolve_route(&state, parts.method.as_str(), parts.uri.path(), host_header.as_deref());
+
+    let destination: SpiffeId = match routed_workload_id.parse() {
+        Ok(id) => id,
+        Err(_) => {
+            return error_response(
+                StatusCode::BAD_GATEWAY,
+                "misconfigured route: workload_id is not a valid SPIFFE ID",
+            );
+        }
+    };
+    // Validate the resolved workload against the registry before
+    // forwarding anything to it -- a route pointing at an unregistered
+    // workload is an operator misconfiguration, not something to silently
+    // proxy through.
+    if state.registry.get(&destination).is_none() {
+        return error_response(
+            StatusCode::BAD_GATEWAY,
+            "misconfigured route: workload_id not found in registry",
+        );
+    }
+
     let request = ValidationRequest {
-        destination: &state.protected_workload,
+        destination: &destination,
         source_principal: source_principal.as_ref(),
         obo_token: obo_token.as_deref(),
         // F1 fix: never feed the unsigned `X-SPIFFE-Caller-Chain` header
@@ -1017,7 +1067,7 @@ async fn proxy_handler(
     // consumers (grep/kubectl logs vs. a tracing UI).
     tracing::info!(
         allow = decision.is_allow(),
-        destination = %state.protected_workload,
+        destination = %destination,
         source_principal = source_principal.as_ref().map(|id| id.to_string()),
         obo_present = obo_token.is_some(),
         obo_chain = caller_chain.as_deref().unwrap_or(""),
@@ -1038,7 +1088,7 @@ async fn proxy_handler(
     );
 
     let response = match decision {
-        Decision::Allow => forward_to_upstream(&state, parts, body_bytes, &trace_cx).await,
+        Decision::Allow => forward_to_upstream(&state, parts, body_bytes, &trace_cx, &routed_upstream_addr).await,
         Decision::Deny(reason) => (
             StatusCode::FORBIDDEN,
             Json(DenyBody {
@@ -1066,6 +1116,7 @@ async fn forward_to_upstream(
     parts: axum::http::request::Parts,
     body_bytes: axum::body::Bytes,
     trace_cx: &OtelContext,
+    upstream_addr: &str,
 ) -> Response {
     // Check body size limit (F6 fix)
     if body_bytes.len() > state.max_body_bytes {
@@ -1077,7 +1128,11 @@ async fn forward_to_upstream(
         .path_and_query()
         .map(|pq| pq.as_str())
         .unwrap_or("/");
-    let url = format!("{}{}", state.upstream_addr.trim_end_matches('/'), path_and_query);
+    // F14 / Task 1: `upstream_addr` is the route-resolved backend (or the
+    // gateway's single configured `upstream_addr` when routing doesn't
+    // apply -- see `resolve_route`), not necessarily `state.upstream_addr`
+    // itself.
+    let url = format!("{}{}", upstream_addr.trim_end_matches('/'), path_and_query);
 
     let mut headers = parts.headers.clone();
     for name in HOP_BY_HOP_HEADERS {
@@ -1130,6 +1185,7 @@ mod tests {
 
     use axum::http::StatusCode as SC;
     use tower::ServiceExt;
+    use zero_trust::Route;
 
     const TRUST_DOMAIN: &str = "chakra.internal";
     const INVENTORY: &str = "spiffe://chakra.internal/ns/inventory/sa/inventory-svc";
@@ -1178,6 +1234,7 @@ workloads:
             gateway_id: Arc::new(GATEWAY_SELF.parse().unwrap()),
             token_exchange_ttl_secs: 300,
             max_body_bytes: 100 * 1024 * 1024,
+            route_table: Arc::new(RouteTable::default()),
         }
     }
 
@@ -1531,6 +1588,107 @@ workloads:
         let response = router.oneshot(request).await.unwrap();
         assert_eq!(response.status(), SC::FORBIDDEN);
         assert_eq!(hits.load(Ordering::SeqCst), 0);
+    }
+
+    // --- F14 / Task 1: multi-backend routing wired into `proxy_handler` ---
+    //
+    // `tests/routing_tests.rs` covers `RouteTable::resolve` itself in
+    // isolation; these three exercise `resolve_route`/`proxy_handler`
+    // end-to-end through the real `Router`, proving routing decisions
+    // actually affect where a request lands and which identity it's
+    // validated against.
+
+    #[tokio::test]
+    async fn proxy_routes_request_to_matching_route_table_entry() {
+        let (default_upstream, default_hits) = spawn_test_upstream("default backend").await;
+        let (routed_upstream, routed_hits) = spawn_test_upstream("routed backend").await;
+
+        let mut state = test_state(default_upstream);
+        state.route_table = Arc::new(RouteTable::new(vec![Route {
+            host_pattern: "*".to_string(),
+            path_pattern: "/api/inventory/*".to_string(),
+            workload_id: INVENTORY.to_string(),
+            upstream_addr: routed_upstream,
+        }]));
+        let issued = state
+            .identity
+            .issue_jwt_svid("orders-svc", INVENTORY, "orders-secret")
+            .unwrap();
+        let router = build_router(state);
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/api/inventory/items/42")
+            .header(HEADER_OBO_TOKEN, issued.token)
+            .body(Body::empty())
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), SC::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&bytes[..], b"routed backend");
+        assert_eq!(routed_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(default_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn proxy_falls_back_to_default_upstream_when_no_route_matches() {
+        let (default_upstream, default_hits) = spawn_test_upstream("default backend").await;
+        let (routed_upstream, routed_hits) = spawn_test_upstream("routed backend").await;
+
+        let mut state = test_state(default_upstream);
+        state.route_table = Arc::new(RouteTable::new(vec![Route {
+            host_pattern: "*".to_string(),
+            path_pattern: "/api/inventory/*".to_string(),
+            workload_id: INVENTORY.to_string(),
+            upstream_addr: routed_upstream,
+        }]));
+        let issued = state
+            .identity
+            .issue_jwt_svid("orders-svc", INVENTORY, "orders-secret")
+            .unwrap();
+        let router = build_router(state);
+
+        // Doesn't match the configured route's `/api/inventory/*` pattern,
+        // so this falls back to the gateway's single `protected_workload`/
+        // `upstream_addr` -- same as if `routes` were never configured.
+        let request = Request::builder()
+            .method("GET")
+            .uri("/completely/unrelated/path")
+            .header(HEADER_OBO_TOKEN, issued.token)
+            .body(Body::empty())
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), SC::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(&bytes[..], b"default backend");
+        assert_eq!(default_hits.load(Ordering::SeqCst), 1);
+        assert_eq!(routed_hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn proxy_rejects_a_route_pointing_at_an_unregistered_workload() {
+        let (default_upstream, default_hits) = spawn_test_upstream("should never be seen").await;
+
+        let mut state = test_state(default_upstream);
+        state.route_table = Arc::new(RouteTable::new(vec![Route {
+            host_pattern: "*".to_string(),
+            path_pattern: "/api/*".to_string(),
+            workload_id: "spiffe://chakra.internal/ns/missing/sa/missing-svc".to_string(),
+            upstream_addr: "http://127.0.0.1:1".to_string(),
+        }]));
+        let router = build_router(state);
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/api/whatever")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), SC::BAD_GATEWAY);
+        assert_eq!(default_hits.load(Ordering::SeqCst), 0);
     }
 
     /// The one test in this project that can't use `tower::oneshot`: TLS is

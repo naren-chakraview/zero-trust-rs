@@ -16,7 +16,7 @@ mod tls;
 mod token_exchange;
 
 pub use ca::{CertificateAuthority, LocalCa, SignedCert};
-pub use config::{CaConfig, ClientAuth, GatewayConfig, TlsConfig};
+pub use config::{CaConfig, ClientAuth, GatewayConfig, Route, RouteTable, TlsConfig};
 pub use error::{CaError, ConfigError, IdentityError, JwtError, RegistryError, SpiffeIdError, TlsError};
 pub use headers::{
     build_outbound_headers, CallerChain, OutboundHeaders, HEADER_CALLER_CHAIN, HEADER_OBO_TOKEN,

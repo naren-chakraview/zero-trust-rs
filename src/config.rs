@@ -2,6 +2,7 @@
 //! and signing key to use, and which registered workload this particular
 //! `zt-gateway` instance is protecting.
 
+use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
@@ -19,6 +20,27 @@ fn default_token_ttl_seconds() -> i64 {
 
 fn default_ca_ttl_seconds() -> i64 {
     3600 // 1h, matching ADR-0002's X.509 SVID TTL
+}
+
+/// Admin listener (issuance + authorize + token-exchange) default: loopback
+/// only (F10 fix) — issuance is control-plane traffic, never meant to be
+/// reachable from outside the host/pod, so the default is restrictive by
+/// design rather than something an operator has to remember to lock down.
+fn default_admin_addr() -> SocketAddr {
+    "127.0.0.1:6443".parse().unwrap()
+}
+
+/// Proxy listener (protected-traffic forwarding) default: all interfaces,
+/// the standard HTTPS port — this is the listener meant to receive real
+/// user/caller traffic.
+fn default_proxy_addr() -> SocketAddr {
+    "0.0.0.0:443".parse().unwrap()
+}
+
+/// Requests per second the admin listener accepts before further requests
+/// are queued/delayed by the rate limiter (F7 fix).
+fn default_admin_rate_limit() -> u32 {
+    10
 }
 
 /// How strictly `zt-gateway` requires a TLS client certificate.
@@ -135,6 +157,26 @@ pub struct GatewayConfig {
     /// issuance. Only meaningful when `tls.client_auth != ClientAuth::None`.
     #[serde(default)]
     pub ca: Option<CaConfig>,
+
+    /// Admin listener address (default: `127.0.0.1:6443`, loopback-only).
+    /// Serves `/v1/svid/x509`, `/v1/authorize`, and `/v1/token-exchange` —
+    /// see `zt-gateway`'s `build_admin_router` (F10 fix: splitting this out
+    /// of the proxy listener is what makes `client_auth: required` on the
+    /// proxy listener possible without also locking issuance behind an
+    /// mTLS cert a workload doesn't have yet).
+    #[serde(default = "default_admin_addr")]
+    pub admin_addr: SocketAddr,
+
+    /// Proxy listener address (default: `0.0.0.0:443`). Serves only the
+    /// reverse-proxy catch-all (protected traffic forwarding) — issuance
+    /// and control-plane routes are never reachable here.
+    #[serde(default = "default_proxy_addr")]
+    pub proxy_addr: SocketAddr,
+
+    /// Requests per second the admin listener accepts (F7 fix: issuance
+    /// previously had no rate limiting at all). Default: 10.
+    #[serde(default = "default_admin_rate_limit")]
+    pub admin_rate_limit: u32,
 }
 
 impl GatewayConfig {
@@ -180,7 +222,50 @@ impl GatewayConfig {
         if let Ok(v) = std::env::var("ZT_GATEWAY_ACTIVE_KID") {
             self.active_kid = Some(v);
         }
+        if let Ok(v) = std::env::var("ZT_GATEWAY_ADMIN_ADDR") {
+            self.admin_addr = v
+                .parse()
+                .unwrap_or_else(|e| panic!("ZT_GATEWAY_ADMIN_ADDR={v:?} is not a valid socket address: {e}"));
+        }
+        if let Ok(v) = std::env::var("ZT_GATEWAY_PROXY_ADDR") {
+            self.proxy_addr = v
+                .parse()
+                .unwrap_or_else(|e| panic!("ZT_GATEWAY_PROXY_ADDR={v:?} is not a valid socket address: {e}"));
+        }
+        if let Ok(v) = std::env::var("ZT_GATEWAY_ADMIN_RATE_LIMIT") {
+            self.admin_rate_limit = v
+                .parse()
+                .unwrap_or_else(|e| panic!("ZT_GATEWAY_ADMIN_RATE_LIMIT={v:?} is not a valid u32: {e}"));
+        }
         self
+    }
+
+    /// Test-only constructor for a minimal, otherwise-valid config whose
+    /// listener addresses are the given `proxy`/`admin` sockets — used by
+    /// `zt-gateway`'s listener-isolation tests, which need real,
+    /// test-chosen ports rather than the production defaults (loopback
+    /// `6443`/`0.0.0.0:443`, the latter of which requires a privileged
+    /// port and would collide across concurrently-run tests anyway). Not
+    /// `#[cfg(test)]`-gated because it's consumed from `zt-gateway.rs`'s
+    /// own `#[cfg(test)]` module, a separate compilation unit from this
+    /// library crate's test build.
+    pub fn test_with_listeners(proxy: SocketAddr, admin: SocketAddr) -> Self {
+        Self {
+            listen_addr: default_listen_addr(),
+            upstream_addr: "http://127.0.0.1:0".to_string(),
+            registry_path: PathBuf::from("unused-in-tests.yaml"),
+            protected_workload: "spiffe://chakra.internal/ns/inventory/sa/inventory-svc".to_string(),
+            signing_key_path: None,
+            jwks_path: None,
+            active_kid: None,
+            gateway_id: None,
+            token_ttl_seconds: default_token_ttl_seconds(),
+            tls: None,
+            ca: None,
+            admin_addr: admin,
+            proxy_addr: proxy,
+            admin_rate_limit: default_admin_rate_limit(),
+        }
     }
 
     pub fn protected_workload_id(&self) -> Result<SpiffeId, ConfigError> {
@@ -364,6 +449,51 @@ protected_workload: spiffe://chakra.internal/ns/inventory/sa/inventory-svc
             config.gateway_id_spiffe_id(),
             Err(ConfigError::InvalidGatewayId { .. })
         ));
+    }
+
+    #[test]
+    fn admin_and_proxy_listener_defaults_are_loopback_admin_and_wildcard_proxy() {
+        let config = GatewayConfig::from_yaml_str(MINIMAL).unwrap();
+        assert_eq!(config.admin_addr, "127.0.0.1:6443".parse().unwrap());
+        assert_eq!(config.proxy_addr, "0.0.0.0:443".parse().unwrap());
+        assert_eq!(config.admin_rate_limit, 10);
+    }
+
+    #[test]
+    fn admin_and_proxy_listener_addresses_are_configurable() {
+        let yaml = format!(
+            "{MINIMAL}\nadmin_addr: 127.0.0.1:7000\nproxy_addr: 0.0.0.0:7443\nadmin_rate_limit: 25\n"
+        );
+        let config = GatewayConfig::from_yaml_str(&yaml).unwrap();
+        assert_eq!(config.admin_addr, "127.0.0.1:7000".parse().unwrap());
+        assert_eq!(config.proxy_addr, "0.0.0.0:7443".parse().unwrap());
+        assert_eq!(config.admin_rate_limit, 25);
+    }
+
+    #[test]
+    fn env_vars_override_admin_and_proxy_listener_settings() {
+        std::env::set_var("ZT_GATEWAY_ADMIN_ADDR", "127.0.0.1:7001");
+        std::env::set_var("ZT_GATEWAY_PROXY_ADDR", "0.0.0.0:7444");
+        std::env::set_var("ZT_GATEWAY_ADMIN_RATE_LIMIT", "42");
+
+        let config = GatewayConfig::from_yaml_str(MINIMAL).unwrap().with_env_overrides();
+        assert_eq!(config.admin_addr, "127.0.0.1:7001".parse().unwrap());
+        assert_eq!(config.proxy_addr, "0.0.0.0:7444".parse().unwrap());
+        assert_eq!(config.admin_rate_limit, 42);
+
+        std::env::remove_var("ZT_GATEWAY_ADMIN_ADDR");
+        std::env::remove_var("ZT_GATEWAY_PROXY_ADDR");
+        std::env::remove_var("ZT_GATEWAY_ADMIN_RATE_LIMIT");
+    }
+
+    #[test]
+    fn test_with_listeners_builds_a_minimal_valid_config() {
+        let proxy: SocketAddr = "127.0.0.1:19443".parse().unwrap();
+        let admin: SocketAddr = "127.0.0.1:19444".parse().unwrap();
+        let config = GatewayConfig::test_with_listeners(proxy, admin);
+        assert_eq!(config.proxy_addr, proxy);
+        assert_eq!(config.admin_addr, admin);
+        assert!(config.protected_workload_id().is_ok());
     }
 
     #[test]

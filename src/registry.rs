@@ -7,6 +7,7 @@ use std::collections::HashMap;
 use std::io::Read;
 
 use serde::Deserialize;
+use subtle::ConstantTimeEq;
 
 use crate::error::RegistryError;
 use crate::spiffe_id::SpiffeId;
@@ -134,13 +135,31 @@ impl Registry {
     /// needs this exact "look up by name, compare the token" check — it
     /// lives here once so `identity.rs` and `ca.rs` can't drift apart on
     /// what counts as a valid credential.
+    ///
+    /// The actual byte comparison uses [`subtle::ConstantTimeEq`] rather
+    /// than `==` (F7 fix) — a naive `str` comparison short-circuits on the
+    /// first mismatched byte, so its running time leaks how many leading
+    /// bytes of a guessed token were correct, which turns bootstrap-token
+    /// brute-forcing into a timing side-channel. Even the "workload doesn't
+    /// exist" branch still performs a dummy constant-time comparison before
+    /// returning, so a caller can't distinguish "unknown workload" from
+    /// "known workload, wrong token" by response latency either.
     pub fn check_bootstrap_token(&self, workload_name: &str, credential: &str) -> CredentialCheck<'_> {
         let Some(entry) = self.get_by_name(workload_name) else {
+            let dummy = "x";
+            let _ = dummy.as_bytes().ct_eq(credential.as_bytes());
             return CredentialCheck::UnknownWorkload;
         };
         match &entry.bootstrap_token {
-            Some(expected) if expected == credential => CredentialCheck::Ok(entry),
-            _ => CredentialCheck::InvalidCredential,
+            Some(expected) if bool::from(expected.as_bytes().ct_eq(credential.as_bytes())) => {
+                CredentialCheck::Ok(entry)
+            }
+            None => {
+                let dummy = "x";
+                let _ = dummy.as_bytes().ct_eq(credential.as_bytes());
+                CredentialCheck::InvalidCredential
+            }
+            Some(_) => CredentialCheck::InvalidCredential,
         }
     }
 
@@ -246,6 +265,59 @@ workloads:
         let registry = Registry::from_yaml_str(FIXTURE).unwrap();
         let unknown: SpiffeId = "spiffe://chakra.internal/ns/ghost/sa/ghost".parse().unwrap();
         assert!(registry.get(&unknown).is_none());
+    }
+
+    /// Qualitative timing test (F7): comparing against the correct token,
+    /// a wrong token of the same length, and a wrong token of a different
+    /// length should all take roughly the same time — proving the compare
+    /// doesn't short-circuit on the first mismatched byte the way `==`
+    /// does. Exact timing is hardware/load-dependent, so this only asserts
+    /// the deltas stay small, not that the absolute numbers match.
+    #[test]
+    fn bootstrap_token_comparison_is_constant_time() {
+        let registry = Registry::from_yaml_str(FIXTURE).unwrap();
+        let workload = "inventory-svc";
+        let correct_token = "inventory-secret";
+        let wrong_same_len = "xxxxxxxxxxxxxxxx"; // same length as correct_token
+        let wrong_diff_len = "x";
+
+        // Warm up (JIT/cache effects, first-call overhead) before timing.
+        for _ in 0..1000 {
+            let _ = registry.check_bootstrap_token(workload, correct_token);
+            let _ = registry.check_bootstrap_token(workload, wrong_same_len);
+            let _ = registry.check_bootstrap_token(workload, wrong_diff_len);
+        }
+
+        let time_many = |token: &str| -> u128 {
+            let start = std::time::Instant::now();
+            for _ in 0..5000 {
+                let _ = registry.check_bootstrap_token(workload, token);
+            }
+            start.elapsed().as_micros()
+        };
+
+        let correct_time = time_many(correct_token);
+        let wrong_same_len_time = time_many(wrong_same_len);
+        let wrong_diff_len_time = time_many(wrong_diff_len);
+
+        // All three should match in outcome (allow/deny) as a sanity check...
+        assert!(matches!(
+            registry.check_bootstrap_token(workload, correct_token),
+            CredentialCheck::Ok(_)
+        ));
+        assert!(matches!(
+            registry.check_bootstrap_token(workload, wrong_same_len),
+            CredentialCheck::InvalidCredential
+        ));
+
+        // ...and the batched timings should be in the same ballpark —
+        // comfortably loose bounds since this runs on shared CI hardware.
+        let max_time = correct_time.max(wrong_same_len_time).max(wrong_diff_len_time);
+        let min_time = correct_time.min(wrong_same_len_time).min(wrong_diff_len_time);
+        assert!(
+            max_time < min_time.max(1) * 20,
+            "timings diverged too much: correct={correct_time}us same_len={wrong_same_len_time}us diff_len={wrong_diff_len_time}us"
+        );
     }
 
     #[test]

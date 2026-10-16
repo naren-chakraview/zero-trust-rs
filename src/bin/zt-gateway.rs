@@ -12,9 +12,12 @@
 //! `None`, same as v0.1. See `obo::validate`'s doc comment for exactly what
 //! that does and doesn't enable.
 
+use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::body::Body;
+use axum::error_handling::HandleErrorLayer;
 use axum::extract::{Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -26,6 +29,9 @@ use opentelemetry::trace::TracerProvider as _;
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
+use tower::buffer::BufferLayer;
+use tower::limit::RateLimitLayer;
+use tower::ServiceBuilder;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -202,29 +208,179 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         token_exchange_ttl_secs: config.token_ttl_seconds.max(0) as u64,
     };
 
-    let router = build_router(state);
-    let listener = TcpListener::bind(&config.listen_addr).await?;
+    let listener_config = ListenerConfig {
+        proxy_addr: config.proxy_addr,
+        admin_addr: config.admin_addr,
+        admin_rate_limit_rps: config.admin_rate_limit,
+    };
+
+    let handles = setup_listeners(&listener_config, state, tls_acceptor).await?;
     tracing::info!(
-        addr = %config.listen_addr,
+        admin_addr = %handles.admin_addr,
+        proxy_addr = %handles.proxy_addr,
         upstream = %config.upstream_addr,
-        tls = tls_acceptor.is_some(),
+        admin_rate_limit_rps = listener_config.admin_rate_limit_rps,
         "zt-gateway listening"
     );
-    serve(listener, router, tls_acceptor).await;
+
+    // Neither task ever returns under normal operation -- `serve()` loops
+    // forever, only giving up an iteration (not the whole loop) on a
+    // per-connection accept error. Waiting on both keeps `main` alive for
+    // the process lifetime and surfaces a panic in either listener as a
+    // process exit rather than silently leaving the other half running.
+    let (admin_result, proxy_result) = tokio::join!(handles.admin, handles.proxy);
+    admin_result?;
+    proxy_result?;
 
     Ok(())
 }
 
+/// Pre-resolved listener settings `setup_listeners` needs, split out of
+/// `GatewayConfig` so tests can construct one directly (with test-chosen
+/// ports) without building a full, file-backed `GatewayConfig`.
+struct ListenerConfig {
+    proxy_addr: SocketAddr,
+    admin_addr: SocketAddr,
+    admin_rate_limit_rps: u32,
+}
+
+/// What `setup_listeners` hands back: the two background tasks (so the
+/// caller can await/abort them) plus the addresses each listener actually
+/// bound to -- the same as `config.{admin,proxy}_addr` in production, but
+/// meaningfully different from the requested address when a test asks for
+/// port `0` and needs to learn which port the OS actually picked.
+struct ListenerHandles {
+    admin_addr: SocketAddr,
+    proxy_addr: SocketAddr,
+    admin: tokio::task::JoinHandle<()>,
+    proxy: tokio::task::JoinHandle<()>,
+}
+
+/// Binds and spawns the admin and proxy listeners as two independent
+/// background tasks, each running the same hand-rolled `serve()` accept
+/// loop (see its doc comment) -- same TLS configuration on both (Task 6
+/// doesn't change TLS setup, only which routes live on which listener; see
+/// `docs/design/` for the planned per-listener `client_auth` split), but
+/// completely disjoint route tables: issuance/`authorize`/`token-exchange`
+/// only ever reach `build_admin_router`'s routes, and protected traffic
+/// only ever reaches `build_proxy_router`'s fallback (F7, F10 fixes).
+async fn setup_listeners(
+    config: &ListenerConfig,
+    state: AppState,
+    tls_acceptor: Option<TlsAcceptor>,
+) -> Result<ListenerHandles, Box<dyn std::error::Error>> {
+    let admin_router = build_admin_router(state.clone(), config.admin_rate_limit_rps);
+    let proxy_router = build_proxy_router(state);
+
+    let admin_listener = TcpListener::bind(config.admin_addr).await?;
+    let admin_addr = admin_listener.local_addr()?;
+    let proxy_listener = TcpListener::bind(config.proxy_addr).await?;
+    let proxy_addr = proxy_listener.local_addr()?;
+
+    let admin_tls = tls_acceptor.clone();
+    let admin = tokio::spawn(async move {
+        serve(admin_listener, admin_router, admin_tls).await;
+    });
+
+    let proxy = tokio::spawn(async move {
+        serve(proxy_listener, proxy_router, tls_acceptor).await;
+    });
+
+    Ok(ListenerHandles {
+        admin_addr,
+        proxy_addr,
+        admin,
+        proxy,
+    })
+}
+
+/// Builds the admin listener's router: the issuance routes (`/v1/svid/jwt`,
+/// `/v1/svid/x509`), `/v1/authorize`, and `/v1/token-exchange` -- every
+/// control-plane route this gateway exposes, all behind a shared rate
+/// limit (F7 fix: previously unlimited, making the bootstrap-token compare
+/// a practical brute-force target). No fallback is registered, so any path
+/// this router doesn't recognize 404s instead of being proxied anywhere.
+///
+/// The rate limiter is wrapped in a `tower::buffer::Buffer` specifically
+/// because `tower::limit::RateLimit` does not implement `Clone` -- its
+/// token-bucket state would otherwise have to live directly on the
+/// `Router`, and axum's hand-rolled `serve()` (see its doc comment) clones
+/// the whole `Router` once per accepted TCP connection, not once per
+/// request. Without the buffer, every new connection would start its own
+/// independent rate limiter and the limit would only ever hold within a
+/// single connection, never across the listener as a whole. `Buffer`
+/// instead runs the rate-limited service once, in a spawned worker task,
+/// and hands every clone of the returned `Router` a cheap handle (an mpsc
+/// `Sender`) to that same worker -- so the limit is enforced globally, the
+/// way `admin_rate_limit` in `GatewayConfig`'s doc comment describes it.
+fn build_admin_router(state: AppState, rate_limit_rps: u32) -> Router {
+    Router::new()
+        .route("/v1/svid/jwt", post(issue_svid))
+        .route("/v1/svid/x509", post(issue_x509_svid))
+        .route("/v1/authorize", post(authorize))
+        .route("/v1/token-exchange", post(handle_token_exchange))
+        .layer(
+            ServiceBuilder::new()
+                // `Buffer`/`RateLimit`'s error type is `tower::BoxError`,
+                // not the `Infallible` axum's `Router::layer` requires (every
+                // handler already produces a `Response` rather than erroring)
+                // -- `HandleErrorLayer` closes that gap by turning any error
+                // from the layers below into a `Response` itself, making the
+                // resulting service's error type `Infallible` again. In
+                // practice `RateLimit` never actually errors (it delays via
+                // `Poll::Pending` instead), so this path is boilerplate to
+                // satisfy the type-level contract, not something expected to
+                // fire under normal operation.
+                .layer(HandleErrorLayer::new(handle_admin_middleware_error))
+                .layer(BufferLayer::new(1024))
+                // RateLimitLayer::new panics on a zero rate; `.max(1)` keeps a
+                // misconfigured `admin_rate_limit: 0` from crashing the
+                // gateway at startup, degrading instead to the lowest
+                // meaningful rate (1 req/s) rather than failing closed on an
+                // operator typo.
+                .layer(RateLimitLayer::new(rate_limit_rps.max(1) as u64, Duration::from_secs(1))),
+        )
+        .layer(TraceLayer::new_for_http())
+        .with_state(state)
+}
+
+/// Converts a `tower::BoxError` bubbling up from the admin router's rate
+/// limiting middleware (see `build_admin_router`) into an HTTP response —
+/// required so the layered service's error type is `Infallible` rather
+/// than `BoxError` (axum's `Router::layer` bound). Not expected to fire in
+/// practice: `tower::limit::RateLimit` enforces its budget by delaying
+/// (`Poll::Pending`) rather than erroring.
+async fn handle_admin_middleware_error(err: tower::BoxError) -> Response {
+    error_response(StatusCode::SERVICE_UNAVAILABLE, format!("admin listener unavailable: {err}"))
+}
+
+/// Builds the proxy listener's router: only the reverse-proxy catch-all
+/// (F7, F10 fixes). No issuance or control-plane route is ever reachable
+/// here, which is what makes it safe to set `client_auth: required` on
+/// this listener without also locking out workloads that haven't
+/// bootstrapped an SVID yet (they'd reach the admin listener instead,
+/// which stays `client_auth: optional`/loopback-restricted).
+fn build_proxy_router(state: AppState) -> Router {
+    Router::new()
+        .fallback(proxy_handler)
+        .layer(TraceLayer::new_for_http())
+        .with_state(state)
+}
+
+/// The pre-Task-6 combined router: every route (issuance, `/v1/authorize`,
+/// `/v1/token-exchange`) plus the proxy fallback, all on one `Router`, none
+/// of it rate-limited. Kept around (rather than folded into
+/// `build_admin_router`/`build_proxy_router`) purely so every test written
+/// before this task -- which exercises issuance, authorize, token-exchange,
+/// and proxying all through a single `Router` via `tower::ServiceExt::oneshot`
+/// -- keeps working completely unmodified; `main` itself no longer calls
+/// this, `setup_listeners` is what it uses instead.
+#[cfg_attr(not(test), allow(dead_code))]
 fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/v1/svid/jwt", post(issue_svid))
         .route("/v1/svid/x509", post(issue_x509_svid))
         .route("/v1/authorize", post(authorize))
-        // RFC 8693 token exchange (Task 5). Lives alongside the other
-        // issuance/control-plane routes here for now; Task 6 moves all of
-        // them onto a separate, rate-limited admin listener and takes this
-        // off the same listener `proxy_handler`'s fallback serves traffic
-        // on.
         .route("/v1/token-exchange", post(handle_token_exchange))
         .fallback(proxy_handler)
         .layer(TraceLayer::new_for_http())
@@ -1375,5 +1531,164 @@ workloads:
                 );
             }
         }
+    }
+
+    // --- Task 6: admin/proxy listener split, rate limiting, constant-time
+    // --- bootstrap token comparison (F7, F10) ---
+
+    /// The core F10 guarantee: `/v1/authorize` (an admin-only route) answers
+    /// on the admin listener but is unreachable on the proxy listener — a
+    /// request to that path there falls through to `proxy_handler`'s
+    /// catch-all instead, which denies it for lacking an OBO token, exactly
+    /// like any other unauthenticated proxy request. And the reverse holds
+    /// too: the admin listener has no catch-all at all, so a path it
+    /// doesn't recognize 404s rather than silently being proxied anywhere.
+    #[tokio::test]
+    async fn admin_routes_are_unreachable_on_the_proxy_listener() {
+        let state = test_state("http://unused.invalid".to_string());
+        let admin_router = build_admin_router(state.clone(), 1000);
+        let proxy_router = build_proxy_router(state);
+
+        let admin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let admin_addr = admin_listener.local_addr().unwrap();
+        let proxy_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let proxy_addr = proxy_listener.local_addr().unwrap();
+
+        tokio::spawn(serve(admin_listener, admin_router, None));
+        tokio::spawn(serve(proxy_listener, proxy_router, None));
+
+        let client = reqwest::Client::new();
+        let authorize_body = serde_json::json!({ "destination": INVENTORY });
+
+        // /v1/authorize answers on the admin listener...
+        let admin_resp = client
+            .post(format!("http://{admin_addr}/v1/authorize"))
+            .json(&authorize_body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(admin_resp.status(), SC::OK);
+
+        // ...but on the proxy listener the same path is just ordinary
+        // (token-less) proxy traffic, and gets denied -- never routed to
+        // the authorize handler.
+        let proxy_resp = client
+            .post(format!("http://{proxy_addr}/v1/authorize"))
+            .json(&authorize_body)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(proxy_resp.status(), SC::FORBIDDEN);
+
+        // The admin listener, in turn, never serves proxied traffic -- a
+        // path with no matching admin route 404s instead of being
+        // forwarded.
+        let admin_proxy_attempt = client
+            .get(format!("http://{admin_addr}/some/protected/path"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(admin_proxy_attempt.status(), SC::NOT_FOUND);
+    }
+
+    /// Exercises the real production wiring (`ListenerConfig` +
+    /// `setup_listeners`, the pair `main` itself calls) end to end, rather
+    /// than hand-assembling routers/listeners the way the test above does.
+    /// Binds to port `0` on both listeners and reads back the OS-assigned
+    /// ports from `ListenerHandles` to stay collision-free under parallel
+    /// test execution.
+    #[tokio::test]
+    async fn setup_listeners_wires_the_admin_and_proxy_routers_onto_separate_sockets() {
+        let gateway_config =
+            GatewayConfig::test_with_listeners("127.0.0.1:0".parse().unwrap(), "127.0.0.1:0".parse().unwrap());
+        let listener_config = ListenerConfig {
+            proxy_addr: gateway_config.proxy_addr,
+            admin_addr: gateway_config.admin_addr,
+            admin_rate_limit_rps: gateway_config.admin_rate_limit,
+        };
+        let state = test_state("http://unused.invalid".to_string());
+
+        let handles = setup_listeners(&listener_config, state, None).await.unwrap();
+
+        let client = reqwest::Client::new();
+
+        let admin_resp = client
+            .post(format!("http://{}/v1/authorize", handles.admin_addr))
+            .json(&serde_json::json!({ "destination": INVENTORY }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(admin_resp.status(), SC::OK);
+
+        let proxy_resp = client
+            .post(format!("http://{}/v1/authorize", handles.proxy_addr))
+            .json(&serde_json::json!({ "destination": INVENTORY }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(proxy_resp.status(), SC::FORBIDDEN);
+
+        handles.admin.abort();
+        handles.proxy.abort();
+    }
+
+    /// Qualitative rate-limit test (F7): with a deliberately tiny budget
+    /// (2 req/s), sending a 2x-budget burst of requests through the admin
+    /// router must take meaningfully longer than an unthrottled burst would
+    /// (which completes in low single-digit milliseconds in-process) --
+    /// proving requests beyond the budget are queued/delayed rather than
+    /// all let through immediately. Every clone of `router` below shares
+    /// one `tower::buffer::Buffer` worker (see `build_admin_router`'s doc
+    /// comment), which is what makes the limit hold across the whole
+    /// burst instead of resetting per clone.
+    #[tokio::test]
+    async fn admin_router_rate_limits_a_burst_of_requests() {
+        let state = test_state("http://unused.invalid".to_string());
+        let rate_limit_rps: u32 = 2;
+        let router = build_admin_router(state, rate_limit_rps);
+
+        let make_request = || {
+            Request::builder()
+                .method("POST")
+                .uri("/v1/authorize")
+                .header("content-type", "application/json")
+                .body(Body::from(format!(r#"{{"destination":"{INVENTORY}"}}"#)))
+                .unwrap()
+        };
+
+        let start = std::time::Instant::now();
+        for _ in 0..(rate_limit_rps as usize * 2) {
+            let response = router.clone().oneshot(make_request()).await.unwrap();
+            assert_eq!(response.status(), SC::OK);
+        }
+        let elapsed = start.elapsed();
+
+        assert!(
+            elapsed >= std::time::Duration::from_millis(800),
+            "expected a 2x-budget burst to be throttled to more than ~800ms, took {elapsed:?}"
+        );
+    }
+
+    /// Below the configured rate, requests should sail through without any
+    /// imposed delay — the limiter should never slow down traffic that's
+    /// already within budget.
+    #[tokio::test]
+    async fn admin_router_does_not_throttle_requests_within_budget() {
+        let state = test_state("http://unused.invalid".to_string());
+        let router = build_admin_router(state, 1000);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/authorize")
+            .header("content-type", "application/json")
+            .body(Body::from(format!(r#"{{"destination":"{INVENTORY}"}}"#)))
+            .unwrap();
+
+        let start = std::time::Instant::now();
+        let response = router.oneshot(request).await.unwrap();
+        let elapsed = start.elapsed();
+
+        assert_eq!(response.status(), SC::OK);
+        assert!(elapsed < std::time::Duration::from_millis(500), "got: {elapsed:?}");
     }
 }

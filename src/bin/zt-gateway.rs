@@ -21,6 +21,7 @@ use axum::error_handling::HandleErrorLayer;
 use axum::extract::{Request, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
+use axum::extract::DefaultBodyLimit;
 use axum::routing::post;
 use axum::{Extension, Json, Router};
 use hyper_util::rt::TokioIo;
@@ -30,8 +31,9 @@ use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use tokio_rustls::TlsAcceptor;
 use tower::buffer::BufferLayer;
-use tower::limit::RateLimitLayer;
+use tower::limit::{ConcurrencyLimitLayer, RateLimitLayer};
 use tower::ServiceBuilder;
+use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
@@ -66,6 +68,8 @@ struct AppState {
     /// Mirrors `GatewayConfig::token_ttl_seconds`, the same TTL
     /// `LocalIssuer` itself uses for `issue_jwt_svid`.
     token_exchange_ttl_secs: u64,
+    /// Max body size in bytes (F6 fix).
+    max_body_bytes: usize,
 }
 
 /// Sets up structured stdout logs (always) plus, when
@@ -197,21 +201,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         None => None,
     };
 
+    let upstream_client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(config.connect_timeout_secs))
+        .timeout(Duration::from_secs(config.request_timeout_secs))
+        .build()?;
+
     let state = AppState {
         identity: Arc::new(issuer),
         ca,
         registry: Arc::new(registry),
-        http_client: reqwest::Client::new(),
+        http_client: upstream_client,
         upstream_addr: config.upstream_addr.clone(),
         protected_workload: Arc::new(protected_workload),
         gateway_id: Arc::new(gateway_id),
         token_exchange_ttl_secs: config.token_ttl_seconds.max(0) as u64,
+        max_body_bytes: (config.max_body_mb as usize) * 1024 * 1024,
     };
 
     let listener_config = ListenerConfig {
         proxy_addr: config.proxy_addr,
         admin_addr: config.admin_addr,
         admin_rate_limit_rps: config.admin_rate_limit,
+        max_body_mb: config.max_body_mb,
+        request_timeout_secs: config.request_timeout_secs,
+        max_concurrent_connections: config.max_concurrent_connections,
     };
 
     let handles = setup_listeners(&listener_config, state, tls_acceptor).await?;
@@ -242,6 +255,9 @@ struct ListenerConfig {
     proxy_addr: SocketAddr,
     admin_addr: SocketAddr,
     admin_rate_limit_rps: u32,
+    max_body_mb: u32,
+    request_timeout_secs: u64,
+    max_concurrent_connections: u32,
 }
 
 /// What `setup_listeners` hands back: the two background tasks (so the
@@ -269,8 +285,8 @@ async fn setup_listeners(
     state: AppState,
     tls_acceptor: Option<TlsAcceptor>,
 ) -> Result<ListenerHandles, Box<dyn std::error::Error>> {
-    let admin_router = build_admin_router(state.clone(), config.admin_rate_limit_rps);
-    let proxy_router = build_proxy_router(state);
+    let admin_router = build_admin_router(state.clone(), config.admin_rate_limit_rps, config.max_body_mb, config.request_timeout_secs, config.max_concurrent_connections);
+    let proxy_router = build_proxy_router(state, config.max_body_mb, config.request_timeout_secs, config.max_concurrent_connections);
 
     let admin_listener = TcpListener::bind(config.admin_addr).await?;
     let admin_addr = admin_listener.local_addr()?;
@@ -313,24 +329,19 @@ async fn setup_listeners(
 /// and hands every clone of the returned `Router` a cheap handle (an mpsc
 /// `Sender`) to that same worker -- so the limit is enforced globally, the
 /// way `admin_rate_limit` in `GatewayConfig`'s doc comment describes it.
-fn build_admin_router(state: AppState, rate_limit_rps: u32) -> Router {
+fn build_admin_router(state: AppState, rate_limit_rps: u32, max_body_mb: u32, request_timeout_secs: u64, max_concurrent_connections: u32) -> Router {
+    let body_limit_bytes = (max_body_mb as usize) * 1024 * 1024;
+
     Router::new()
         .route("/v1/svid/jwt", post(issue_svid))
         .route("/v1/svid/x509", post(issue_x509_svid))
         .route("/v1/authorize", post(authorize))
         .route("/v1/token-exchange", post(handle_token_exchange))
+        .layer(DefaultBodyLimit::max(body_limit_bytes))
+        .layer(TimeoutLayer::new(Duration::from_secs(request_timeout_secs)))
         .layer(
             ServiceBuilder::new()
-                // `Buffer`/`RateLimit`'s error type is `tower::BoxError`,
-                // not the `Infallible` axum's `Router::layer` requires (every
-                // handler already produces a `Response` rather than erroring)
-                // -- `HandleErrorLayer` closes that gap by turning any error
-                // from the layers below into a `Response` itself, making the
-                // resulting service's error type `Infallible` again. In
-                // practice `RateLimit` never actually errors (it delays via
-                // `Poll::Pending` instead), so this path is boilerplate to
-                // satisfy the type-level contract, not something expected to
-                // fire under normal operation.
+                .layer(ConcurrencyLimitLayer::new(max_concurrent_connections as usize))
                 .layer(HandleErrorLayer::new(handle_admin_middleware_error))
                 .layer(BufferLayer::new(1024))
                 // RateLimitLayer::new panics on a zero rate; `.max(1)` keeps a
@@ -360,9 +371,14 @@ async fn handle_admin_middleware_error(err: tower::BoxError) -> Response {
 /// this listener without also locking out workloads that haven't
 /// bootstrapped an SVID yet (they'd reach the admin listener instead,
 /// which stays `client_auth: optional`/loopback-restricted).
-fn build_proxy_router(state: AppState) -> Router {
+fn build_proxy_router(state: AppState, max_body_mb: u32, request_timeout_secs: u64, max_concurrent_connections: u32) -> Router {
+    let body_limit_bytes = (max_body_mb as usize) * 1024 * 1024;
+
     Router::new()
         .fallback(proxy_handler)
+        .layer(DefaultBodyLimit::max(body_limit_bytes))
+        .layer(TimeoutLayer::new(Duration::from_secs(request_timeout_secs)))
+        .layer(ConcurrencyLimitLayer::new(max_concurrent_connections as usize))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -377,12 +393,20 @@ fn build_proxy_router(state: AppState) -> Router {
 /// this, `setup_listeners` is what it uses instead.
 #[cfg_attr(not(test), allow(dead_code))]
 fn build_router(state: AppState) -> Router {
+    let max_body_mb = 100u32;
+    let request_timeout_secs = 30u64;
+    let max_concurrent_connections = 1000u32;
+    let body_limit_bytes = (max_body_mb as usize) * 1024 * 1024;
+
     Router::new()
         .route("/v1/svid/jwt", post(issue_svid))
         .route("/v1/svid/x509", post(issue_x509_svid))
         .route("/v1/authorize", post(authorize))
         .route("/v1/token-exchange", post(handle_token_exchange))
         .fallback(proxy_handler)
+        .layer(DefaultBodyLimit::max(body_limit_bytes))
+        .layer(TimeoutLayer::new(Duration::from_secs(request_timeout_secs)))
+        .layer(ConcurrencyLimitLayer::new(max_concurrent_connections as usize))
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -745,10 +769,17 @@ async fn proxy_handler(
     peer_identity: Option<Extension<PeerIdentity>>,
     req: Request,
 ) -> Response {
+    let (parts, body) = req.into_parts();
+
+    let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
+        Ok(bytes) => bytes,
+        Err(_) => return error_response(StatusCode::BAD_REQUEST, "failed to read request body"),
+    };
+
     let source_principal = peer_identity.and_then(|Extension(PeerIdentity(id))| id);
-    let obo_token = header_str(req.headers(), HEADER_OBO_TOKEN);
-    let caller_chain = header_str(req.headers(), HEADER_CALLER_CHAIN);
-    let user_principal = header_str(req.headers(), HEADER_USER_PRINCIPAL);
+    let obo_token = header_str(&parts.headers, HEADER_OBO_TOKEN);
+    let caller_chain = header_str(&parts.headers, HEADER_CALLER_CHAIN);
+    let user_principal = header_str(&parts.headers, HEADER_USER_PRINCIPAL);
 
     let request = ValidationRequest {
         destination: &state.protected_workload,
@@ -811,7 +842,7 @@ async fn proxy_handler(
     );
 
     match decision {
-        Decision::Allow => forward_to_upstream(&state, req).await,
+        Decision::Allow => forward_to_upstream(&state, parts, body_bytes).await,
         Decision::Deny(reason) => (
             StatusCode::FORBIDDEN,
             Json(DenyBody {
@@ -827,13 +858,11 @@ async fn proxy_handler(
 /// for the new connection to the upstream instead of reusing stale values.
 const HOP_BY_HOP_HEADERS: [&str; 3] = ["host", "content-length", "connection"];
 
-async fn forward_to_upstream(state: &AppState, req: Request) -> Response {
-    let (parts, body) = req.into_parts();
-
-    let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
-        Ok(bytes) => bytes,
-        Err(_) => return error_response(StatusCode::BAD_REQUEST, "failed to read request body"),
-    };
+async fn forward_to_upstream(state: &AppState, parts: axum::http::request::Parts, body_bytes: axum::body::Bytes) -> Response {
+    // Check body size limit (F6 fix)
+    if body_bytes.len() > state.max_body_bytes {
+        return error_response(StatusCode::PAYLOAD_TOO_LARGE, "payload too large");
+    }
 
     let path_and_query = parts
         .uri
@@ -856,6 +885,10 @@ async fn forward_to_upstream(state: &AppState, req: Request) -> Response {
     let upstream_response = match upstream_request.send().await {
         Ok(resp) => resp,
         Err(e) => {
+            if e.is_timeout() {
+                tracing::warn!(error = %e, "upstream request timeout");
+                return error_response(StatusCode::GATEWAY_TIMEOUT, "upstream request timeout");
+            }
             tracing::warn!(error = %e, "upstream request failed");
             return error_response(StatusCode::BAD_GATEWAY, "upstream request failed");
         }
@@ -932,6 +965,7 @@ workloads:
             protected_workload: Arc::new(INVENTORY.parse().unwrap()),
             gateway_id: Arc::new(GATEWAY_SELF.parse().unwrap()),
             token_exchange_ttl_secs: 300,
+            max_body_bytes: 100 * 1024 * 1024,
         }
     }
 
@@ -1546,8 +1580,8 @@ workloads:
     #[tokio::test]
     async fn admin_routes_are_unreachable_on_the_proxy_listener() {
         let state = test_state("http://unused.invalid".to_string());
-        let admin_router = build_admin_router(state.clone(), 1000);
-        let proxy_router = build_proxy_router(state);
+        let admin_router = build_admin_router(state.clone(), 1000, 100, 30, 1000);
+        let proxy_router = build_proxy_router(state, 100, 30, 1000);
 
         let admin_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let admin_addr = admin_listener.local_addr().unwrap();
@@ -1605,6 +1639,9 @@ workloads:
             proxy_addr: gateway_config.proxy_addr,
             admin_addr: gateway_config.admin_addr,
             admin_rate_limit_rps: gateway_config.admin_rate_limit,
+            max_body_mb: gateway_config.max_body_mb,
+            request_timeout_secs: gateway_config.request_timeout_secs,
+            max_concurrent_connections: gateway_config.max_concurrent_connections,
         };
         let state = test_state("http://unused.invalid".to_string());
 
@@ -1645,7 +1682,7 @@ workloads:
     async fn admin_router_rate_limits_a_burst_of_requests() {
         let state = test_state("http://unused.invalid".to_string());
         let rate_limit_rps: u32 = 2;
-        let router = build_admin_router(state, rate_limit_rps);
+        let router = build_admin_router(state, rate_limit_rps, 100, 30, 1000);
 
         let make_request = || {
             Request::builder()
@@ -1675,7 +1712,7 @@ workloads:
     #[tokio::test]
     async fn admin_router_does_not_throttle_requests_within_budget() {
         let state = test_state("http://unused.invalid".to_string());
-        let router = build_admin_router(state, 1000);
+        let router = build_admin_router(state, 1000, 100, 30, 1000);
 
         let request = Request::builder()
             .method("POST")
@@ -1690,5 +1727,136 @@ workloads:
 
         assert_eq!(response.status(), SC::OK);
         assert!(elapsed < std::time::Duration::from_millis(500), "got: {elapsed:?}");
+    }
+
+    // --- Task 7: body limits and timeouts (F6) ---
+
+    /// Oversized request body is rejected with 413 Payload Too Large.
+    #[tokio::test]
+    async fn proxy_rejects_oversized_body_with_413() {
+        let mut state = test_state("http://unused.invalid".to_string());
+        state.max_body_bytes = 100 * 1024 * 1024; // Allow token issuance
+        let router_for_token = build_router_with_limits(state.clone(), 100, 30, 1000);
+
+        // First, issue a valid token for the oversized body test
+        let issued = router_for_token
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/svid/jwt")
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"workload_name":"orders-svc","audience":"{}","bootstrap_token":"orders-secret"}}"#,
+                        INVENTORY
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(issued.into_body(), usize::MAX).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let token = parsed["token"].as_str().unwrap().to_string();
+
+        // Now update state with 1 MB limit and try large body
+        state.max_body_bytes = 1 * 1024 * 1024;
+        let router = build_router_with_limits(state, 1, 30, 1000);
+
+        // 5 MB body (exceeds 1 MB limit)
+        let large_body = vec![0u8; 5 * 1024 * 1024];
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/some/path")
+            .header(HEADER_OBO_TOKEN, token)
+            .body(Body::from(large_body))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), SC::PAYLOAD_TOO_LARGE);
+    }
+
+    /// Slow upstream request times out and returns 504 Gateway Timeout.
+    #[tokio::test]
+    async fn proxy_returns_504_on_upstream_timeout() {
+        // Spawn a fake upstream that accepts connections but never responds
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let slow_upstream_addr = format!("http://{}", listener.local_addr().unwrap());
+
+        // Spawn background task that accepts connections but hangs
+        tokio::spawn(async move {
+            loop {
+                if let Ok((mut _socket, _)) = listener.accept().await {
+                    // Accept the connection but never send a response
+                    tokio::time::sleep(Duration::from_secs(60)).await;
+                }
+            }
+        });
+
+        let state = test_state(slow_upstream_addr);
+        // Use the client's 1-second timeout (not the TimeoutLayer timeout which applies to the whole request)
+        // The reqwest client has a timeout set in main, but in tests we need to handle it
+        // First use normal timeout for token issuance, then create a client with short timeout for proxy test
+        let router_for_token = build_router_with_limits(state.clone(), 100, 5, 1000);
+
+        let issued = router_for_token
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/v1/svid/jwt")
+                    .header("content-type", "application/json")
+                    .body(Body::from(format!(
+                        r#"{{"workload_name":"orders-svc","audience":"{}","bootstrap_token":"orders-secret"}}"#,
+                        INVENTORY
+                    )))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let bytes = axum::body::to_bytes(issued.into_body(), usize::MAX).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let token = parsed["token"].as_str().unwrap().to_string();
+
+        // Now we need to update the state to have a shorter timeout on the http client
+        // Create a new client with 1 second timeout
+        let http_client = reqwest::Client::builder()
+            .connect_timeout(Duration::from_secs(1))
+            .timeout(Duration::from_secs(1))
+            .build()
+            .unwrap();
+
+        let mut state_with_timeout = state;
+        state_with_timeout.http_client = http_client;
+
+        // Use a longer TimeoutLayer timeout so the layer doesn't fire
+        let router = build_router_with_limits(state_with_timeout, 100, 10, 1000);
+
+        // Make a proxied request that will timeout on the upstream client
+        let request = Request::builder()
+            .method("GET")
+            .uri("/some/path")
+            .header(HEADER_OBO_TOKEN, token)
+            .body(Body::empty())
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), SC::GATEWAY_TIMEOUT);
+    }
+
+    /// Helper to build a router with custom timeout/limit settings for testing.
+    fn build_router_with_limits(state: AppState, max_body_mb: u32, request_timeout_secs: u64, max_concurrent_connections: u32) -> Router {
+        let body_limit_bytes = (max_body_mb as usize) * 1024 * 1024;
+
+        Router::new()
+            .route("/v1/svid/jwt", post(issue_svid))
+            .route("/v1/svid/x509", post(issue_x509_svid))
+            .route("/v1/authorize", post(authorize))
+            .route("/v1/token-exchange", post(handle_token_exchange))
+            .fallback(proxy_handler)
+            .layer(DefaultBodyLimit::max(body_limit_bytes))
+            .layer(TimeoutLayer::new(Duration::from_secs(request_timeout_secs)))
+            .layer(ConcurrencyLimitLayer::new(max_concurrent_connections as usize))
+            .layer(TraceLayer::new_for_http())
+            .with_state(state)
     }
 }

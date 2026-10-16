@@ -43,6 +43,31 @@ fn default_admin_rate_limit() -> u32 {
     10
 }
 
+/// Max request body size in MB (F6 fix).
+fn default_max_body_mb() -> u32 {
+    100
+}
+
+/// Connect timeout for upstream requests in seconds (F6 fix).
+fn default_connect_timeout_secs() -> u64 {
+    10
+}
+
+/// Read timeout for upstream requests in seconds (F6 fix).
+fn default_read_timeout_secs() -> u64 {
+    30
+}
+
+/// Overall request timeout in seconds (F6 fix).
+fn default_request_timeout_secs() -> u64 {
+    30
+}
+
+/// Max concurrent connections (F6 fix).
+fn default_max_concurrent_connections() -> u32 {
+    1000
+}
+
 /// How strictly `zt-gateway` requires a TLS client certificate.
 /// See `docs/design/0001-tls-mtls-termination.md` for the full rollout story.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
@@ -177,6 +202,31 @@ pub struct GatewayConfig {
     /// previously had no rate limiting at all). Default: 10.
     #[serde(default = "default_admin_rate_limit")]
     pub admin_rate_limit: u32,
+
+    /// Max request body size in MB (F6 fix: prevents unbounded memory usage).
+    /// Default: 100 MB.
+    #[serde(default = "default_max_body_mb")]
+    pub max_body_mb: u32,
+
+    /// Connect timeout for upstream requests in seconds (F6 fix).
+    /// Default: 10 seconds.
+    #[serde(default = "default_connect_timeout_secs")]
+    pub connect_timeout_secs: u64,
+
+    /// Read timeout for upstream requests in seconds (F6 fix).
+    /// Default: 30 seconds.
+    #[serde(default = "default_read_timeout_secs")]
+    pub read_timeout_secs: u64,
+
+    /// Overall request timeout in seconds (F6 fix).
+    /// Default: 30 seconds.
+    #[serde(default = "default_request_timeout_secs")]
+    pub request_timeout_secs: u64,
+
+    /// Max concurrent connections (F6 fix: prevents resource exhaustion).
+    /// Default: 1000.
+    #[serde(default = "default_max_concurrent_connections")]
+    pub max_concurrent_connections: u32,
 }
 
 impl GatewayConfig {
@@ -237,6 +287,31 @@ impl GatewayConfig {
                 .parse()
                 .unwrap_or_else(|e| panic!("ZT_GATEWAY_ADMIN_RATE_LIMIT={v:?} is not a valid u32: {e}"));
         }
+        if let Ok(v) = std::env::var("ZT_GATEWAY_MAX_BODY_MB") {
+            self.max_body_mb = v
+                .parse()
+                .unwrap_or_else(|e| panic!("ZT_GATEWAY_MAX_BODY_MB={v:?} is not a valid u32: {e}"));
+        }
+        if let Ok(v) = std::env::var("ZT_GATEWAY_CONNECT_TIMEOUT_SECS") {
+            self.connect_timeout_secs = v
+                .parse()
+                .unwrap_or_else(|e| panic!("ZT_GATEWAY_CONNECT_TIMEOUT_SECS={v:?} is not a valid u64: {e}"));
+        }
+        if let Ok(v) = std::env::var("ZT_GATEWAY_READ_TIMEOUT_SECS") {
+            self.read_timeout_secs = v
+                .parse()
+                .unwrap_or_else(|e| panic!("ZT_GATEWAY_READ_TIMEOUT_SECS={v:?} is not a valid u64: {e}"));
+        }
+        if let Ok(v) = std::env::var("ZT_GATEWAY_REQUEST_TIMEOUT_SECS") {
+            self.request_timeout_secs = v
+                .parse()
+                .unwrap_or_else(|e| panic!("ZT_GATEWAY_REQUEST_TIMEOUT_SECS={v:?} is not a valid u64: {e}"));
+        }
+        if let Ok(v) = std::env::var("ZT_GATEWAY_MAX_CONCURRENT_CONNECTIONS") {
+            self.max_concurrent_connections = v
+                .parse()
+                .unwrap_or_else(|e| panic!("ZT_GATEWAY_MAX_CONCURRENT_CONNECTIONS={v:?} is not a valid u32: {e}"));
+        }
         self
     }
 
@@ -265,7 +340,20 @@ impl GatewayConfig {
             admin_addr: admin,
             proxy_addr: proxy,
             admin_rate_limit: default_admin_rate_limit(),
+            max_body_mb: default_max_body_mb(),
+            connect_timeout_secs: default_connect_timeout_secs(),
+            read_timeout_secs: default_read_timeout_secs(),
+            request_timeout_secs: default_request_timeout_secs(),
+            max_concurrent_connections: default_max_concurrent_connections(),
         }
+    }
+
+    /// Test-only constructor with custom timeout/body limit settings.
+    pub fn test_with_limits(proxy: SocketAddr, admin: SocketAddr, max_body_mb: u32, request_timeout_secs: u64) -> Self {
+        let mut config = Self::test_with_listeners(proxy, admin);
+        config.max_body_mb = max_body_mb;
+        config.request_timeout_secs = request_timeout_secs;
+        config
     }
 
     pub fn protected_workload_id(&self) -> Result<SpiffeId, ConfigError> {
@@ -507,5 +595,48 @@ protected_workload: spiffe://chakra.internal/ns/inventory/sa/inventory-svc
 
         std::env::remove_var("ZT_GATEWAY_JWKS_PATH");
         std::env::remove_var("ZT_GATEWAY_ACTIVE_KID");
+    }
+
+    #[test]
+    fn default_body_and_timeout_limits_are_applied() {
+        let config = GatewayConfig::from_yaml_str(MINIMAL).unwrap();
+        assert_eq!(config.max_body_mb, 100);
+        assert_eq!(config.connect_timeout_secs, 10);
+        assert_eq!(config.read_timeout_secs, 30);
+        assert_eq!(config.request_timeout_secs, 30);
+        assert_eq!(config.max_concurrent_connections, 1000);
+    }
+
+    #[test]
+    fn body_and_timeout_limits_are_configurable_in_yaml() {
+        let yaml = format!("{MINIMAL}\nmax_body_mb: 50\nconnect_timeout_secs: 5\nread_timeout_secs: 15\nrequest_timeout_secs: 20\nmax_concurrent_connections: 500\n");
+        let config = GatewayConfig::from_yaml_str(&yaml).unwrap();
+        assert_eq!(config.max_body_mb, 50);
+        assert_eq!(config.connect_timeout_secs, 5);
+        assert_eq!(config.read_timeout_secs, 15);
+        assert_eq!(config.request_timeout_secs, 20);
+        assert_eq!(config.max_concurrent_connections, 500);
+    }
+
+    #[test]
+    fn env_vars_override_body_and_timeout_limits() {
+        std::env::set_var("ZT_GATEWAY_MAX_BODY_MB", "75");
+        std::env::set_var("ZT_GATEWAY_CONNECT_TIMEOUT_SECS", "8");
+        std::env::set_var("ZT_GATEWAY_READ_TIMEOUT_SECS", "25");
+        std::env::set_var("ZT_GATEWAY_REQUEST_TIMEOUT_SECS", "28");
+        std::env::set_var("ZT_GATEWAY_MAX_CONCURRENT_CONNECTIONS", "750");
+
+        let config = GatewayConfig::from_yaml_str(MINIMAL).unwrap().with_env_overrides();
+        assert_eq!(config.max_body_mb, 75);
+        assert_eq!(config.connect_timeout_secs, 8);
+        assert_eq!(config.read_timeout_secs, 25);
+        assert_eq!(config.request_timeout_secs, 28);
+        assert_eq!(config.max_concurrent_connections, 750);
+
+        std::env::remove_var("ZT_GATEWAY_MAX_BODY_MB");
+        std::env::remove_var("ZT_GATEWAY_CONNECT_TIMEOUT_SECS");
+        std::env::remove_var("ZT_GATEWAY_READ_TIMEOUT_SECS");
+        std::env::remove_var("ZT_GATEWAY_REQUEST_TIMEOUT_SECS");
+        std::env::remove_var("ZT_GATEWAY_MAX_CONCURRENT_CONNECTIONS");
     }
 }

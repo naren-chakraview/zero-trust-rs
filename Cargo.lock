@@ -1689,6 +1689,7 @@ dependencies = [
  "http",
  "http-body",
  "pin-project-lite",
+ "tokio",
  "tower 0.5.3",
  "tower-layer",
  "tower-service",

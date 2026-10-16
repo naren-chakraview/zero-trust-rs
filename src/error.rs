@@ -85,6 +85,17 @@ pub enum ConfigError {
     Io(#[from] std::io::Error),
     #[error("protected_workload is not a valid SPIFFE ID: {0}")]
     InvalidProtectedWorkload(#[from] SpiffeIdError),
+    /// [`crate::GatewayConfig::gateway_id`]'s value doesn't parse as a
+    /// SPIFFE ID. Kept distinct from `InvalidProtectedWorkload` (rather
+    /// than sharing a `#[from]`) since both wrap the same underlying
+    /// [`SpiffeIdError`] type and a derive can't disambiguate which field
+    /// failed from the source type alone.
+    #[error("gateway_id '{value}' is not a valid SPIFFE ID: {source}")]
+    InvalidGatewayId {
+        value: String,
+        #[source]
+        source: SpiffeIdError,
+    },
 }
 
 /// Errors from loading/generating TLS server certificate material or

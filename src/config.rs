@@ -113,6 +113,17 @@ pub struct GatewayConfig {
     #[serde(default)]
     pub active_kid: Option<String>,
 
+    /// This gateway's own SPIFFE ID, appended to the signed `act`
+    /// delegation chain by `POST /v1/token-exchange`
+    /// ([`crate::token_exchange::exchange_token`]) when this gateway hands
+    /// a request on to a further hop. Defaults to `protected_workload`
+    /// when unset — correct for the common single-protected-workload
+    /// deployment, but should be set explicitly for a gateway that fans
+    /// requests out to multiple downstream audiences under its own
+    /// distinct identity.
+    #[serde(default)]
+    pub gateway_id: Option<String>,
+
     #[serde(default = "default_token_ttl_seconds")]
     pub token_ttl_seconds: i64,
 
@@ -176,6 +187,19 @@ impl GatewayConfig {
         self.protected_workload
             .parse()
             .map_err(ConfigError::InvalidProtectedWorkload)
+    }
+
+    /// This gateway's own identity for RFC 8693 token exchange, falling
+    /// back to [`Self::protected_workload_id`] when `gateway_id` is unset
+    /// (see that field's doc comment for when an explicit value matters).
+    pub fn gateway_id_spiffe_id(&self) -> Result<SpiffeId, ConfigError> {
+        match &self.gateway_id {
+            Some(value) => value.parse().map_err(|source| ConfigError::InvalidGatewayId {
+                value: value.clone(),
+                source,
+            }),
+            None => self.protected_workload_id(),
+        }
     }
 }
 
@@ -311,6 +335,35 @@ protected_workload: spiffe://chakra.internal/ns/inventory/sa/inventory-svc
         let config = GatewayConfig::from_yaml_str(&yaml).unwrap();
         assert_eq!(config.jwks_path, Some(PathBuf::from("jwks.json")));
         assert_eq!(config.active_kid, Some("key-1".to_string()));
+    }
+
+    #[test]
+    fn gateway_id_defaults_to_protected_workload_when_unset() {
+        let config = GatewayConfig::from_yaml_str(MINIMAL).unwrap();
+        assert!(config.gateway_id.is_none());
+        assert_eq!(
+            config.gateway_id_spiffe_id().unwrap(),
+            config.protected_workload_id().unwrap()
+        );
+    }
+
+    #[test]
+    fn gateway_id_overrides_protected_workload_when_set() {
+        let yaml = format!("{MINIMAL}\ngateway_id: spiffe://chakra.internal/ns/gateway-a/sa/gateway-a\n");
+        let config = GatewayConfig::from_yaml_str(&yaml).unwrap();
+        let id = config.gateway_id_spiffe_id().unwrap();
+        assert_eq!(id.service_account(), "gateway-a");
+        assert_ne!(id, config.protected_workload_id().unwrap());
+    }
+
+    #[test]
+    fn gateway_id_rejects_a_malformed_spiffe_id() {
+        let yaml = format!("{MINIMAL}\ngateway_id: not-a-spiffe-id\n");
+        let config = GatewayConfig::from_yaml_str(&yaml).unwrap();
+        assert!(matches!(
+            config.gateway_id_spiffe_id(),
+            Err(ConfigError::InvalidGatewayId { .. })
+        ));
     }
 
     #[test]

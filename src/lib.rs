@@ -13,6 +13,7 @@ mod obo;
 mod registry;
 mod spiffe_id;
 mod tls;
+mod token_exchange;
 
 pub use ca::{CertificateAuthority, LocalCa, SignedCert};
 pub use config::{CaConfig, ClientAuth, GatewayConfig, TlsConfig};
@@ -27,6 +28,7 @@ pub use obo::{validate, Decision, DenyReason, ValidationRequest, Validator};
 pub use registry::{CredentialCheck, Registry, WorkloadEntry, DEFAULT_MAX_OBO_CHAIN_DEPTH};
 pub use spiffe_id::SpiffeId;
 pub use tls::{build_client_cert_verifier, build_server_config, load_certs, ServerCertificate};
+pub use token_exchange::{exchange_token, TokenExchangeError, TokenExchangeRequest, TokenExchangeResponse};
 
 /// Current time as Unix seconds. A thin wrapper so call sites don't reach
 /// for a date/time crate just to compare against a JWT `exp`/`iat`.

@@ -31,10 +31,10 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
 use zero_trust::{
-    build_client_cert_verifier, build_server_config, load_certs, now_unix_secs, validate, CaError,
-    CertificateAuthority, ClientAuth, Decision, GatewayConfig, IdentityError, IdentityProvider,
-    LocalCa, LocalIssuer, Registry, ServerCertificate, SpiffeId, ValidationRequest,
-    HEADER_CALLER_CHAIN, HEADER_OBO_TOKEN, HEADER_USER_PRINCIPAL,
+    build_client_cert_verifier, build_server_config, exchange_token, load_certs, now_unix_secs, validate,
+    CaError, CertificateAuthority, ClientAuth, Decision, GatewayConfig, IdentityError, IdentityProvider,
+    LocalCa, LocalIssuer, Registry, ServerCertificate, SpiffeId, TokenExchangeError, TokenExchangeRequest,
+    TokenExchangeResponse, ValidationRequest, HEADER_CALLER_CHAIN, HEADER_OBO_TOKEN, HEADER_USER_PRINCIPAL,
 };
 
 /// Everything a request handler needs, cheap to clone (every field is an
@@ -52,6 +52,14 @@ struct AppState {
     http_client: reqwest::Client,
     upstream_addr: String,
     protected_workload: Arc<SpiffeId>,
+    /// This gateway's own identity, appended to the signed `act`
+    /// delegation chain by `POST /v1/token-exchange`. See
+    /// `GatewayConfig::gateway_id`'s doc comment.
+    gateway_id: Arc<SpiffeId>,
+    /// TTL (seconds) for tokens minted by `POST /v1/token-exchange`.
+    /// Mirrors `GatewayConfig::token_ttl_seconds`, the same TTL
+    /// `LocalIssuer` itself uses for `issue_jwt_svid`.
+    token_exchange_ttl_secs: u64,
 }
 
 /// Sets up structured stdout logs (always) plus, when
@@ -110,6 +118,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let registry = Registry::from_reader(std::fs::File::open(&config.registry_path)?)?;
     let protected_workload = config.protected_workload_id()?;
+    let gateway_id = config.gateway_id_spiffe_id()?;
 
     let issuer = match (&config.jwks_path, &config.active_kid) {
         (Some(jwks_path), Some(active_kid)) => {
@@ -189,6 +198,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         http_client: reqwest::Client::new(),
         upstream_addr: config.upstream_addr.clone(),
         protected_workload: Arc::new(protected_workload),
+        gateway_id: Arc::new(gateway_id),
+        token_exchange_ttl_secs: config.token_ttl_seconds.max(0) as u64,
     };
 
     let router = build_router(state);
@@ -209,6 +220,12 @@ fn build_router(state: AppState) -> Router {
         .route("/v1/svid/jwt", post(issue_svid))
         .route("/v1/svid/x509", post(issue_x509_svid))
         .route("/v1/authorize", post(authorize))
+        // RFC 8693 token exchange (Task 5). Lives alongside the other
+        // issuance/control-plane routes here for now; Task 6 moves all of
+        // them onto a separate, rate-limited admin listener and takes this
+        // off the same listener `proxy_handler`'s fallback serves traffic
+        // on.
+        .route("/v1/token-exchange", post(handle_token_exchange))
         .fallback(proxy_handler)
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -502,6 +519,36 @@ async fn authorize(
         .into_response()
 }
 
+// --- POST /v1/token-exchange ---
+
+async fn handle_token_exchange(State(state): State<AppState>, Json(req): Json<TokenExchangeRequest>) -> Response {
+    match exchange_token(
+        &req.subject_token,
+        &req.audience,
+        state.identity.as_ref(),
+        state.identity.verifier(),
+        &state.gateway_id,
+        state.token_exchange_ttl_secs,
+        now_unix_secs(),
+    ) {
+        Ok((access_token, expires_in)) => (
+            StatusCode::OK,
+            Json(TokenExchangeResponse {
+                access_token,
+                token_type: "Bearer".to_string(),
+                expires_in,
+            }),
+        )
+            .into_response(),
+        Err(e @ TokenExchangeError::InvalidToken) => error_response(StatusCode::BAD_REQUEST, e.to_string()),
+        Err(e @ TokenExchangeError::ExpiredToken) => error_response(StatusCode::UNAUTHORIZED, e.to_string()),
+        Err(e @ TokenExchangeError::InvalidAudience) => error_response(StatusCode::BAD_REQUEST, e.to_string()),
+        Err(e @ TokenExchangeError::InternalError) => {
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
+        }
+    }
+}
+
 // --- fallback: the actual reverse proxy ---
 
 #[derive(Serialize)]
@@ -715,6 +762,8 @@ workloads:
         .unwrap()
     }
 
+    const GATEWAY_SELF: &str = "spiffe://chakra.internal/ns/zt-gateway/sa/zt-gateway";
+
     fn test_state(upstream_addr: String) -> AppState {
         let registry = test_registry();
         let issuer = LocalIssuer::generate(registry.clone(), 300).unwrap();
@@ -725,6 +774,8 @@ workloads:
             http_client: reqwest::Client::new(),
             upstream_addr,
             protected_workload: Arc::new(INVENTORY.parse().unwrap()),
+            gateway_id: Arc::new(GATEWAY_SELF.parse().unwrap()),
+            token_exchange_ttl_secs: 300,
         }
     }
 
@@ -837,6 +888,150 @@ workloads:
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
         let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert!(parsed["cert_pem"].as_str().unwrap().contains("BEGIN CERTIFICATE"));
+    }
+
+    #[tokio::test]
+    async fn token_exchange_returns_a_token_with_the_gateway_appended_to_the_chain() {
+        let state = test_state("http://unused.invalid".to_string());
+        let issued = state
+            .identity
+            .issue_jwt_svid("orders-svc", API_GATEWAY, "orders-secret")
+            .unwrap();
+        let router = build_router(state);
+
+        let body = serde_json::json!({
+            "subject_token": issued.token,
+            "audience": INVENTORY,
+        })
+        .to_string();
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/token-exchange")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), SC::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed["token_type"], "Bearer");
+        assert!(parsed["expires_in"].as_u64().unwrap() > 0);
+        let new_token = parsed["access_token"].as_str().unwrap();
+
+        // The router (and the `AppState` it consumed) only ever exposes
+        // the issuer through the HTTP response here, so this decodes the
+        // JWT payload directly (no signature check needed — the point is
+        // to confirm the *shape* of the claims the handler produced, not
+        // re-derive what `exchange_token`'s own unit tests already prove
+        // about signature validity).
+        let payload_b64 = new_token.split('.').nth(1).unwrap();
+        let payload_bytes =
+            base64_decode_url_nopad(payload_b64).expect("jwt payload should be valid base64url");
+        let payload: serde_json::Value = serde_json::from_slice(&payload_bytes).unwrap();
+        assert_eq!(payload["sub"], ORDERS);
+        assert_eq!(payload["aud"][0], INVENTORY);
+        assert_eq!(payload["act"]["sub"], GATEWAY_SELF);
+    }
+
+    /// Minimal base64url (no padding) decoder, just for inspecting a JWT's
+    /// payload segment in the test above without pulling in a `base64`
+    /// dependency the rest of the crate doesn't otherwise need.
+    fn base64_decode_url_nopad(s: &str) -> Option<Vec<u8>> {
+        const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
+        let mut lut = [255u8; 256];
+        for (i, &c) in ALPHABET.iter().enumerate() {
+            lut[c as usize] = i as u8;
+        }
+        let mut bits: u32 = 0;
+        let mut nbits = 0;
+        let mut out = Vec::new();
+        for c in s.bytes() {
+            let v = lut[c as usize];
+            if v == 255 {
+                return None;
+            }
+            bits = (bits << 6) | v as u32;
+            nbits += 6;
+            if nbits >= 8 {
+                nbits -= 8;
+                out.push((bits >> nbits) as u8);
+            }
+        }
+        Some(out)
+    }
+
+    #[tokio::test]
+    async fn token_exchange_rejects_an_expired_inbound_token() {
+        let mut state = test_state("http://unused.invalid".to_string());
+        let registry = test_registry();
+        let expired_issuer = LocalIssuer::generate(registry, -1).unwrap();
+        let issued = expired_issuer
+            .issue_jwt_svid("orders-svc", API_GATEWAY, "orders-secret")
+            .unwrap();
+        state.identity = Arc::new(expired_issuer);
+        let router = build_router(state);
+
+        let body = serde_json::json!({
+            "subject_token": issued.token,
+            "audience": INVENTORY,
+        })
+        .to_string();
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/token-exchange")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), SC::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn token_exchange_rejects_an_invalid_audience() {
+        let state = test_state("http://unused.invalid".to_string());
+        let issued = state
+            .identity
+            .issue_jwt_svid("orders-svc", API_GATEWAY, "orders-secret")
+            .unwrap();
+        let router = build_router(state);
+
+        let body = serde_json::json!({
+            "subject_token": issued.token,
+            "audience": "not-a-spiffe-id",
+        })
+        .to_string();
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/token-exchange")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), SC::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn token_exchange_rejects_a_tampered_token() {
+        let state = test_state("http://unused.invalid".to_string());
+        let router = build_router(state);
+
+        let body = serde_json::json!({
+            "subject_token": "not.a.validtoken",
+            "audience": INVENTORY,
+        })
+        .to_string();
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/token-exchange")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), SC::BAD_REQUEST);
     }
 
     #[tokio::test]

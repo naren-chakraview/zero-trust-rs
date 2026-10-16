@@ -63,6 +63,18 @@ pub trait IdentityProvider {
 
     /// The verifier for tokens this provider issues.
     fn verifier(&self) -> &JwtVerifier;
+
+    /// Signs already-built [`OboClaims`] directly with this provider's
+    /// active signing key, bypassing `issue_jwt_svid`'s bootstrap-token
+    /// authentication entirely.
+    ///
+    /// This exists for RFC 8693 token exchange
+    /// ([`crate::token_exchange::exchange_token`]): the caller has already
+    /// independently verified the *inbound* token via [`Self::verifier`]
+    /// and is re-minting its claims (new `aud`, extended `act` chain, fresh
+    /// `iat`/`exp`/`jti`) for the next hop — there is no bootstrap token to
+    /// check because nothing new is being authenticated, only re-signed.
+    fn sign_claims(&self, claims: &OboClaims) -> Result<String, IdentityError>;
 }
 
 /// v0.1's only [`IdentityProvider`]: this process holds its own RSA
@@ -229,6 +241,10 @@ impl IdentityProvider for LocalIssuer {
 
     fn verifier(&self) -> &JwtVerifier {
         &self.verifier
+    }
+
+    fn sign_claims(&self, claims: &OboClaims) -> Result<String, IdentityError> {
+        Ok(self.signer.sign(claims)?)
     }
 }
 

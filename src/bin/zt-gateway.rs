@@ -45,7 +45,7 @@ use zero_trust::{
     build_client_cert_verifier, build_server_config, compute_cert_thumbprint_x5t_s256, exchange_token, load_certs,
     now_unix_secs, validate_with_cert_binding_and_clock_skew, CaError, CertificateAuthority, ClientAuth, Decision,
     GatewayConfig, IdentityError, IdentityProvider, LocalCa, LocalIssuer, Registry, RouteTable, ServerCertificate,
-    SpiffeId, TokenExchangeError, TokenExchangeRequest, TokenExchangeResponse, ValidationRequest,
+    SpiffeId, SpireProvider, TokenExchangeError, TokenExchangeRequest, TokenExchangeResponse, ValidationRequest,
     HEADER_CALLER_CHAIN, HEADER_OBO_TOKEN, HEADER_USER_PRINCIPAL,
 };
 
@@ -148,37 +148,54 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let protected_workload = config.protected_workload_id()?;
     let gateway_id = config.gateway_id_spiffe_id()?;
 
-    let issuer = match (&config.jwks_path, &config.active_kid) {
-        (Some(jwks_path), Some(active_kid)) => {
-            let jwks_data = std::fs::read_to_string(jwks_path)?;
-            LocalIssuer::with_jwks(
-                registry.clone(),
-                &jwks_data,
-                active_kid.clone(),
-                config.token_ttl_seconds,
-            )?
-        }
-        (Some(_), None) => {
-            return Err(
-                "jwks_path is configured but active_kid is missing — set active_kid to \
-                 the kid this gateway should sign with"
-                    .into(),
-            );
-        }
-        (None, _) => match &config.signing_key_path {
-            Some(path) => {
-                let pem = std::fs::read(path)?;
-                LocalIssuer::from_rsa_private_pem(registry.clone(), &pem, config.token_ttl_seconds)?
+    // Task 5 / F13: `spire_socket_path` set opts this gateway into a
+    // SPIRE-backed `IdentityProvider` (`SpireProvider`) instead of
+    // `LocalIssuer` -- entirely optional, and `LocalIssuer` remains the
+    // default/backward-compatible path when it's unset. See
+    // `spire_provider.rs`'s module doc comment for what `SpireProvider`
+    // can't faithfully provide relative to `LocalIssuer` (notably: RFC
+    // 8693 token exchange).
+    let identity: Arc<dyn IdentityProvider + Send + Sync> = if let Some(socket_path) = &config.spire_socket_path {
+        tracing::info!(
+            socket_path = %socket_path,
+            "spire_socket_path configured — issuing workload identity via the SPIRE Workload API \
+             instead of LocalIssuer"
+        );
+        Arc::new(SpireProvider::new(socket_path).await?)
+    } else {
+        let issuer = match (&config.jwks_path, &config.active_kid) {
+            (Some(jwks_path), Some(active_kid)) => {
+                let jwks_data = std::fs::read_to_string(jwks_path)?;
+                LocalIssuer::with_jwks(
+                    registry.clone(),
+                    &jwks_data,
+                    active_kid.clone(),
+                    config.token_ttl_seconds,
+                )?
             }
-            None => {
-                tracing::warn!(
-                    "no signing_key_path or jwks_path configured — generating an ephemeral \
-                     keypair; issued tokens will not survive a restart and cannot be verified \
-                     by any other gateway"
+            (Some(_), None) => {
+                return Err(
+                    "jwks_path is configured but active_kid is missing — set active_kid to \
+                     the kid this gateway should sign with"
+                        .into(),
                 );
-                LocalIssuer::generate(registry.clone(), config.token_ttl_seconds)?
             }
-        },
+            (None, _) => match &config.signing_key_path {
+                Some(path) => {
+                    let pem = std::fs::read(path)?;
+                    LocalIssuer::from_rsa_private_pem(registry.clone(), &pem, config.token_ttl_seconds)?
+                }
+                None => {
+                    tracing::warn!(
+                        "no signing_key_path or jwks_path configured — generating an ephemeral \
+                         keypair; issued tokens will not survive a restart and cannot be verified \
+                         by any other gateway"
+                    );
+                    LocalIssuer::generate(registry.clone(), config.token_ttl_seconds)?
+                }
+            },
+        };
+        Arc::new(issuer)
     };
 
     let ca = resolve_ca(&config, &registry)?;
@@ -225,7 +242,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .build()?;
 
     let state = AppState {
-        identity: Arc::new(issuer),
+        identity,
         ca,
         registry: Arc::new(registry),
         http_client: upstream_client,

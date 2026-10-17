@@ -74,6 +74,16 @@ pub enum IdentityError {
     /// valid JSON, or doesn't match the expected `{"keys": [...]}` shape.
     #[error("failed to parse JWKS document: {0}")]
     InvalidJwks(String),
+
+    /// An error from [`crate::SpireProvider`] talking to a SPIRE agent's
+    /// Workload API (Task 5 / F13) -- connection failures, malformed
+    /// responses, or an operation the Workload API has no RPC for at all
+    /// (arbitrary claim signing, or bootstrap-token-authenticated issuance
+    /// for a third-party workload). See `src/spire_provider.rs`'s module
+    /// doc comment for which of `IdentityProvider`'s methods this can show
+    /// up from and why.
+    #[error("SPIRE workload API error: {0}")]
+    Spire(String),
 }
 
 /// Errors from loading a [`crate::config::GatewayConfig`].

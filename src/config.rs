@@ -261,6 +261,18 @@ pub struct GatewayConfig {
     #[serde(default)]
     pub active_kid: Option<String>,
 
+    /// Workload API socket for a running SPIRE agent (Task 5 / F13), e.g.
+    /// `unix:/tmp/spire-agent/public/api.sock`. When set, `zt-gateway`
+    /// builds a [`crate::SpireProvider`] from it and uses that as the
+    /// gateway's `IdentityProvider` instead of `LocalIssuer` -- entirely
+    /// optional, and ignored (not even connected to) when unset, which
+    /// keeps every existing `LocalIssuer`-based deployment and config file
+    /// unaffected by this field's existence. See `spire_provider.rs`'s
+    /// module doc comment for what this does and doesn't support relative
+    /// to `LocalIssuer`.
+    #[serde(default)]
+    pub spire_socket_path: Option<String>,
+
     /// This gateway's own SPIFFE ID, appended to the signed `act`
     /// delegation chain by `POST /v1/token-exchange`
     /// ([`crate::token_exchange::exchange_token`]) when this gateway hands
@@ -453,6 +465,7 @@ impl GatewayConfig {
             signing_key_path: None,
             jwks_path: None,
             active_kid: None,
+            spire_socket_path: None,
             gateway_id: None,
             token_ttl_seconds: default_token_ttl_seconds(),
             tls: None,
@@ -630,6 +643,24 @@ protected_workload: spiffe://chakra.internal/ns/inventory/sa/inventory-svc
         let config = GatewayConfig::from_yaml_str(&yaml).unwrap();
         assert_eq!(config.jwks_path, Some(PathBuf::from("jwks.json")));
         assert_eq!(config.active_kid, Some("key-1".to_string()));
+    }
+
+    // --- SPIRE Workload API opt-in (Task 5 / F13) ---
+
+    #[test]
+    fn spire_socket_path_is_absent_by_default() {
+        let config = GatewayConfig::from_yaml_str(MINIMAL).unwrap();
+        assert!(config.spire_socket_path.is_none());
+    }
+
+    #[test]
+    fn spire_socket_path_parses_when_present() {
+        let yaml = format!("{MINIMAL}\nspire_socket_path: \"unix:/tmp/spire-agent/public/api.sock\"\n");
+        let config = GatewayConfig::from_yaml_str(&yaml).unwrap();
+        assert_eq!(
+            config.spire_socket_path,
+            Some("unix:/tmp/spire-agent/public/api.sock".to_string())
+        );
     }
 
     #[test]

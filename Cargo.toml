@@ -41,6 +41,17 @@ subtle = "2"
 sha2 = "0.10"
 base64 = "0.22"
 uuid = { version = "1.0", features = ["v4"] }
+# Task 5 / F13: SPIRE Workload API `IdentityProvider` (`src/spire_provider.rs`).
+#
+# The plan called for `spiffe = "0.2"`, but that line of the crate (and
+# everything through ~0.3.x) is built on `grpcio`, which needs `cmake` to
+# compile its bundled gRPC C core -- not installed in this sandbox and not
+# installable without root. `0.4.0` onward rewrote the Workload API client
+# on top of `tonic` (pure Rust, only needs `protoc`, which *is* available
+# here), so `0.18` (latest at the time of writing) is used instead. See
+# `src/spire_provider.rs`'s module doc comment and the Task 5 report for
+# the full tradeoff writeup.
+spiffe = { version = "0.18", features = ["workload-api"] }
 
 [dev-dependencies]
 # F12 tests: `InMemorySpanExporter`, for asserting on recorded span

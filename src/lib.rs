@@ -12,6 +12,7 @@ mod jwt;
 mod obo;
 mod registry;
 mod spiffe_id;
+mod spire_provider;
 mod tls;
 mod token_exchange;
 
@@ -30,6 +31,7 @@ pub use obo::{
 };
 pub use registry::{CredentialCheck, Registry, WorkloadEntry, DEFAULT_MAX_OBO_CHAIN_DEPTH};
 pub use spiffe_id::SpiffeId;
+pub use spire_provider::SpireProvider;
 pub use tls::{build_client_cert_verifier, build_server_config, load_certs, ServerCertificate};
 pub use token_exchange::{exchange_token, TokenExchangeError, TokenExchangeRequest, TokenExchangeResponse};
 

@@ -1,0 +1,184 @@
+# SPIRE agent DaemonSet for local Kind-cluster testing of Task 5's
+# SpireProvider against a real SPIRE deployment. Pairs with
+# deploy/k8s/spire-server.yaml (apply that first -- it creates the "spire"
+# namespace this file's objects live in).
+#
+# Deviations from the plan's illustrative snippet (docs/superpowers/plans/
+# 2026-10-16-security-gaps-phase-1-2.md lines 1213-1291), fixed for
+# correctness:
+#   - agent.conf gets `insecure_bootstrap = true`. The plan's snippet set
+#     neither `trust_bundle_path` nor `insecure_bootstrap`, which is a
+#     SPIRE agent config validation error (it refuses to start without one
+#     of those) -- the agent would crash-loop before ever reaching the
+#     "mount a socket" step. `insecure_bootstrap` (trust-on-first-use, no
+#     pre-distributed bundle needed) is the standard choice for local/dev
+#     clusters like this one; a production deployment should instead wire
+#     up the k8sbundle Notifier + a trust_bundle_path ConfigMap, as
+#     deploy/k8s/spire/ (the pre-existing demo SPIRE instance) already does.
+#   - The socket volume is `hostPath` (fixed path /tmp/spire-agent on the
+#     node), not `emptyDir` as literally written in the Task 6 spec.
+#     emptyDir's host-side directory is scoped to the pod's UID and isn't a
+#     stable, predictable path -- it cannot be the thing a *different* pod
+#     (the gateway, via deploy/k8s/gateway-deployment.yaml's hostPath mount)
+#     reaches via a fixed `/tmp/spire-agent` hostPath, which the same spec
+#     explicitly requires. hostPath is what actually makes the socket
+#     reachable cross-pod on the same node; it's also what the existing
+#     deploy/k8s/spire/agent-daemonset.yaml already does for the same
+#     reason.
+#   - Added ServiceAccount + ClusterRole/ClusterRoleBinding for spire-agent
+#     (pods/nodes/nodes-proxy get) -- required by the k8s_psat NodeAttestor
+#     on the agent side; not called out explicitly in the Task 6 spec but
+#     necessary for "no errors in logs".
+#   - Added a projected `serviceAccountToken` volume mounted at
+#     /var/run/secrets/tokens, verified necessary against a real Kind
+#     cluster run: the agent's k8s_psat NodeAttestor plugin fatally errors
+#     ("unable to load token from /var/run/secrets/tokens/spire-agent: no
+#     such file or directory") without it -- the default automounted
+#     service-account token isn't enough; the plugin specifically wants a
+#     bound token at this path with audience "spire-server".
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: spire-agent
+  namespace: spire
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: spire-agent-cluster-role
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "nodes", "nodes/proxy"]
+    verbs: ["get"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: spire-agent-cluster-role-binding
+subjects:
+  - kind: ServiceAccount
+    name: spire-agent
+    namespace: spire
+roleRef:
+  kind: ClusterRole
+  name: spire-agent-cluster-role
+  apiGroup: rbac.authorization.k8s.io
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: spire-agent
+  namespace: spire
+data:
+  agent.conf: |
+    agent {
+      data_dir = "/opt/spire/data/agent"
+      log_level = "DEBUG"
+      server_address = "spire-server.spire.svc.cluster.local"
+      server_port = "8081"
+      socket_path = "/tmp/spire-agent/agent.sock"
+      trust_domain = "chakra.internal"
+      insecure_bootstrap = true
+    }
+
+    plugins {
+      NodeAttestor "k8s_psat" {
+        plugin_data {
+          cluster = "chakra-internal"
+        }
+      }
+
+      WorkloadAttestor "unix" {
+        plugin_data {
+        }
+      }
+
+      KeyManager "memory" {
+        plugin_data {
+        }
+      }
+    }
+
+    health_checks {
+      listener_enabled = true
+      bind_address = "0.0.0.0"
+      bind_port = "8080"
+      live_path = "/live"
+      ready_path = "/ready"
+    }
+
+---
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: spire-agent
+  namespace: spire
+  labels:
+    app: spire-agent
+spec:
+  selector:
+    matchLabels:
+      app: spire-agent
+  template:
+    metadata:
+      labels:
+        app: spire-agent
+    spec:
+      hostPID: true
+      serviceAccountName: spire-agent
+      containers:
+        - name: spire-agent
+          image: ghcr.io/spiffe/spire-agent:1.8.0
+          args: ["-config", "/opt/spire/conf/agent/agent.conf"]
+          securityContext:
+            runAsUser: 0
+          volumeMounts:
+            - name: spire-config
+              mountPath: /opt/spire/conf/agent
+              readOnly: true
+            - name: spire-agent-socket
+              mountPath: /tmp/spire-agent
+            - name: spire-token
+              mountPath: /var/run/secrets/tokens
+            - name: host-passwd
+              mountPath: /etc/passwd
+              readOnly: true
+          livenessProbe:
+            httpGet:
+              path: /live
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 60
+            timeoutSeconds: 3
+            failureThreshold: 2
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+      volumes:
+        - name: spire-config
+          configMap:
+            name: spire-agent
+        - name: spire-agent-socket
+          hostPath:
+            path: /tmp/spire-agent
+            type: DirectoryOrCreate
+        - name: spire-token
+          projected:
+            sources:
+              - serviceAccountToken:
+                  path: spire-agent
+                  expirationSeconds: 7200
+                  audience: spire-server
+        # Quiets benign "Failed to lookup user/group name by uid/gid"
+        # warnings from the unix WorkloadAttestor (this minimal image has
+        # no /etc/passwd of its own); verified against a real Kind run.
+        - name: host-passwd
+          hostPath:
+            path: /etc/passwd
+            type: File

@@ -49,6 +49,11 @@ spec:
               value: http://otel-collector:4318
             - name: RUST_LOG
               value: info
+            # Task 6 (F13 part 2): see api-gateway.yaml for the full
+            # rationale/caveat (this env var is currently inert; SPIRE
+            # opt-in is via gateway.config.yaml's spire_socket_path).
+            - name: ZT_SPIRE_SOCKET_PATH
+              value: "/tmp/spire-agent/agent.sock"
           args:
             - /etc/zt-gateway/gateway.config.yaml
           ports:
@@ -60,6 +65,9 @@ spec:
             - name: gateway-config
               mountPath: /etc/zt-gateway/gateway.config.yaml
               subPath: gateway.config.yaml
+            - name: spire-agent-socket
+              mountPath: /tmp/spire-agent
+              readOnly: true
       volumes:
         - name: registry
           configMap:
@@ -67,6 +75,10 @@ spec:
         - name: gateway-config
           configMap:
             name: zt-gateway-config-inventory-svc
+        - name: spire-agent-socket
+          hostPath:
+            path: /tmp/spire-agent
+            type: DirectoryOrCreate
 ---
 apiVersion: v1
 kind: Service

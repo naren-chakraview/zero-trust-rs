@@ -46,6 +46,17 @@ spec:
               value: http://otel-collector:4318
             - name: RUST_LOG
               value: info
+            # Task 6 (F13 part 2): path to the Task 6 SPIRE agent's
+            # Workload API socket (deploy/k8s/spire-agent.yaml), mounted
+            # below via hostPath. NOTE: as of Task 5 (src/spire_provider.rs,
+            # src/config.rs), the gateway binary reads `spire_socket_path`
+            # only from gateway.config.yaml -- there is no
+            # ZT_SPIRE_SOCKET_PATH / ZT_GATEWAY_SPIRE_SOCKET_PATH env-var
+            # override wired up yet, so this var is currently inert. Set
+            # `spire_socket_path: "unix:/tmp/spire-agent/agent.sock"` in
+            # the ConfigMap above to actually opt this gateway into SPIRE.
+            - name: ZT_SPIRE_SOCKET_PATH
+              value: "/tmp/spire-agent/agent.sock"
           args:
             - /etc/zt-gateway/gateway.config.yaml
           ports:
@@ -57,6 +68,9 @@ spec:
             - name: gateway-config
               mountPath: /etc/zt-gateway/gateway.config.yaml
               subPath: gateway.config.yaml
+            - name: spire-agent-socket
+              mountPath: /tmp/spire-agent
+              readOnly: true
       volumes:
         - name: registry
           configMap:
@@ -64,6 +78,13 @@ spec:
         - name: gateway-config
           configMap:
             name: zt-gateway-config-api-gateway
+        # From deploy/k8s/spire-agent.yaml's DaemonSet: that agent mounts
+        # its Workload API socket at this same fixed hostPath, so any pod
+        # on the same node (any namespace) can reach it this way.
+        - name: spire-agent-socket
+          hostPath:
+            path: /tmp/spire-agent
+            type: DirectoryOrCreate
 ---
 apiVersion: v1
 kind: Service

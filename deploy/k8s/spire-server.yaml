@@ -1,0 +1,206 @@
+# SPIRE server for local Kind-cluster testing of Task 5's SpireProvider
+# (src/spire_provider.rs) against a real SPIRE deployment.
+#
+# Deliberately isolated from the pre-existing deploy/k8s/spire/ StatefulSet
+# (namespace zero-trust-demo, image 1.11.2, socket at
+# /run/spire/sockets/agent.sock) -- this is a separate, dedicated "spire"
+# namespace per the Task 6 spec, safe to run alongside it on the same
+# cluster since namespaces, ConfigMap names, and hostPath socket dirs don't
+# collide.
+#
+# Deviations from the plan's illustrative snippet (docs/superpowers/plans/
+# 2026-10-16-security-gaps-phase-1-2.md lines 1097-1211), fixed for
+# correctness:
+#   - Dropped `UpstreamAuthority "disk"` -- it points at
+#     /opt/spire/data/server/keys/root_{key,cert}.pem, which nothing in this
+#     manifest ever creates; spire-server would fail to start. Omitting any
+#     UpstreamAuthority plugin makes the server self-sign its own CA via the
+#     KeyManager below, which is what the existing (working)
+#     deploy/k8s/spire/server-configmap.yaml also does.
+#   - Fixed `clusters = { "chakra-internal" { ... } }` to
+#     `clusters = { "chakra-internal" = { ... } }` -- the nested-map HCL
+#     plugin_data syntax requires the `=` (matches deploy/k8s/spire's
+#     already-working server-configmap.yaml).
+#   - Added ServiceAccount + ClusterRole/ClusterRoleBinding for spire-server
+#     (TokenReview create, pods/nodes get) -- required by the k8s_psat
+#     NodeAttestor to validate agent PSATs; not called out explicitly in the
+#     Task 6 spec but necessary for "no errors in logs".
+#   - Added health_checks + readiness/liveness probes so `kubectl wait
+#     --for=condition=ready` in scripts/setup-spire-kind.sh actually proves
+#     the server initialized, not just that the container started.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: spire
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: spire-server
+  namespace: spire
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: spire-server-trust-role
+rules:
+  - apiGroups: [""]
+    resources: ["pods", "nodes"]
+    verbs: ["get"]
+  - apiGroups: ["authentication.k8s.io"]
+    resources: ["tokenreviews"]
+    verbs: ["create"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: spire-server-trust-role-binding
+subjects:
+  - kind: ServiceAccount
+    name: spire-server
+    namespace: spire
+roleRef:
+  kind: ClusterRole
+  name: spire-server-trust-role
+  apiGroup: rbac.authorization.k8s.io
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: spire-server
+  namespace: spire
+data:
+  server.conf: |
+    server {
+      bind_address = "0.0.0.0"
+      bind_port = "8081"
+      socket_path = "/tmp/spire-server/private/api.sock"
+      trust_domain = "chakra.internal"
+      data_dir = "/opt/spire/data/server"
+      log_level = "DEBUG"
+      ca_key_type = "rsa-2048"
+
+      ca_subject = {
+        country = ["US"],
+        organization = ["chakra"],
+        common_name = "",
+      }
+
+      federation {
+        bundle_endpoint {
+          address = "0.0.0.0"
+          port = 8443
+        }
+      }
+    }
+
+    plugins {
+      DataStore "sql" {
+        plugin_data {
+          database_type = "sqlite3"
+          connection_string = "/opt/spire/data/server/datastore.sqlite3"
+        }
+      }
+
+      NodeAttestor "k8s_psat" {
+        plugin_data {
+          clusters = {
+            "chakra-internal" = {
+              service_account_allow_list = ["spire:spire-agent"]
+            }
+          }
+        }
+      }
+
+      KeyManager "disk" {
+        plugin_data {
+          keys_path = "/opt/spire/data/server/keys.json"
+        }
+      }
+    }
+
+    health_checks {
+      listener_enabled = true
+      bind_address = "0.0.0.0"
+      bind_port = "8080"
+      live_path = "/live"
+      ready_path = "/ready"
+    }
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: spire-server
+  namespace: spire
+  labels:
+    app: spire-server
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: spire-server
+  template:
+    metadata:
+      labels:
+        app: spire-server
+    spec:
+      serviceAccountName: spire-server
+      containers:
+        - name: spire-server
+          image: ghcr.io/spiffe/spire-server:1.8.0
+          args: ["-config", "/opt/spire/conf/server/server.conf"]
+          ports:
+            - containerPort: 8081
+              name: api
+            - containerPort: 8443
+              name: bundle-endpoint
+            - containerPort: 8080
+              name: healthz
+          volumeMounts:
+            - name: spire-config
+              mountPath: /opt/spire/conf/server
+              readOnly: true
+            - name: spire-data
+              mountPath: /opt/spire/data/server
+          livenessProbe:
+            httpGet:
+              path: /live
+              port: 8080
+            initialDelaySeconds: 15
+            periodSeconds: 60
+            timeoutSeconds: 3
+            failureThreshold: 2
+          readinessProbe:
+            httpGet:
+              path: /ready
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+      volumes:
+        - name: spire-config
+          configMap:
+            name: spire-server
+        - name: spire-data
+          emptyDir: {}
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: spire-server
+  namespace: spire
+spec:
+  selector:
+    app: spire-server
+  ports:
+    - port: 8081
+      targetPort: 8081
+      name: api
+    - port: 8443
+      targetPort: 8443
+      name: bundle-endpoint

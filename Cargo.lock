@@ -2992,6 +2992,7 @@ dependencies = [
  "time",
  "tokio",
  "tokio-rustls",
+ "tonic 0.14.6",
  "tower 0.4.13",
  "tower-http",
  "tracing",

@@ -56,19 +56,6 @@ use crate::jwt::{JwtVerifier, OboClaims};
 pub struct SpireProvider {
     client: WorkloadApiClient,
     verifier: JwtVerifier,
-    /// Bridges this trait's synchronous methods
-    /// ([`IdentityProvider::issue_jwt_svid`]) onto the underlying Workload
-    /// API client's `async` RPCs. A dedicated runtime (rather than reusing
-    /// whatever runtime called [`Self::new`]) so that blocking on it from
-    /// inside, say, `zt-gateway`'s own multi-threaded runtime never
-    /// re-enters that same runtime -- tokio only forbids `block_on`-ing a
-    /// runtime from one of its own worker threads, not blocking on a
-    /// second, independent one. The tradeoff: a call to `issue_jwt_svid`
-    /// still ties up whichever thread calls it for the RPC's duration,
-    /// same as any other blocking I/O would -- acceptable for this scope,
-    /// but a candidate to revisit (e.g. making `IdentityProvider` itself
-    /// `async`) before this carries real production traffic.
-    rt: tokio::runtime::Runtime,
 }
 
 impl SpireProvider {
@@ -91,12 +78,7 @@ impl SpireProvider {
             .map_err(|source| IdentityError::Spire(format!("failed to fetch JWT bundles: {source}")))?;
         let verifier = verifier_from_jwt_bundles(&bundles);
 
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|source| IdentityError::Spire(format!("failed to start bridging runtime: {source}")))?;
-
-        Ok(Self { client, verifier, rt })
+        Ok(Self { client, verifier })
     }
 
     /// Fetches this workload's default X.509 SVID directly from SPIRE.
@@ -158,16 +140,46 @@ impl IdentityProvider for SpireProvider {
     /// `LocalIssuer`) but not used -- SPIRE has already authenticated
     /// *this* process via the Workload API connection itself, and
     /// `audience` is issued against that identity.
+    ///
+    /// ## Sync/async bridging
+    ///
+    /// This trait method is `&self`-sync (matching `LocalIssuer`), but the
+    /// underlying `spiffe` Workload API client is `async`. Fix-round-1:
+    /// this used to bridge via a dedicated, independent
+    /// `tokio::runtime::Runtime` and `rt.block_on(...)`, on the theory that
+    /// tokio only forbids `block_on`-ing *the same* runtime from one of its
+    /// own worker threads, not a second, independent one. That theory is
+    /// wrong: tokio tracks "is this thread currently driving async tasks"
+    /// as a thread-local flag checked by *every* runtime's `block_on`
+    /// (confirmed empirically -- a second, independent runtime's
+    /// `block_on`, called from inside a `#[tokio::main]` multi-threaded
+    /// runtime's worker thread with no `spawn_blocking` in between, panics
+    /// with the exact same "Cannot start a runtime from within a runtime"
+    /// either way). Since `zt-gateway`'s async `issue_svid` HTTP handler
+    /// calls this method directly (no `spawn_blocking`), the old code
+    /// panicked on every real request.
+    ///
+    /// The fix is [`tokio::task::block_in_place`] wrapping
+    /// `Handle::current().block_on(...)`: `block_in_place` tells the
+    /// multi-threaded runtime "this worker thread is about to block; move
+    /// its other queued tasks to a different worker first," which is
+    /// exactly what makes blocking here safe instead of starving the
+    /// runtime. This requires the calling runtime to be the `multi_thread`
+    /// flavor (true for `zt-gateway`'s `#[tokio::main]`, and for any
+    /// `#[tokio::test(flavor = "multi_thread")]` test) -- `block_in_place`
+    /// itself panics on a `current_thread` runtime, which is an explicit,
+    /// documented tokio restriction, not something this method can work
+    /// around.
     fn issue_jwt_svid(
         &self,
         _requester_workload_name: &str,
         audience: &str,
         _credential: &str,
     ) -> Result<IssuedToken, IdentityError> {
-        let svid = self
-            .rt
-            .block_on(self.client.fetch_jwt_svid(std::iter::once(audience), None))
-            .map_err(|source| IdentityError::Spire(format!("failed to fetch JWT-SVID for {audience}: {source}")))?;
+        let svid = tokio::task::block_in_place(|| {
+            tokio::runtime::Handle::current().block_on(self.client.fetch_jwt_svid(std::iter::once(audience), None))
+        })
+        .map_err(|source| IdentityError::Spire(format!("failed to fetch JWT-SVID for {audience}: {source}")))?;
 
         Ok(IssuedToken {
             token: svid.token().to_string(),
@@ -245,5 +257,47 @@ mod tests {
         // An empty verifier still exists and simply rejects every token --
         // "fails closed", not a panic or an unwrap at the trait boundary.
         assert!(verifier.verify_signature("not.a.token").is_err());
+    }
+
+    /// Fix-round-1 regression: `issue_jwt_svid` used to bridge onto a
+    /// dedicated `tokio::runtime::Runtime` via `rt.block_on(...)`, which
+    /// panics ("Cannot start a runtime from within a runtime") whenever
+    /// called from a thread that's already driving async tasks for *any*
+    /// runtime -- which is exactly what `zt-gateway`'s async `issue_svid`
+    /// HTTP handler does, by calling this sync trait method directly (no
+    /// `spawn_blocking` in between). This test reproduces that call shape:
+    /// a `multi_thread`-flavored runtime (matching `zt-gateway`'s
+    /// `#[tokio::main]`) calling `issue_jwt_svid` synchronously from
+    /// inside an `async fn`.
+    ///
+    /// No live SPIRE agent is needed: `Endpoint::from_static(..).
+    /// connect_lazy()` builds a channel that performs no I/O at
+    /// construction time, so building the `SpireProvider` below can't
+    /// itself fail or block. The actual connection attempt -- and its
+    /// failure, since nothing listens on `127.0.0.1:1` -- happens inside
+    /// the RPC itself, which is what lets this test prove the old panic
+    /// happened *before* any RPC was attempted: if the sync/async bridge
+    /// were still broken, this test would panic, not return a clean `Err`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn issue_jwt_svid_does_not_panic_when_called_synchronously_from_an_async_context() {
+        let endpoint = spiffe::transport::Endpoint::Tcp {
+            host: "127.0.0.1".parse().unwrap(),
+            port: 1,
+        };
+        let channel = tonic::transport::Endpoint::from_static("http://127.0.0.1:1").connect_lazy();
+        let client = WorkloadApiClient::new_with_channel(endpoint, channel);
+        let provider = SpireProvider {
+            client,
+            verifier: JwtVerifier::from_jwks_entries(Vec::new()),
+        };
+
+        // Direct, synchronous call from inside this `async fn` -- no
+        // `spawn_blocking` -- is the part that used to panic.
+        let result = provider.issue_jwt_svid("workload", "aud", "cred");
+
+        assert!(
+            result.is_err(),
+            "expected the RPC against a refused connection to fail cleanly (not panic, and not succeed)"
+        );
     }
 }

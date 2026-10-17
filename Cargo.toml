@@ -59,6 +59,15 @@ spiffe = { version = "0.18", features = ["workload-api"] }
 opentelemetry_sdk = { version = "0.27", features = ["testing"] }
 # F17: criterion benchmarks for the token-validation pipeline.
 criterion = { version = "0.5", features = ["html_reports"] }
+# Task 5 fix-round-1 regression test (`src/spire_provider.rs`): builds a
+# `tonic::transport::Channel` directly via `connect_lazy()` so the test can
+# construct a `WorkloadApiClient`/`SpireProvider` without any I/O at
+# construction time (no live SPIRE agent needed), to exercise
+# `issue_jwt_svid`'s sync/async bridge. Version pinned to match what
+# `spiffe = "0.18"` already resolves to (see Cargo.lock) so the
+# `tonic::transport::Channel` type here is the same type
+# `WorkloadApiClient::new_with_channel` expects.
+tonic = { version = "0.14", default-features = false, features = ["channel"] }
 
 [[bench]]
 name = "gateway_benches"

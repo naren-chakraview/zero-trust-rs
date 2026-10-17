@@ -78,6 +78,16 @@ fn default_clock_skew_secs() -> u64 {
     60
 }
 
+/// How long a seen `jti` (JWT ID) is remembered by the in-memory replay
+/// cache before it's allowed to be presented again (Task 13 / N12). Only
+/// consulted when `jti_cache_enabled` is true. Default: 3600 seconds (1h) —
+/// comfortably longer than the gateway's own default `token_ttl_seconds`
+/// (300s), so a replay cache sized to this default outlives any token it
+/// would need to remember.
+fn default_jti_ttl_secs() -> u64 {
+    3600
+}
+
 /// How strictly `zt-gateway` requires a TLS client certificate.
 /// See `docs/design/0001-tls-mtls-termination.md` for the full rollout story.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
@@ -354,6 +364,46 @@ pub struct GatewayConfig {
     /// (Task 3). See [`default_clock_skew_secs`]'s doc comment. Default: 60.
     #[serde(default = "default_clock_skew_secs")]
     pub clock_skew_tolerance_secs: u64,
+
+    /// Trusted IdP issuers for human user principals minted via the N5
+    /// edge-mint path (review 0002 finding N5: `POST /v1/svid/jwt-with-user`,
+    /// `LocalIssuer::issue_jwt_svid_with_user`). A user credential's
+    /// claimed issuer must appear in this list before this gateway will
+    /// mint a token vouching for it, and before `obo::validate_with_user_issuers`
+    /// will accept that token's `user` claim as a human principal string
+    /// rather than requiring it to parse as a SPIFFE ID.
+    ///
+    /// Example: `["auth.corp.internal", "okta.com"]`. Empty (the default)
+    /// means no human-principal edge mint is possible at all -- every
+    /// `POST /v1/svid/jwt-with-user` request is rejected until at least
+    /// one issuer is configured.
+    #[serde(default)]
+    pub user_issuers: Vec<String>,
+
+    /// Issuer identities this gateway trusts (Task 13 / N12), checked
+    /// against a token's signed `iss` claim by
+    /// [`crate::obo::validate_with_issuer_and_replay_policy`]. An empty
+    /// list (the default) disables this check entirely — every token's
+    /// `iss` (including a missing one) passes, which keeps every existing
+    /// deployment's behavior unchanged until it opts in by listing at
+    /// least one trusted issuer here.
+    #[serde(default)]
+    pub trusted_issuers: Vec<String>,
+
+    /// Whether to enforce JTI (JWT ID) replay detection (Task 13 / N12) via
+    /// [`crate::registry::Registry::check_jti`]. Default: `false` — opt-in,
+    /// since the replay cache is in-memory and per-process (see
+    /// `Registry`'s doc comment): a deployment running multiple gateway
+    /// instances behind a load balancer would need a shared store instead
+    /// of this one, so it isn't enabled unconditionally.
+    #[serde(default)]
+    pub jti_cache_enabled: bool,
+
+    /// How long a seen `jti` is remembered by the replay cache (Task 13 /
+    /// N12), in seconds. Only consulted when `jti_cache_enabled` is true.
+    /// See [`default_jti_ttl_secs`]'s doc comment. Default: 3600.
+    #[serde(default = "default_jti_ttl_secs")]
+    pub jti_ttl_secs: u64,
 }
 
 impl GatewayConfig {
@@ -444,6 +494,33 @@ impl GatewayConfig {
                 .parse()
                 .unwrap_or_else(|e| panic!("ZT_GATEWAY_CLOCK_SKEW_SECS={v:?} is not a valid u64: {e}"));
         }
+        // N5 fix: `ZT_USER_ISSUERS` is comma-separated (e.g.
+        // "auth.corp.internal,okta.com"), matching the shape operators
+        // already use for other multi-value env overrides in this project
+        // (see `HEADER_CALLER_CHAIN`'s comma-joined chain). Blank entries
+        // (from stray commas) are dropped rather than kept as empty-string
+        // "trusted issuers".
+        if let Ok(v) = std::env::var("ZT_USER_ISSUERS") {
+            self.user_issuers = v
+                .split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect();
+        }
+        // Task 13 / N12: trusted-issuer list and JTI replay-cache opt-in.
+        // Deliberately `ZT_*`, not `ZT_GATEWAY_*` like every override
+        // above -- that's the exact prefix the remediation plan specifies.
+        if let Ok(v) = std::env::var("ZT_TRUSTED_ISSUERS") {
+            self.trusted_issuers = v
+                .split(|c: char| c == ',' || c.is_whitespace())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect();
+        }
+        if let Ok(v) = std::env::var("ZT_JTI_CACHE_ENABLED") {
+            self.jti_cache_enabled = matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on");
+        }
         self
     }
 
@@ -480,6 +557,10 @@ impl GatewayConfig {
             max_concurrent_connections: default_max_concurrent_connections(),
             routes: Vec::new(),
             clock_skew_tolerance_secs: default_clock_skew_secs(),
+            user_issuers: Vec::new(),
+            trusted_issuers: Vec::new(),
+            jti_cache_enabled: false,
+            jti_ttl_secs: default_jti_ttl_secs(),
         }
     }
 
@@ -816,5 +897,110 @@ protected_workload: spiffe://chakra.internal/ns/inventory/sa/inventory-svc
         assert_eq!(config.clock_skew_tolerance_secs, 15);
 
         std::env::remove_var("ZT_GATEWAY_CLOCK_SKEW_SECS");
+    }
+
+    // --- N5 fix (review 0002): trusted user issuers for the edge-mint path ---
+
+    #[test]
+    fn user_issuers_is_empty_by_default() {
+        let config = GatewayConfig::from_yaml_str(MINIMAL).unwrap();
+        assert!(config.user_issuers.is_empty());
+    }
+
+    #[test]
+    fn user_issuers_parses_from_yaml() {
+        let yaml = format!("{MINIMAL}\nuser_issuers:\n  - auth.corp.internal\n  - okta.com\n");
+        let config = GatewayConfig::from_yaml_str(&yaml).unwrap();
+        assert_eq!(
+            config.user_issuers,
+            vec!["auth.corp.internal".to_string(), "okta.com".to_string()]
+        );
+    }
+
+    #[test]
+    fn env_var_overrides_user_issuers_as_a_comma_separated_list() {
+        std::env::set_var("ZT_USER_ISSUERS", "auth.corp.internal, okta.com,");
+
+        let config = GatewayConfig::from_yaml_str(MINIMAL).unwrap().with_env_overrides();
+        assert_eq!(
+            config.user_issuers,
+            vec!["auth.corp.internal".to_string(), "okta.com".to_string()]
+        );
+
+        std::env::remove_var("ZT_USER_ISSUERS");
+    }
+
+    #[test]
+    fn test_with_listeners_has_no_trusted_user_issuers() {
+        let proxy: SocketAddr = "127.0.0.1:19445".parse().unwrap();
+        let admin: SocketAddr = "127.0.0.1:19446".parse().unwrap();
+        let config = GatewayConfig::test_with_listeners(proxy, admin);
+        assert!(config.user_issuers.is_empty());
+    }
+
+    // --- Trusted issuers + JTI replay cache (Task 13 / N12) ---
+
+    #[test]
+    fn trusted_issuers_and_jti_cache_default_to_disabled() {
+        let config = GatewayConfig::from_yaml_str(MINIMAL).unwrap();
+        assert!(config.trusted_issuers.is_empty());
+        assert!(!config.jti_cache_enabled);
+        assert_eq!(config.jti_ttl_secs, 3600);
+    }
+
+    #[test]
+    fn trusted_issuers_and_jti_cache_are_configurable_in_yaml() {
+        let yaml = format!(
+            "{MINIMAL}\ntrusted_issuers:\n  - spiffe://chakra.internal\n  - spiffe://other.trust-domain\njti_cache_enabled: true\njti_ttl_secs: 120\n"
+        );
+        let config = GatewayConfig::from_yaml_str(&yaml).unwrap();
+        assert_eq!(
+            config.trusted_issuers,
+            vec!["spiffe://chakra.internal".to_string(), "spiffe://other.trust-domain".to_string()]
+        );
+        assert!(config.jti_cache_enabled);
+        assert_eq!(config.jti_ttl_secs, 120);
+    }
+
+    #[test]
+    fn env_var_overrides_trusted_issuers_comma_and_space_separated() {
+        std::env::set_var(
+            "ZT_TRUSTED_ISSUERS",
+            "spiffe://chakra.internal, spiffe://b.internal spiffe://c.internal",
+        );
+
+        let config = GatewayConfig::from_yaml_str(MINIMAL).unwrap().with_env_overrides();
+        assert_eq!(
+            config.trusted_issuers,
+            vec![
+                "spiffe://chakra.internal".to_string(),
+                "spiffe://b.internal".to_string(),
+                "spiffe://c.internal".to_string(),
+            ]
+        );
+
+        std::env::remove_var("ZT_TRUSTED_ISSUERS");
+    }
+
+    #[test]
+    fn env_var_overrides_jti_cache_enabled() {
+        std::env::set_var("ZT_JTI_CACHE_ENABLED", "true");
+        let config = GatewayConfig::from_yaml_str(MINIMAL).unwrap().with_env_overrides();
+        assert!(config.jti_cache_enabled);
+        std::env::remove_var("ZT_JTI_CACHE_ENABLED");
+
+        std::env::set_var("ZT_JTI_CACHE_ENABLED", "false");
+        let config = GatewayConfig::from_yaml_str(MINIMAL).unwrap().with_env_overrides();
+        assert!(!config.jti_cache_enabled);
+        std::env::remove_var("ZT_JTI_CACHE_ENABLED");
+    }
+
+    #[test]
+    fn test_with_listeners_has_no_trusted_issuers_or_jti_cache() {
+        let proxy: SocketAddr = "127.0.0.1:19447".parse().unwrap();
+        let admin: SocketAddr = "127.0.0.1:19448".parse().unwrap();
+        let config = GatewayConfig::test_with_listeners(proxy, admin);
+        assert!(config.trusted_issuers.is_empty());
+        assert!(!config.jti_cache_enabled);
     }
 }

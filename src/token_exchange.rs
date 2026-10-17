@@ -11,16 +11,28 @@
 //! audience it's about to call.
 //!
 //! Deliberately *not* re-run here: full `obo::validate` access-control
-//! checks (chain depth, allow-listing, user-principal shape). Per the
-//! brief, token exchange only re-mints a token whose signature is valid
-//! and whose `exp` hasn't passed — the destination backend (or the next
-//! gateway) is responsible for running `obo::validate` against its own
-//! registry when the re-minted token actually arrives.
+//! checks (allow-listing, user-principal shape). The destination backend
+//! (or the next gateway) is responsible for running `obo::validate`
+//! against its own registry when the re-minted token actually arrives.
+//!
+//! Task 6 (N3 fix, review 0002): what token exchange *does* check, before
+//! ever re-minting anything, is that the inbound token is actually
+//! entitled to be exchanged *here*: its signature must verify, its `exp`
+//! must not have passed, its `nbf` (if any) must not be in the future, its
+//! `aud` must name this gateway's own protected workload (not some other
+//! gateway's), and its already-signed delegation chain must not already
+//! be at or past this gateway's configured `max_chain_depth`. Without the
+//! `aud`/depth checks, a token minted for gateway A could be replayed
+//! through gateway B's exchange endpoint and rescoped to an audience
+//! gateway A never intended, or a chain could be bounced through more hops
+//! than the destination's registry entry allows before this gateway even
+//! appends itself as the next one.
 
 use serde::{Deserialize, Serialize};
 
 use crate::identity::IdentityProvider;
-use crate::jwt::{ActClaim, JwtVerifier, OboClaims};
+use crate::jwt::{ActClaim, CertBinding, JwtVerifier, OboClaims};
+use crate::obo::cert_binding_matches;
 use crate::spiffe_id::SpiffeId;
 
 /// Why [`exchange_token`] refused to re-mint a token.
@@ -33,6 +45,35 @@ pub enum TokenExchangeError {
     ExpiredToken,
     /// `next_audience` is not a well-formed SPIFFE ID.
     InvalidAudience,
+    /// N2 fix (review 0002): the inbound token carries a signed
+    /// `cnf.x5t#S256` claim, but it doesn't match the thumbprint of the
+    /// certificate the exchanging caller actually presented (or no
+    /// certificate was presented at all) — only ever produced by
+    /// [`exchange_token_with_cert_binding`]; [`exchange_token`] never
+    /// checks cert binding.
+    CertificateBindingMismatch,
+    /// Task 6 fix (N3, review 0002): the inbound token's `nbf` is in the
+    /// future — reaffirming, at exchange time, the same not-yet-valid
+    /// check `obo::validate`/`validate_with_clock_skew` already perform at
+    /// request-validation time. No clock-skew allowance here (exchange
+    /// happens hop-to-hop, immediately after the previous mint, so skew
+    /// tolerance isn't needed the way it is for a token that may have
+    /// travelled over the wire).
+    NotYetValid,
+    /// Task 6 fix (N3, review 0002): the inbound token's `aud` does not
+    /// contain this gateway's protected workload identity
+    /// (`destination_workload`) — this token was never addressed to this
+    /// gateway, so it has no business being exchanged here. Without this
+    /// check, a token minted for one gateway could be replayed through an
+    /// unrelated gateway's `/v1/token-exchange` endpoint and rescoped to
+    /// an audience its original issuer never intended.
+    AudienceMismatch,
+    /// Task 6 fix (N3, review 0002): the inbound token's signed delegation
+    /// chain (`OboClaims::delegation_chain`) is already as long as, or
+    /// longer than, `max_chain_depth` — exchanging it onward would let the
+    /// chain grow past the limit this gateway (or its destination's
+    /// registry entry) is configured to enforce.
+    ChainDepthExceeded,
     /// Signing the re-minted claims failed.
     InternalError,
 }
@@ -43,6 +84,14 @@ impl std::fmt::Display for TokenExchangeError {
             Self::InvalidToken => write!(f, "invalid or tampered inbound token"),
             Self::ExpiredToken => write!(f, "inbound token has expired"),
             Self::InvalidAudience => write!(f, "requested audience is not a valid SPIFFE ID"),
+            Self::CertificateBindingMismatch => {
+                write!(f, "inbound token's certificate binding does not match the caller's presented certificate")
+            }
+            Self::NotYetValid => write!(f, "inbound token is not yet valid (nbf is in the future)"),
+            Self::AudienceMismatch => {
+                write!(f, "inbound token's audience does not name this gateway's protected workload")
+            }
+            Self::ChainDepthExceeded => write!(f, "inbound token's delegation chain already exceeds the maximum allowed depth"),
             Self::InternalError => write!(f, "internal error during token exchange"),
         }
     }
@@ -71,14 +120,26 @@ impl std::error::Error for TokenExchangeError {}
 /// Fails with [`TokenExchangeError::InvalidToken`] if the inbound token's
 /// signature doesn't verify against `verifier`, [`TokenExchangeError::ExpiredToken`]
 /// if `now_secs >= inbound token's exp` (expiry is checked strictly, same
-/// convention as `obo::validate`), or [`TokenExchangeError::InvalidAudience`]
-/// if `next_audience` doesn't parse as a [`SpiffeId`]. The audience check
-/// runs independently of inbound-token validity, so a well-formed but
-/// expired token and a malformed audience each report their own distinct
-/// reason.
+/// convention as `obo::validate`), [`TokenExchangeError::NotYetValid`] if
+/// the inbound token's `nbf` is in the future, or
+/// [`TokenExchangeError::InvalidAudience`] if `next_audience` doesn't parse
+/// as a [`SpiffeId`]. The audience check runs independently of
+/// inbound-token validity, so a well-formed but expired token and a
+/// malformed audience each report their own distinct reason.
+///
+/// Task 6 (N3 fix, review 0002): also fails with
+/// [`TokenExchangeError::AudienceMismatch`] if the inbound token's `aud`
+/// does not contain `destination_workload` (this gateway's own protected
+/// workload identity — the inbound token must have been addressed to
+/// *this* gateway, not some other one), or
+/// [`TokenExchangeError::ChainDepthExceeded`] if the inbound token's
+/// already-signed delegation chain (`OboClaims::delegation_chain`) is
+/// already as long as, or longer than, `max_chain_depth`.
 pub fn exchange_token(
     inbound_token: &str,
     next_audience: &str,
+    destination_workload: &SpiffeId,
+    max_chain_depth: u32,
     issuer: &dyn IdentityProvider,
     verifier: &JwtVerifier,
     gateway_id: &SpiffeId,
@@ -97,12 +158,40 @@ pub fn exchange_token(
         return Err(TokenExchangeError::ExpiredToken);
     }
 
+    // Step 2b (N3 fix): `nbf`, reaffirmed here the same way `obo::validate`
+    // checks it at request-validation time. No clock-skew allowance -- see
+    // `TokenExchangeError::NotYetValid`'s doc comment for why.
+    if let Some(nbf) = inbound_claims.nbf {
+        if nbf > now_secs {
+            return Err(TokenExchangeError::NotYetValid);
+        }
+    }
+
     // Step 3: the next audience must itself be a well-formed SPIFFE ID —
     // checked regardless of inbound-token validity so each failure mode
     // reports its own distinct reason.
     let next_aud: SpiffeId = next_audience
         .parse()
         .map_err(|_| TokenExchangeError::InvalidAudience)?;
+
+    // Step 3b (N3 fix): the inbound token must actually be addressed to
+    // *this* gateway's protected workload -- otherwise a token minted for
+    // one gateway could be exchanged through an unrelated one and
+    // rescoped to an audience its issuer never intended.
+    let destination_str = destination_workload.to_string();
+    if !inbound_claims.aud.iter().any(|aud| aud == &destination_str) {
+        return Err(TokenExchangeError::AudienceMismatch);
+    }
+
+    // Step 3c (N3 fix): the signed chain so far must not already be at (or
+    // past) this gateway's configured maximum -- `delegation_chain()`'s
+    // length already counts every hop recorded up to and including the
+    // immediate caller, so `> max_chain_depth` (not `>=`) is the correct
+    // comparison: a chain *at* the limit may still take its next hop, same
+    // convention `obo::validate`'s own chain-depth check uses.
+    if inbound_claims.delegation_chain().len() > max_chain_depth as usize {
+        return Err(TokenExchangeError::ChainDepthExceeded);
+    }
 
     // Step 4: re-mint. `sub`/`user`/`cnf` carry over unchanged; per RFC
     // 8693 §4.1, `act` names the party currently exercising delegated
@@ -122,6 +211,127 @@ pub fn exchange_token(
         nbf: Some(now_secs),
         jti: Some(generate_jti()),
         cnf: inbound_claims.cnf.clone(),
+        iss: inbound_claims.iss.clone(),
+    };
+
+    let new_token = issuer
+        .sign_claims(&new_claims)
+        .map_err(|_| TokenExchangeError::InternalError)?;
+
+    Ok((new_token, ttl_secs))
+}
+
+/// Like [`exchange_token`], but additionally implements the N2 fix (review
+/// 0002): the new token is bound to the **exchanging hop's own
+/// certificate** (`caller_cert_thumbprint` — the thumbprint of whatever TLS
+/// client certificate the caller presented to the admin listener, if any)
+/// instead of blindly copying forward whatever `cnf` the inbound token
+/// happened to carry.
+///
+/// Before re-minting, this also validates that the inbound token's `cnf`
+/// claim (if present) matches `caller_cert_thumbprint` — using the same
+/// [`cert_binding_matches`] logic [`crate::obo::validate_with_cert_binding`]
+/// uses at request-validation time — and fails with
+/// [`TokenExchangeError::CertificateBindingMismatch`] if it doesn't. This
+/// closes the N2 hole: without it, a bound token presented by anyone other
+/// than the party it's bound to could still be exchanged onward.
+///
+/// The new token's `cnf`:
+/// - `caller_cert_thumbprint: Some(thumbprint)` — the new token is bound to
+///   `CertBinding { x5t_s256: thumbprint.to_string() }`, **replacing**
+///   whatever `cnf` the inbound token carried (including `None`). Every hop
+///   re-binds to its own cert; binding never survives an exchange
+///   unchanged.
+/// - `caller_cert_thumbprint: None` — no certificate was presented at
+///   exchange time (e.g. mTLS not enabled on the admin listener), so the
+///   new token is left unbound (`cnf: None`), same as [`exchange_token`].
+///   This only succeeds when the inbound token itself had no `cnf` to
+///   check — a bound inbound token with no presented cert is a mismatch,
+///   per [`cert_binding_matches`]'s fail-closed semantics.
+///
+/// All other fields (`sub`, `aud`, `user`, `act`, `iat`/`exp`, `jti`,
+/// `iss`) behave exactly as documented on [`exchange_token`].
+///
+/// Task 6 (N3 fix, review 0002): also validates `destination_workload` and
+/// `max_chain_depth` exactly as [`exchange_token`] does — see that
+/// function's doc comment for [`TokenExchangeError::NotYetValid`],
+/// [`TokenExchangeError::AudienceMismatch`], and
+/// [`TokenExchangeError::ChainDepthExceeded`].
+pub fn exchange_token_with_cert_binding(
+    inbound_token: &str,
+    next_audience: &str,
+    destination_workload: &SpiffeId,
+    max_chain_depth: u32,
+    issuer: &dyn IdentityProvider,
+    verifier: &JwtVerifier,
+    gateway_id: &SpiffeId,
+    ttl_secs: u64,
+    now_secs: i64,
+    caller_cert_thumbprint: Option<&str>,
+) -> Result<(String, u64), TokenExchangeError> {
+    // Step 1: verify the inbound token's signature.
+    let inbound_claims = verifier
+        .verify_signature(inbound_token)
+        .map_err(|_| TokenExchangeError::InvalidToken)?;
+
+    // Step 2: expiry, same convention as `exchange_token`/`obo::validate`.
+    if now_secs >= inbound_claims.exp {
+        return Err(TokenExchangeError::ExpiredToken);
+    }
+
+    // Step 2b (N3 fix): `nbf`, reaffirmed the same way `exchange_token`
+    // does -- see that function's doc comment on
+    // `TokenExchangeError::NotYetValid`.
+    if let Some(nbf) = inbound_claims.nbf {
+        if nbf > now_secs {
+            return Err(TokenExchangeError::NotYetValid);
+        }
+    }
+
+    // Step 3: the next audience must be a well-formed SPIFFE ID.
+    let next_aud: SpiffeId = next_audience
+        .parse()
+        .map_err(|_| TokenExchangeError::InvalidAudience)?;
+
+    // Step 3b (N3 fix): the inbound token must be addressed to this
+    // gateway's protected workload -- see `exchange_token`'s doc comment
+    // on `TokenExchangeError::AudienceMismatch`.
+    let destination_str = destination_workload.to_string();
+    if !inbound_claims.aud.iter().any(|aud| aud == &destination_str) {
+        return Err(TokenExchangeError::AudienceMismatch);
+    }
+
+    // Step 3c (N3 fix): the signed chain so far must not already be at (or
+    // past) this gateway's configured maximum -- see `exchange_token`'s
+    // doc comment on `TokenExchangeError::ChainDepthExceeded`.
+    if inbound_claims.delegation_chain().len() > max_chain_depth as usize {
+        return Err(TokenExchangeError::ChainDepthExceeded);
+    }
+
+    // Step 4 (N2 fix): the inbound token's `cnf`, if any, must match the
+    // cert the exchanging caller actually presented. A missing `cnf` on
+    // the inbound token always passes this check (nothing to validate);
+    // a present `cnf` with no matching presented cert fails closed.
+    if !cert_binding_matches(inbound_claims.cnf.as_ref(), caller_cert_thumbprint) {
+        return Err(TokenExchangeError::CertificateBindingMismatch);
+    }
+
+    // Step 5: re-mint, re-binding `cnf` to the exchanging hop's own
+    // certificate (not the inbound token's) — the core of the N2 fix.
+    let new_cnf = caller_cert_thumbprint.map(|thumbprint| CertBinding {
+        x5t_s256: thumbprint.to_string(),
+    });
+
+    let new_claims = OboClaims {
+        sub: inbound_claims.sub.clone(),
+        aud: vec![next_aud.to_string()],
+        user: inbound_claims.user.clone(),
+        act: append_hop(inbound_claims.act.clone(), gateway_id.to_string()),
+        iat: now_secs,
+        exp: now_secs + ttl_secs as i64,
+        nbf: Some(now_secs),
+        jti: Some(generate_jti()),
+        cnf: new_cnf,
         iss: inbound_claims.iss.clone(),
     };
 
@@ -234,6 +444,8 @@ workloads:
         let (new_token, ttl) = exchange_token(
             &initial_token,
             "spiffe://chakra.internal/ns/backend-b/sa/backend-b",
+            &gw("spiffe://chakra.internal/ns/backend-a/sa/backend-a"),
+            5,
             &issuer,
             issuer.verifier(),
             &gw("spiffe://chakra.internal/ns/gateway-a/sa/gateway-a"),
@@ -318,6 +530,8 @@ workloads:
         let (token_for_b, _) = exchange_token(
             &token_for_a,
             "spiffe://chakra.internal/ns/gateway-b/sa/gateway-b",
+            &gw("spiffe://chakra.internal/ns/gateway-a/sa/gateway-a"),
+            5,
             &gw_a,
             gw_a.verifier(),
             &gw("spiffe://chakra.internal/ns/gateway-a/sa/gateway-a"),
@@ -336,6 +550,8 @@ workloads:
         let (final_token, _) = exchange_token(
             &token_for_b,
             "spiffe://chakra.internal/ns/gateway-c/sa/gateway-c",
+            &gw("spiffe://chakra.internal/ns/gateway-b/sa/gateway-b"),
+            5,
             &gw_b,
             gw_b.verifier(),
             &gw("spiffe://chakra.internal/ns/gateway-b/sa/gateway-b"),
@@ -387,6 +603,8 @@ workloads:
         let (new_token, _) = exchange_token(
             &token,
             "spiffe://chakra.internal/ns/backend-b/sa/backend-b",
+            &gw("spiffe://chakra.internal/ns/backend/sa/backend"),
+            5,
             &issuer,
             issuer.verifier(),
             &gw("spiffe://chakra.internal/ns/gateway-a/sa/gateway-a"),
@@ -425,6 +643,8 @@ workloads:
         let result = exchange_token(
             &expired_token,
             "spiffe://chakra.internal/ns/backend-b/sa/backend-b",
+            &gw("spiffe://chakra.internal/ns/backend/sa/backend"),
+            5,
             &issuer,
             issuer.verifier(),
             &gw("spiffe://chakra.internal/ns/gateway-a/sa/gateway-a"),
@@ -456,6 +676,8 @@ workloads:
         let result = exchange_token(
             &token,
             "not-a-spiffe-id", // invalid!
+            &gw("spiffe://chakra.internal/ns/backend/sa/backend"),
+            5,
             &issuer,
             issuer.verifier(),
             &gw("spiffe://chakra.internal/ns/gateway-a/sa/gateway-a"),
@@ -490,6 +712,8 @@ workloads:
         let result = exchange_token(
             &token,
             "spiffe://chakra.internal/ns/backend-b/sa/backend-b",
+            &gw("spiffe://chakra.internal/ns/backend/sa/backend"),
+            5,
             &issuer,
             issuer.verifier(), // trusts only `issuer`'s key, not `other_issuer`'s
             &gw("spiffe://chakra.internal/ns/gateway-a/sa/gateway-a"),
@@ -507,6 +731,8 @@ workloads:
         let result = exchange_token(
             "not.a.jwt",
             "spiffe://chakra.internal/ns/backend-b/sa/backend-b",
+            &gw("spiffe://chakra.internal/ns/backend/sa/backend"),
+            5,
             &issuer,
             issuer.verifier(),
             &gw("spiffe://chakra.internal/ns/gateway-a/sa/gateway-a"),
@@ -537,6 +763,8 @@ workloads:
         let (token_1, _) = exchange_token(
             &token,
             "spiffe://chakra.internal/ns/backend-b/sa/backend-b",
+            &gw("spiffe://chakra.internal/ns/backend/sa/backend"),
+            5,
             &issuer,
             issuer.verifier(),
             &gw("spiffe://chakra.internal/ns/gateway-a/sa/gateway-a"),
@@ -547,6 +775,8 @@ workloads:
         let (token_2, _) = exchange_token(
             &token,
             "spiffe://chakra.internal/ns/backend-b/sa/backend-b",
+            &gw("spiffe://chakra.internal/ns/backend/sa/backend"),
+            5,
             &issuer,
             issuer.verifier(),
             &gw("spiffe://chakra.internal/ns/gateway-a/sa/gateway-a"),

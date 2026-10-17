@@ -431,6 +431,8 @@ fn three_hop_chain_has_the_latest_hop_as_the_outermost_act() {
     let (token_1, _) = exchange_token(
         &token_0,
         HOP_ORDERS,
+        &GATEWAY.parse::<SpiffeId>().unwrap(),
+        5,
         &issuer,
         issuer.verifier(),
         &GATEWAY.parse::<SpiffeId>().unwrap(),
@@ -443,6 +445,8 @@ fn three_hop_chain_has_the_latest_hop_as_the_outermost_act() {
     let (token_2, _) = exchange_token(
         &token_1,
         HOP_INVENTORY,
+        &HOP_ORDERS.parse::<SpiffeId>().unwrap(),
+        5,
         &issuer,
         issuer.verifier(),
         &HOP_ORDERS.parse::<SpiffeId>().unwrap(),
@@ -457,6 +461,8 @@ fn three_hop_chain_has_the_latest_hop_as_the_outermost_act() {
     let (token_3, _) = exchange_token(
         &token_2,
         "spiffe://chakra.internal/ns/backend/sa/backend",
+        &HOP_INVENTORY.parse::<SpiffeId>().unwrap(),
+        5,
         &issuer,
         issuer.verifier(),
         &HOP_INVENTORY.parse::<SpiffeId>().unwrap(),
@@ -676,4 +682,312 @@ fn current_actor_returns_outermost_act_sub_when_present() {
     assert_ne!(current_actor(&claims).to_string(), N1_API_GATEWAY);
     // `sub` itself is unchanged -- still the originator.
     assert_eq!(claims.sub, N1_API_GATEWAY);
+}
+
+// --- Task 13 (N12): issuer trust and JTI replay validation -----------------
+//
+// Review 0002 finding N12: tokens must be validated against a trusted
+// issuer list, and an optional JTI (JWT ID) replay cache prevents a
+// captured token from being reused indefinitely. Both checks are opt-in,
+// reached through `validate_with_issuer_and_replay_policy` rather than
+// `validate` itself, so every pre-existing `validate`/`validate_with_clock_skew`
+// call site (and every test above) keeps behaving exactly as before.
+
+const TRUSTED_ISSUER: &str = "spiffe://chakra.internal";
+const UNTRUSTED_ISSUER: &str = "spiffe://attacker.example";
+
+fn n12_claims(iss: Option<&str>, jti: Option<&str>) -> OboClaims {
+    OboClaims {
+        sub: ORDERS.to_string(),
+        aud: vec![INVENTORY.to_string()],
+        user: None,
+        act: None,
+        iat: 0,
+        exp: 300,
+        nbf: None,
+        jti: jti.map(str::to_string),
+        cnf: None,
+        iss: iss.map(str::to_string),
+    }
+}
+
+/// 1. A token whose `iss` is on the configured trusted-issuer list is
+///    accepted.
+#[test]
+fn issuer_validation_trusted() {
+    let reg = registry();
+    let (signer, verifier) = test_keys();
+    let destination: SpiffeId = INVENTORY.parse().unwrap();
+
+    let token = signer.sign(&n12_claims(Some(TRUSTED_ISSUER), None)).unwrap();
+    let request = ValidationRequest {
+        destination: &destination,
+        source_principal: None,
+        obo_token: Some(&token),
+        caller_chain: None,
+    };
+
+    let trusted_issuers = vec![TRUSTED_ISSUER.to_string()];
+    assert_eq!(
+        validate_with_issuer_and_replay_policy(&reg, &verifier, &request, 0, 60, &trusted_issuers, false, 3600),
+        Decision::Allow
+    );
+}
+
+/// 2. A token whose `iss` is *not* on the configured trusted-issuer list is
+///    rejected with `DenyReason::IssuerNotTrusted` — a compromised (or
+///    simply unrecognized) issuer's tokens are never accepted once a
+///    trusted-issuer list is configured.
+#[test]
+fn issuer_validation_untrusted() {
+    let reg = registry();
+    let (signer, verifier) = test_keys();
+    let destination: SpiffeId = INVENTORY.parse().unwrap();
+
+    let token = signer.sign(&n12_claims(Some(UNTRUSTED_ISSUER), None)).unwrap();
+    let request = ValidationRequest {
+        destination: &destination,
+        source_principal: None,
+        obo_token: Some(&token),
+        caller_chain: None,
+    };
+
+    let trusted_issuers = vec![TRUSTED_ISSUER.to_string()];
+    assert_eq!(
+        validate_with_issuer_and_replay_policy(&reg, &verifier, &request, 0, 60, &trusted_issuers, false, 3600),
+        Decision::Deny(DenyReason::IssuerNotTrusted)
+    );
+}
+
+/// 3. Two tokens minted with the same `jti` -- the second presentation is
+///    rejected as a replay once JTI caching is enabled: the first request
+///    is allowed and records the `jti`, the second (even though it is
+///    otherwise a perfectly valid, independently-signed token) is denied
+///    with `DenyReason::TokenReplayed`.
+#[test]
+fn jti_replay_detection() {
+    let reg = registry();
+    let (signer, verifier) = test_keys();
+    let destination: SpiffeId = INVENTORY.parse().unwrap();
+
+    let shared_jti = "jti-replay-test-1";
+    let token_first = signer.sign(&n12_claims(Some(TRUSTED_ISSUER), Some(shared_jti))).unwrap();
+    let token_second = signer.sign(&n12_claims(Some(TRUSTED_ISSUER), Some(shared_jti))).unwrap();
+
+    let trusted_issuers = vec![TRUSTED_ISSUER.to_string()];
+
+    let request_first = ValidationRequest {
+        destination: &destination,
+        source_principal: None,
+        obo_token: Some(&token_first),
+        caller_chain: None,
+    };
+    assert_eq!(
+        validate_with_issuer_and_replay_policy(&reg, &verifier, &request_first, 0, 60, &trusted_issuers, true, 3600),
+        Decision::Allow,
+        "first presentation of a fresh jti must be allowed"
+    );
+
+    let request_second = ValidationRequest {
+        destination: &destination,
+        source_principal: None,
+        obo_token: Some(&token_second),
+        caller_chain: None,
+    };
+    assert_eq!(
+        validate_with_issuer_and_replay_policy(&reg, &verifier, &request_second, 0, 60, &trusted_issuers, true, 3600),
+        Decision::Deny(DenyReason::TokenReplayed),
+        "replaying the same jti must be denied"
+    );
+}
+
+/// 4. A replayed `jti` is accepted again once its cache entry's TTL has
+///    elapsed -- the cache expires rather than remembering every jti
+///    forever.
+#[test]
+fn jti_cache_respects_ttl() {
+    let reg = registry();
+    let (signer, verifier) = test_keys();
+    let destination: SpiffeId = INVENTORY.parse().unwrap();
+
+    let shared_jti = "jti-ttl-test-1";
+    let token = signer.sign(&n12_claims(Some(TRUSTED_ISSUER), Some(shared_jti))).unwrap();
+    let trusted_issuers = vec![TRUSTED_ISSUER.to_string()];
+
+    let request = ValidationRequest {
+        destination: &destination,
+        source_principal: None,
+        obo_token: Some(&token),
+        caller_chain: None,
+    };
+
+    // A TTL of effectively zero (one nanosecond): the first call records
+    // the jti, and by the time the second call's lazy-eviction sweep runs
+    // (after a short real sleep), that record has already expired.
+    assert_eq!(
+        validate_with_issuer_and_replay_policy(&reg, &verifier, &request, 0, 60, &trusted_issuers, true, 0),
+        Decision::Allow,
+        "first presentation must be allowed"
+    );
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    assert_eq!(
+        validate_with_issuer_and_replay_policy(&reg, &verifier, &request, 0, 60, &trusted_issuers, true, 0),
+        Decision::Allow,
+        "replay after the TTL has elapsed must be allowed again, not denied"
+    );
+}
+
+// --- Task 6 (N3): validate inbound exchange requests (audience + depth) ---
+//
+// Review 0002 finding N3: `exchange_token` must refuse to re-mint a token
+// that wasn't addressed to this gateway's own protected workload, and must
+// refuse to extend a delegation chain that's already at (or past) the
+// configured maximum depth. Before this fix, neither was checked at all --
+// a token minted for one gateway could be exchanged through an unrelated
+// one, and a chain could grow without bound regardless of any registry's
+// `max_obo_chain_depth`.
+
+const N3_PAYMENTS: &str = "spiffe://chakra.internal/ns/payments/sa/payments-svc";
+const N3_ORDERS_GW: &str = "spiffe://chakra.internal/ns/orders-gw/sa/orders-gw";
+const N3_DOWNSTREAM: &str = "spiffe://chakra.internal/ns/downstream/sa/downstream";
+
+fn n3_issuer() -> LocalIssuer {
+    LocalIssuer::generate(registry(), 300).unwrap()
+}
+
+/// A token whose `aud` names one workload (`payments`) must not be
+/// exchangeable at a gateway protecting a different workload (`orders`) --
+/// exactly the "token addressed to gateway A exchanged at gateway B" hole
+/// N3 closes.
+#[test]
+fn exchange_rejects_wrong_audience() {
+    let issuer = n3_issuer();
+    let now = 1_000i64;
+
+    let claims = OboClaims {
+        sub: "spiffe://chakra.internal/ns/originator/sa/originator".to_string(),
+        aud: vec![N3_PAYMENTS.to_string()],
+        user: None,
+        act: None,
+        iat: now,
+        exp: now + 300,
+        nbf: None,
+        jti: None,
+        cnf: None,
+        iss: None,
+    };
+    let token = issuer.sign_claims(&claims).unwrap();
+
+    let destination_workload: SpiffeId = ORDERS.parse().unwrap();
+    let result = exchange_token(
+        &token,
+        N3_DOWNSTREAM,
+        &destination_workload,
+        5,
+        &issuer,
+        issuer.verifier(),
+        &N3_ORDERS_GW.parse::<SpiffeId>().unwrap(),
+        300,
+        now,
+    );
+
+    assert_eq!(result.unwrap_err(), TokenExchangeError::AudienceMismatch);
+}
+
+/// A token whose signed delegation chain is already 3 hops deep must be
+/// rejected at a gateway configured with `max_chain_depth = 2` -- the
+/// chain must not be allowed to grow past the configured limit.
+#[test]
+fn exchange_respects_max_depth() {
+    let issuer = n3_issuer();
+    let now = 1_000i64;
+
+    // Chain so far: [originator, hop-a, hop-b] -- 3 entries, built directly
+    // via nested `act` (outermost = most recent hop, per the N4 fix) rather
+    // than performing three real exchanges, to isolate exactly the depth
+    // check this test targets.
+    let claims = OboClaims {
+        sub: "spiffe://chakra.internal/ns/originator/sa/originator".to_string(),
+        aud: vec![INVENTORY.to_string()],
+        user: None,
+        act: Some(Box::new(ActClaim {
+            sub: "spiffe://chakra.internal/ns/hop-b/sa/hop-b".to_string(),
+            act: Some(Box::new(ActClaim {
+                sub: "spiffe://chakra.internal/ns/hop-a/sa/hop-a".to_string(),
+                act: None,
+            })),
+        })),
+        iat: now,
+        exp: now + 300,
+        nbf: None,
+        jti: None,
+        cnf: None,
+        iss: None,
+    };
+    assert_eq!(claims.delegation_chain().len(), 3);
+    let token = issuer.sign_claims(&claims).unwrap();
+
+    let destination_workload: SpiffeId = INVENTORY.parse().unwrap();
+    let result = exchange_token(
+        &token,
+        N3_DOWNSTREAM,
+        &destination_workload,
+        2, // max_chain_depth
+        &issuer,
+        issuer.verifier(),
+        &N3_ORDERS_GW.parse::<SpiffeId>().unwrap(),
+        300,
+        now,
+    );
+
+    assert_eq!(result.unwrap_err(), TokenExchangeError::ChainDepthExceeded);
+}
+
+/// The happy path: a token addressed to this gateway's protected workload,
+/// with a chain depth of 2 against a configured `max_chain_depth` of 3,
+/// must be exchanged successfully -- proving the audience and depth
+/// checks above don't also reject perfectly legitimate exchanges.
+#[test]
+fn exchange_allows_matching_audience_and_depth() {
+    let issuer = n3_issuer();
+    let now = 1_000i64;
+
+    // Chain so far: [originator, hop-a] -- 2 entries, one hop already
+    // recorded.
+    let claims = OboClaims {
+        sub: "spiffe://chakra.internal/ns/originator/sa/originator".to_string(),
+        aud: vec![ORDERS.to_string()],
+        user: None,
+        act: Some(Box::new(ActClaim {
+            sub: "spiffe://chakra.internal/ns/hop-a/sa/hop-a".to_string(),
+            act: None,
+        })),
+        iat: now,
+        exp: now + 300,
+        nbf: None,
+        jti: None,
+        cnf: None,
+        iss: None,
+    };
+    assert_eq!(claims.delegation_chain().len(), 2);
+    let token = issuer.sign_claims(&claims).unwrap();
+
+    let destination_workload: SpiffeId = ORDERS.parse().unwrap();
+    let (new_token, ttl) = exchange_token(
+        &token,
+        N3_DOWNSTREAM,
+        &destination_workload,
+        3, // max_chain_depth
+        &issuer,
+        issuer.verifier(),
+        &N3_ORDERS_GW.parse::<SpiffeId>().unwrap(),
+        300,
+        now,
+    )
+    .unwrap();
+
+    assert_eq!(ttl, 300);
+    let new_claims = issuer.verifier().verify_signature(&new_token).unwrap();
+    assert_eq!(new_claims.aud, vec![N3_DOWNSTREAM.to_string()]);
+    assert_eq!(new_claims.delegation_chain().len(), 3); // hop-a, then orders-gw appended
 }

@@ -26,14 +26,18 @@ pub use headers::{
 pub use identity::{IdentityProvider, IssuedToken, LocalIssuer};
 pub use jwt::{compute_cert_thumbprint_x5t_s256, ActClaim, CertBinding, JwtSigner, JwtVerifier, OboClaims};
 pub use obo::{
-    current_actor, validate, validate_with_cert_binding, validate_with_cert_binding_and_clock_skew,
-    validate_with_clock_skew, Decision, DenyReason, ValidationRequest, Validator, DEFAULT_CLOCK_SKEW_SECS,
+    cert_binding_matches, current_actor, validate, validate_with_cert_binding,
+    validate_with_cert_binding_and_clock_skew, validate_with_clock_skew, validate_with_issuer_and_replay_policy,
+    validate_with_user_issuers, Decision, DenyReason, ValidationRequest, Validator, DEFAULT_CLOCK_SKEW_SECS,
 };
-pub use registry::{CredentialCheck, Registry, WorkloadEntry, DEFAULT_MAX_OBO_CHAIN_DEPTH};
+pub use registry::{CredentialCheck, JtiReplayed, Registry, WorkloadEntry, DEFAULT_MAX_OBO_CHAIN_DEPTH};
 pub use spiffe_id::SpiffeId;
 pub use spire_provider::SpireProvider;
 pub use tls::{build_client_cert_verifier, build_server_config, load_certs, ServerCertificate};
-pub use token_exchange::{exchange_token, TokenExchangeError, TokenExchangeRequest, TokenExchangeResponse};
+pub use token_exchange::{
+    exchange_token, exchange_token_with_cert_binding, TokenExchangeError, TokenExchangeRequest,
+    TokenExchangeResponse,
+};
 
 /// Current time as Unix seconds. A thin wrapper so call sites don't reach
 /// for a date/time crate just to compare against a JWT `exp`/`iat`.

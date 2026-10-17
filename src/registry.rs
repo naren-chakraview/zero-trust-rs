@@ -5,6 +5,8 @@
 
 use std::collections::HashMap;
 use std::io::Read;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 use subtle::ConstantTimeEq;
@@ -42,10 +44,29 @@ pub enum CredentialCheck<'a> {
 }
 
 /// The parsed registry: every known workload, keyed by its `SpiffeId`.
+///
+/// Also carries an in-memory JTI (JWT ID) replay cache (Task 13 / N12),
+/// behind an `Arc<Mutex<_>>` so every clone of a `Registry` shares the same
+/// underlying cache rather than starting a fresh, independent one — the
+/// same sharing pattern `registry.clone()` call sites already rely on
+/// elsewhere in this crate (e.g. handing a clone to both `LocalIssuer` and
+/// an `Arc<Registry>` stored in `AppState`). The cache is per-process only:
+/// a multi-process deployment would need a shared store (e.g. Redis)
+/// instead, since a replay could otherwise simply be routed to a different
+/// process to go undetected.
 #[derive(Debug, Clone, Default)]
 pub struct Registry {
     trust_domain: String,
     entries: HashMap<SpiffeId, WorkloadEntry>,
+    // Each entry also stores the `ttl` it was inserted with, so a later
+    // call's lazy-eviction sweep evicts based on *that* entry's own TTL --
+    // not whatever `ttl` the current call happens to pass -- otherwise an
+    // entry inserted with a short TTL would never be evicted by a
+    // subsequent call made with a longer one (bugfix: this field used to
+    // be `HashMap<String, Instant>`, and `check_jti`'s sweep used the
+    // *current* call's `ttl` for every entry, so an entry's own TTL was
+    // silently ignored once it was already in the cache).
+    jti_cache: Arc<Mutex<HashMap<String, (Instant, Duration)>>>,
 }
 
 impl Registry {
@@ -109,6 +130,7 @@ impl Registry {
         Ok(Self {
             trust_domain: raw.trust_domain,
             entries,
+            jti_cache: Arc::new(Mutex::new(HashMap::new())),
         })
     }
 
@@ -170,7 +192,60 @@ impl Registry {
     pub fn is_empty(&self) -> bool {
         self.entries.is_empty()
     }
+
+    /// Checks `jti` (a token's JWT ID) against this registry's in-memory
+    /// replay cache, recording it as seen if it isn't already there (Task
+    /// 13 / N12). Returns `Err(JtiReplayed)` when `jti` was already
+    /// recorded within `ttl` of now — a replay attempt — and `Ok(())`
+    /// otherwise, including the first time any given `jti` is ever seen.
+    ///
+    /// Expired entries are evicted lazily, on this same call, rather than
+    /// through a background sweep: correct (nothing lingers past its TTL
+    /// by more than one `check_jti` call's worth of time) and simple, at
+    /// the cost of a full-cache scan per call — fine at the cache sizes
+    /// this in-memory, single-process design is meant for. Callers that
+    /// want this check to actually run should hold `jti_cache_enabled` in
+    /// their own config (see `obo::validate_with_issuer_and_replay_policy`)
+    /// — `Registry` itself has no opinion on whether replay detection is
+    /// turned on, only on answering "have I seen this `jti` before."
+    pub fn check_jti(&self, jti: &str, ttl: Duration) -> Result<(), JtiReplayed> {
+        let now = Instant::now();
+        let mut cache = self.jti_cache.lock().expect("jti cache mutex poisoned");
+
+        // Lazy cleanup: drop anything whose *own* TTL (recorded at the time
+        // it was inserted) has already elapsed, so the cache never grows
+        // without bound across a long-lived process. Each entry is judged
+        // against the TTL it was inserted with, not `ttl` (this call's
+        // argument) -- otherwise an entry inserted with a short TTL would
+        // never get swept by a later call made with a longer one.
+        cache.retain(|_, (seen_at, entry_ttl)| now.duration_since(*seen_at) < *entry_ttl);
+
+        if cache.contains_key(jti) {
+            return Err(JtiReplayed);
+        }
+        cache.insert(jti.to_string(), (now, ttl));
+        Ok(())
+    }
+
+    /// Number of JTIs currently tracked in the replay cache, after lazy
+    /// eviction of anything past its own recorded TTL. Test-only
+    /// diagnostic helper. `ttl` is unused for eviction (each entry already
+    /// carries its own) but kept so call sites read consistently with
+    /// `check_jti`.
+    #[cfg(test)]
+    fn jti_cache_len(&self, _ttl: Duration) -> usize {
+        let now = Instant::now();
+        let mut cache = self.jti_cache.lock().expect("jti cache mutex poisoned");
+        cache.retain(|_, (seen_at, entry_ttl)| now.duration_since(*seen_at) < *entry_ttl);
+        cache.len()
+    }
 }
+
+/// Error marker returned by [`Registry::check_jti`] when the presented
+/// `jti` was already seen within its TTL window — i.e. a replay attempt
+/// (Task 13 / N12).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct JtiReplayed;
 
 /// Deserialization target matching the YAML file shape exactly. Kept
 /// private and separate from `Registry`/`WorkloadEntry` (the "raw" vs.
@@ -331,5 +406,50 @@ workloads:
 "#;
         let err = Registry::from_yaml_str(bad).unwrap_err();
         assert!(matches!(err, RegistryError::InvalidSpiffeId { .. }));
+    }
+
+    // --- JTI replay cache (Task 13 / N12) ---
+
+    #[test]
+    fn check_jti_allows_a_jti_seen_for_the_first_time() {
+        let registry = Registry::from_yaml_str(FIXTURE).unwrap();
+        assert!(registry.check_jti("jti-1", Duration::from_secs(60)).is_ok());
+    }
+
+    #[test]
+    fn check_jti_rejects_a_replayed_jti_within_ttl() {
+        let registry = Registry::from_yaml_str(FIXTURE).unwrap();
+        assert!(registry.check_jti("jti-2", Duration::from_secs(60)).is_ok());
+        assert_eq!(registry.check_jti("jti-2", Duration::from_secs(60)), Err(JtiReplayed));
+    }
+
+    #[test]
+    fn check_jti_allows_a_replayed_jti_after_ttl_elapses() {
+        let registry = Registry::from_yaml_str(FIXTURE).unwrap();
+        // A near-zero TTL means the entry is effectively already expired by
+        // the time the second call's lazy-eviction sweep runs.
+        assert!(registry.check_jti("jti-3", Duration::from_nanos(1)).is_ok());
+        std::thread::sleep(Duration::from_millis(5));
+        assert!(registry.check_jti("jti-3", Duration::from_nanos(1)).is_ok());
+    }
+
+    #[test]
+    fn check_jti_cloned_registry_shares_the_same_cache() {
+        let registry = Registry::from_yaml_str(FIXTURE).unwrap();
+        let clone = registry.clone();
+        assert!(registry.check_jti("jti-shared", Duration::from_secs(60)).is_ok());
+        // Seen through the original -- the clone, sharing the same
+        // underlying Arc<Mutex<_>>, must also see it as a replay.
+        assert_eq!(clone.check_jti("jti-shared", Duration::from_secs(60)), Err(JtiReplayed));
+    }
+
+    #[test]
+    fn check_jti_lazily_evicts_expired_entries() {
+        let registry = Registry::from_yaml_str(FIXTURE).unwrap();
+        assert!(registry.check_jti("jti-4", Duration::from_nanos(1)).is_ok());
+        std::thread::sleep(Duration::from_millis(5));
+        // The next call (regardless of which jti) sweeps out the expired entry.
+        assert!(registry.check_jti("jti-5", Duration::from_secs(60)).is_ok());
+        assert_eq!(registry.jti_cache_len(Duration::from_secs(60)), 1);
     }
 }

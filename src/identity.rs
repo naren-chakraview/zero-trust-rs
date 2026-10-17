@@ -85,6 +85,33 @@ pub trait IdentityProvider {
     /// `iat`/`exp`/`jti`) for the next hop — there is no bootstrap token to
     /// check because nothing new is being authenticated, only re-signed.
     fn sign_claims(&self, claims: &OboClaims) -> Result<String, IdentityError>;
+
+    /// Edge mint path for a human user principal (N5 fix, review 0002):
+    /// mints a token whose `sub` is `gateway_id` and whose `user` claim
+    /// carries a human principal string (e.g. `user@corp.internal`), not a
+    /// SPIFFE ID -- the entry point into the mesh for human-originated
+    /// requests, letting a downstream verifier attribute an action to a
+    /// human rather than only to the service identity that made the call.
+    /// `user_issuer` must be present in `trusted_user_issuers`
+    /// (the deployment's configured `GatewayConfig::user_issuers`) or this
+    /// fails with [`IdentityError::UntrustedUserIssuer`].
+    ///
+    /// The default implementation always refuses: minting a token requires
+    /// direct access to signing key material, which not every
+    /// `IdentityProvider` holds (see [`crate::SpireProvider::sign_claims`]'s
+    /// doc comment for the same limitation). [`LocalIssuer`] is the only
+    /// provider that overrides this.
+    fn issue_jwt_svid_with_user(
+        &self,
+        _gateway_id: &SpiffeId,
+        _user_principal: &str,
+        _user_issuer: &str,
+        _trusted_user_issuers: &[String],
+    ) -> Result<IssuedToken, IdentityError> {
+        Err(IdentityError::Spire(
+            "issue_jwt_svid_with_user is not supported by this identity provider".to_string(),
+        ))
+    }
 }
 
 /// v0.1's only [`IdentityProvider`]: this process holds its own RSA
@@ -260,6 +287,57 @@ impl LocalIssuer {
             expires_at: claims.exp,
         })
     }
+
+    /// Edge mint path for a human user principal (N5 fix, review 0002).
+    /// See [`IdentityProvider::issue_jwt_svid_with_user`] for the full
+    /// contract. `aud` is self-scoped to `gateway_id` -- this method mints
+    /// a self-identity token carrying the human principal, which
+    /// `POST /v1/token-exchange` (`token_exchange::exchange_token`) then
+    /// re-scopes to each real downstream audience while preserving `user`
+    /// and `iss` verbatim, so the human principal and its trusted issuer
+    /// survive every hop.
+    ///
+    /// Unlike [`Self::issue_jwt_svid`]/[`Self::issue_jwt_svid_with_cert_binding`],
+    /// there is no bootstrap-token credential to check against the
+    /// workload registry here -- no workload is being authenticated, only
+    /// a human credential whose issuer this call validates directly
+    /// against `trusted_user_issuers`.
+    pub fn issue_jwt_svid_with_user(
+        &self,
+        gateway_id: &SpiffeId,
+        user_principal: &str,
+        user_issuer: &str,
+        trusted_user_issuers: &[String],
+    ) -> Result<IssuedToken, IdentityError> {
+        if !trusted_user_issuers.iter().any(|trusted| trusted == user_issuer) {
+            return Err(IdentityError::UntrustedUserIssuer(user_issuer.to_string()));
+        }
+
+        let now = crate::now_unix_secs();
+        let claims = OboClaims {
+            sub: gateway_id.to_string(),
+            aud: vec![gateway_id.to_string()],
+            user: Some(user_principal.to_string()),
+            act: None,
+            iat: now,
+            exp: now + self.ttl_seconds,
+            nbf: Some(now),
+            jti: Some(generate_jti()),
+            cnf: None,
+            // The trusted IdP that vouched for `user_principal`, not this
+            // gateway's own trust domain -- see
+            // `obo::validate_with_user_issuers`, which checks exactly this
+            // claim against `GatewayConfig::user_issuers` to decide
+            // whether to accept the non-SPIFFE-ID `user` claim above.
+            iss: Some(user_issuer.to_string()),
+        };
+
+        let token = self.signer.sign(&claims)?;
+        Ok(IssuedToken {
+            token,
+            expires_at: claims.exp,
+        })
+    }
 }
 
 impl IdentityProvider for LocalIssuer {
@@ -306,6 +384,20 @@ impl IdentityProvider for LocalIssuer {
 
     fn sign_claims(&self, claims: &OboClaims) -> Result<String, IdentityError> {
         Ok(self.signer.sign(claims)?)
+    }
+
+    /// Delegates to the inherent [`Self::issue_jwt_svid_with_user`] -- kept
+    /// as a separate trait override (rather than relying on the default)
+    /// so a caller holding only `&dyn IdentityProvider` (e.g.
+    /// `zt-gateway`'s `AppState::identity`) can still reach it.
+    fn issue_jwt_svid_with_user(
+        &self,
+        gateway_id: &SpiffeId,
+        user_principal: &str,
+        user_issuer: &str,
+        trusted_user_issuers: &[String],
+    ) -> Result<IssuedToken, IdentityError> {
+        self.issue_jwt_svid_with_user(gateway_id, user_principal, user_issuer, trusted_user_issuers)
     }
 }
 

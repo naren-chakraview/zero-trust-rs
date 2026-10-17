@@ -19,7 +19,7 @@ use std::time::Duration;
 use axum::body::Body;
 use axum::error_handling::HandleErrorLayer;
 use axum::extract::{Request, State};
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{HeaderMap, HeaderName, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::extract::DefaultBodyLimit;
 use axum::routing::post;
@@ -42,11 +42,12 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
 use zero_trust::{
-    build_client_cert_verifier, build_server_config, compute_cert_thumbprint_x5t_s256, current_actor, exchange_token,
-    load_certs, now_unix_secs, validate_with_cert_binding_and_clock_skew, CaError, CertificateAuthority, ClientAuth,
-    Decision, GatewayConfig, IdentityError, IdentityProvider, LocalCa, LocalIssuer, Registry, RouteTable,
-    ServerCertificate, SpiffeId, SpireProvider, TokenExchangeError, TokenExchangeRequest, TokenExchangeResponse,
-    ValidationRequest, HEADER_CALLER_CHAIN, HEADER_OBO_TOKEN, HEADER_USER_PRINCIPAL,
+    build_client_cert_verifier, build_server_config, compute_cert_thumbprint_x5t_s256, current_actor,
+    exchange_token_with_cert_binding, load_certs, now_unix_secs, validate_with_cert_binding_and_clock_skew, CaError,
+    CertificateAuthority, ClientAuth, Decision, GatewayConfig, IdentityError, IdentityProvider, LocalCa, LocalIssuer,
+    Registry, RouteTable, ServerCertificate, SpiffeId, SpireProvider, TokenExchangeError, TokenExchangeRequest,
+    TokenExchangeResponse, ValidationRequest, DEFAULT_MAX_OBO_CHAIN_DEPTH, HEADER_CALLER_CHAIN, HEADER_OBO_TOKEN,
+    HEADER_USER_PRINCIPAL,
 };
 
 /// Everything a request handler needs, cheap to clone (every field is an
@@ -84,6 +85,14 @@ struct AppState {
     /// operator-configured tolerance actually reaches the decision, instead
     /// of the fixed `DEFAULT_CLOCK_SKEW_SECS` plain `validate` would use.
     clock_skew_tolerance_secs: i64,
+    /// Trusted IdP issuers for the N5 edge-mint path (review 0002), mirrors
+    /// `GatewayConfig::user_issuers`. `POST /v1/svid/jwt-with-user` checks
+    /// a request's `user_issuer` against this list (via
+    /// `IdentityProvider::issue_jwt_svid_with_user`) before minting
+    /// anything, and it's the same list a downstream validator would pass
+    /// to `obo::validate_with_user_issuers` to accept this gateway's
+    /// human-principal tokens.
+    user_issuers: Arc<Vec<String>>,
 }
 
 /// Sets up structured stdout logs (always) plus, when
@@ -253,6 +262,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_body_bytes: (config.max_body_mb as usize) * 1024 * 1024,
         route_table: Arc::new(RouteTable::new(config.routes.clone())),
         clock_skew_tolerance_secs: config.clock_skew_tolerance_secs as i64,
+        user_issuers: Arc::new(config.user_issuers.clone()),
     };
 
     let listener_config = ListenerConfig {
@@ -348,7 +358,8 @@ async fn setup_listeners(
 }
 
 /// Builds the admin listener's router: the issuance routes (`/v1/svid/jwt`,
-/// `/v1/svid/x509`), `/v1/authorize`, and `/v1/token-exchange` -- every
+/// `/v1/svid/jwt-with-user`, `/v1/svid/x509`), `/v1/authorize`, and
+/// `/v1/token-exchange` -- every
 /// control-plane route this gateway exposes, all behind a shared rate
 /// limit (F7 fix: previously unlimited, making the bootstrap-token compare
 /// a practical brute-force target). No fallback is registered, so any path
@@ -371,6 +382,7 @@ fn build_admin_router(state: AppState, rate_limit_rps: u32, max_body_mb: u32, re
 
     Router::new()
         .route("/v1/svid/jwt", post(issue_svid))
+        .route("/v1/svid/jwt-with-user", post(issue_svid_with_user))
         .route("/v1/svid/x509", post(issue_x509_svid))
         .route("/v1/authorize", post(authorize))
         .route("/v1/token-exchange", post(handle_token_exchange))
@@ -437,6 +449,7 @@ fn build_router(state: AppState) -> Router {
 
     Router::new()
         .route("/v1/svid/jwt", post(issue_svid))
+        .route("/v1/svid/jwt-with-user", post(issue_svid_with_user))
         .route("/v1/svid/x509", post(issue_x509_svid))
         .route("/v1/authorize", post(authorize))
         .route("/v1/token-exchange", post(handle_token_exchange))
@@ -658,6 +671,63 @@ async fn issue_svid(State(state): State<AppState>, Json(req): Json<IssueRequest>
     }
 }
 
+// --- POST /v1/svid/jwt-with-user (N5 fix, review 0002) ---
+//
+// The edge-mint path: unlike `/v1/svid/jwt`, this never issues a token for
+// another *workload* -- it's meant to be called once, at the mesh's human
+// entry point (an edge gateway fronting a browser/CLI session), to mint a
+// token that carries a human user principal (`user`) alongside this
+// gateway's own SPIFFE ID (`sub`), bridging the human-to-service
+// attribution boundary described in review 0002's N5 finding.
+
+#[derive(Deserialize)]
+struct IssueJwtWithUserRequest {
+    /// The human user's credential, as presented by the IdP (a bearer
+    /// token or OIDC ID token). Real OIDC/JWT verification of third-party
+    /// IdP tokens (JWKS fetch, signature check) is out of scope here --
+    /// per the N5 fix's brief, this gateway's credential handling is
+    /// deliberately simple: the credential's value *is* the extracted
+    /// human principal (e.g. `user@corp.internal`), and trust is
+    /// established purely by checking `user_issuer` below against
+    /// `GatewayConfig::user_issuers`.
+    user_credential: String,
+    /// Which trusted IdP issued `user_credential` (e.g.
+    /// `auth.corp.internal`). Checked against `GatewayConfig::user_issuers`
+    /// -- see `IdentityProvider::issue_jwt_svid_with_user`.
+    user_issuer: String,
+}
+
+#[derive(Serialize)]
+struct IssueJwtWithUserResponse {
+    token: String,
+    expires_at: i64,
+}
+
+async fn issue_svid_with_user(
+    State(state): State<AppState>,
+    Json(req): Json<IssueJwtWithUserRequest>,
+) -> Response {
+    match state.identity.issue_jwt_svid_with_user(
+        &state.gateway_id,
+        &req.user_credential,
+        &req.user_issuer,
+        &state.user_issuers,
+    ) {
+        Ok(issued) => (
+            StatusCode::OK,
+            Json(IssueJwtWithUserResponse {
+                token: issued.token,
+                expires_at: issued.expires_at,
+            }),
+        )
+            .into_response(),
+        Err(IdentityError::UntrustedUserIssuer(issuer)) => {
+            error_response(StatusCode::UNAUTHORIZED, format!("untrusted user issuer: {issuer}"))
+        }
+        Err(e) => error_response(StatusCode::BAD_REQUEST, e.to_string()),
+    }
+}
+
 // --- POST /v1/svid/x509 ---
 
 #[derive(Deserialize)]
@@ -766,15 +836,47 @@ async fn authorize(
 
 // --- POST /v1/token-exchange ---
 
-async fn handle_token_exchange(State(state): State<AppState>, Json(req): Json<TokenExchangeRequest>) -> Response {
-    match exchange_token(
+/// N2 fix (review 0002): the admin listener's peer certificate thumbprint
+/// (from the same [`PeerIdentity`] every other admin/proxy route reads --
+/// `None` whenever the connection presented no TLS client certificate at
+/// all, e.g. mTLS disabled in dev) is passed straight into
+/// `exchange_token_with_cert_binding`, which both validates the inbound
+/// token's `cnf` (if any) against it and re-binds the newly minted token to
+/// it -- so a token exchanged at this gateway is always bound to *this*
+/// hop's own certificate, never whatever certificate (or lack of one) the
+/// inbound token happened to carry.
+async fn handle_token_exchange(
+    State(state): State<AppState>,
+    peer_identity: Option<Extension<PeerIdentity>>,
+    Json(req): Json<TokenExchangeRequest>,
+) -> Response {
+    let caller_cert_thumbprint = peer_identity.and_then(|Extension(peer)| peer.cert_thumbprint);
+
+    // Task 6 (N3 fix, review 0002): the inbound token must be addressed to
+    // *this* gateway's own protected workload -- never some other
+    // gateway's -- and its signed delegation chain must not already be at
+    // or past this gateway's configured maximum. `max_chain_depth` comes
+    // from the same registry entry (`max_obo_chain_depth`) that governs
+    // every other chain-depth check in this crate; a gateway whose own
+    // protected workload isn't registered at all falls back to the same
+    // conservative `DEFAULT_MAX_OBO_CHAIN_DEPTH` `obo::validate` uses.
+    let max_chain_depth = state
+        .registry
+        .get(&state.protected_workload)
+        .map(|entry| entry.max_obo_chain_depth)
+        .unwrap_or(DEFAULT_MAX_OBO_CHAIN_DEPTH);
+
+    match exchange_token_with_cert_binding(
         &req.subject_token,
         &req.audience,
+        &state.protected_workload,
+        max_chain_depth,
         state.identity.as_ref(),
         state.identity.verifier(),
         &state.gateway_id,
         state.token_exchange_ttl_secs,
         now_unix_secs(),
+        caller_cert_thumbprint.as_deref(),
     ) {
         Ok((access_token, expires_in)) => (
             StatusCode::OK,
@@ -787,7 +889,13 @@ async fn handle_token_exchange(State(state): State<AppState>, Json(req): Json<To
             .into_response(),
         Err(e @ TokenExchangeError::InvalidToken) => error_response(StatusCode::BAD_REQUEST, e.to_string()),
         Err(e @ TokenExchangeError::ExpiredToken) => error_response(StatusCode::UNAUTHORIZED, e.to_string()),
+        Err(e @ TokenExchangeError::NotYetValid) => error_response(StatusCode::UNAUTHORIZED, e.to_string()),
         Err(e @ TokenExchangeError::InvalidAudience) => error_response(StatusCode::BAD_REQUEST, e.to_string()),
+        Err(e @ TokenExchangeError::AudienceMismatch) => error_response(StatusCode::FORBIDDEN, e.to_string()),
+        Err(e @ TokenExchangeError::ChainDepthExceeded) => error_response(StatusCode::FORBIDDEN, e.to_string()),
+        Err(e @ TokenExchangeError::CertificateBindingMismatch) => {
+            error_response(StatusCode::FORBIDDEN, e.to_string())
+        }
         Err(e @ TokenExchangeError::InternalError) => {
             error_response(StatusCode::INTERNAL_SERVER_ERROR, e.to_string())
         }
@@ -957,6 +1065,15 @@ fn record_obo_span_attributes(
 // below) because a `tracing` span's field set is fixed at creation time —
 // `Span::record` can only fill in a value for a field that was already
 // declared, never add a new one.
+//
+// N11 fix (review 0002): `obo.chain` itself is now only ever recorded from
+// the verified OBO token's signed `delegation_chain()` -- never the
+// unsigned `X-SPIFFE-Caller-Chain` header, which any backend sitting
+// between the caller and this gateway could set to anything. That header,
+// when present, is instead recorded under the separate `obo.chain_unverified`
+// field below -- useful for troubleshooting, but clearly marked as never
+// trusted, same as `obo.user_principal_unverified` already does for the
+// user-principal header (F2 fix).
 /// Resolves which workload identity and upstream backend a proxied
 /// request should be forwarded to (F14 / Task 1: multi-backend routing).
 ///
@@ -979,6 +1096,11 @@ fn resolve_route(state: &AppState, method: &str, path: &str, host: Option<&str>)
     fields(
         obo.caller_principal = tracing::field::Empty,
         obo.chain = tracing::field::Empty,
+        // N11 fix (review 0002): the raw, unverified `X-SPIFFE-Caller-Chain`
+        // header is recorded under this clearly-unverified attribute,
+        // never under `obo.chain` -- see the doc comment above
+        // `resolve_route` for the full rationale.
+        obo.chain_unverified = tracing::field::Empty,
         obo.user_principal = tracing::field::Empty,
         // F2 fix: the raw, unverified `X-SPIFFE-User-Principal` header is
         // recorded under this clearly-unverified attribute, never under
@@ -1074,7 +1196,16 @@ async fn proxy_handler(
     let span = tracing::Span::current();
     span.record("allow", decision.is_allow());
     span.record("deny_reason", decision.deny_reason_str());
-    span.record("obo.chain", caller_chain.as_deref().unwrap_or(""));
+    // N11 fix (review 0002): the unsigned `X-SPIFFE-Caller-Chain` header,
+    // if present, is recorded only under this separately-named, clearly-
+    // unverified attribute -- never under `obo.chain` itself, which is
+    // populated further below exclusively from the OBO token's *signed*,
+    // already-verified `delegation_chain()` whenever one is available.
+    // Observability shows verified facts only; this header is kept around
+    // purely for troubleshooting a backend that's still sending it.
+    if let Some(chain_header) = &caller_chain {
+        span.record("obo.chain_unverified", chain_header.as_str());
+    }
     // F2 fix: the raw `X-SPIFFE-User-Principal` header is never trustworthy
     // (any caller can set it to anything), so it is recorded only under
     // this distinctly-named, clearly-unverified attribute -- never under
@@ -1088,6 +1219,15 @@ async fn proxy_handler(
     // Only meaningful once the decision is Allow -- re-verifying the token
     // here is purely to read its claims for tracing (obo::validate doesn't
     // expose them), not a second authorization decision.
+    //
+    // N10 fix (review 0002): this same *verified* identity (never anything
+    // read straight off a client-supplied header) is also what
+    // `forward_to_upstream` attaches to the upstream request as a
+    // gateway-owned `X-ZT-Verified-*` header, after stripping whatever
+    // delegation headers the client itself sent -- see
+    // `DELEGATION_HEADERS_TO_STRIP`'s doc comment.
+    let mut verified_caller: Option<SpiffeId> = None;
+    let mut verified_chain: Option<Vec<String>> = None;
     if decision.is_allow() {
         if let Some(token) = obo_token.as_deref() {
             if let Ok(claims) = state.identity.verifier().verify_signature(token) {
@@ -1097,14 +1237,25 @@ async fn proxy_handler(
                 // was actually authorized here. Safe to call unconditionally:
                 // `Allow` implies every chain entry already parsed as a
                 // SPIFFE ID.
-                span.record("obo.caller_principal", current_actor(&claims).to_string().as_str());
+                let actor = current_actor(&claims);
+                span.record("obo.caller_principal", actor.to_string().as_str());
                 span.record("obo.token_ttl_seconds", claims.exp - now_unix_secs());
                 if let Some(user) = claims.user.as_deref() {
                     span.record("obo.user_principal", user);
                 }
+                // N11 fix (review 0002): `obo.chain` comes from this
+                // verified token's signed `delegation_chain()` -- never
+                // from the unsigned `X-SPIFFE-Caller-Chain` header (see
+                // `obo.chain_unverified` above, recorded separately and
+                // never trusted).
+                let chain = claims.delegation_chain();
+                span.record("obo.chain", chain.join(" -> ").as_str());
+                verified_chain = Some(chain);
+                verified_caller = Some(actor);
             }
         } else if let Some(sp) = &source_principal {
             span.record("obo.caller_principal", sp.to_string().as_str());
+            verified_caller = Some(sp.clone());
         }
     }
 
@@ -1136,7 +1287,18 @@ async fn proxy_handler(
     );
 
     let response = match decision {
-        Decision::Allow => forward_to_upstream(&state, parts, body_bytes, &trace_cx, &routed_upstream_addr).await,
+        Decision::Allow => {
+            forward_to_upstream(
+                &state,
+                parts,
+                body_bytes,
+                &trace_cx,
+                &routed_upstream_addr,
+                verified_caller.as_ref(),
+                verified_chain.as_deref(),
+            )
+            .await
+        }
         Decision::Deny(reason) => (
             StatusCode::FORBIDDEN,
             Json(DenyBody {
@@ -1159,12 +1321,45 @@ async fn proxy_handler(
 /// for the new connection to the upstream instead of reusing stale values.
 const HOP_BY_HOP_HEADERS: [&str; 3] = ["host", "content-length", "connection"];
 
+/// Client-supplied headers that carry OBO delegation state, or sensitive
+/// upstream auth material, and must never reach the backend verbatim (N10
+/// fix, review 0002): a compromised backend could otherwise replay or
+/// forge these to spoof caller identity and impersonate another workload.
+/// `forward_to_upstream` removes every one of these on *every* forward --
+/// deliberately with no per-route opt-out, since the whole point is that
+/// the backend can never be trusted to receive them. Any verified identity
+/// the backend does need instead travels through the gateway-owned
+/// `X-ZT-Verified-*` headers `forward_to_upstream` adds back afterward,
+/// built only from values the decision engine has already vouched for.
+///
+/// `authorization` is included unconditionally too: whatever bearer
+/// credential the *client* presented to this gateway is this gateway's to
+/// consume (OBO token exchange, mTLS, etc.), not the backend's to see or
+/// replay elsewhere.
+const DELEGATION_HEADERS_TO_STRIP: [&str; 4] =
+    [HEADER_OBO_TOKEN, HEADER_CALLER_CHAIN, HEADER_USER_PRINCIPAL, "authorization"];
+
+/// Gateway-owned header carrying the verified current actor (see
+/// `obo::current_actor`) -- added to the upstream request only when the
+/// decision engine actually verified one, and only after
+/// `DELEGATION_HEADERS_TO_STRIP` has already removed anything the client
+/// itself sent under a similarly-named header. Never populated from a
+/// client-supplied value.
+const HEADER_VERIFIED_USER: &str = "x-zt-verified-user";
+
+/// Gateway-owned header carrying the verified, chronological delegation
+/// chain (`OboClaims::delegation_chain()`), same verified-only rule as
+/// [`HEADER_VERIFIED_USER`].
+const HEADER_VERIFIED_CHAIN: &str = "x-zt-verified-chain";
+
 async fn forward_to_upstream(
     state: &AppState,
     parts: axum::http::request::Parts,
     body_bytes: axum::body::Bytes,
     trace_cx: &OtelContext,
     upstream_addr: &str,
+    verified_caller: Option<&SpiffeId>,
+    verified_chain: Option<&[String]>,
 ) -> Response {
     // Check body size limit (F6 fix)
     if body_bytes.len() > state.max_body_bytes {
@@ -1186,10 +1381,37 @@ async fn forward_to_upstream(
     for name in HOP_BY_HOP_HEADERS {
         headers.remove(name);
     }
+    // N10 fix (review 0002): strip delegation headers -- and `Authorization`
+    // -- unconditionally before anything else touches this request, so
+    // nothing below can accidentally reintroduce a client-supplied value
+    // under one of these names. See `DELEGATION_HEADERS_TO_STRIP`'s doc
+    // comment for why there's no opt-out.
+    for name in DELEGATION_HEADERS_TO_STRIP {
+        headers.remove(name);
+    }
     // F12 fix: propagate the same trace context onward to the upstream, so
     // a delegation chain that keeps going past this gateway still shows up
     // as one trace rather than ending here.
     inject_trace_context(trace_cx, &mut headers);
+
+    // N10 fix (review 0002): attach gateway-owned, VERIFIED replacements --
+    // added only after the strip above, and only from `verified_caller`/
+    // `verified_chain`, which `proxy_handler` populates exclusively from
+    // claims the decision engine has already authenticated (never from the
+    // raw `X-SPIFFE-*` headers just removed). Absent whenever the request
+    // was a direct, tokenless call with no mTLS-verified peer either.
+    if let Some(caller) = verified_caller {
+        if let Ok(value) = axum::http::HeaderValue::from_str(&caller.to_string()) {
+            headers.insert(HeaderName::from_static(HEADER_VERIFIED_USER), value);
+        }
+    }
+    if let Some(chain) = verified_chain {
+        if !chain.is_empty() {
+            if let Ok(value) = axum::http::HeaderValue::from_str(&chain.join(",")) {
+                headers.insert(HeaderName::from_static(HEADER_VERIFIED_CHAIN), value);
+            }
+        }
+    }
 
     let upstream_request = state
         .http_client
@@ -1284,6 +1506,7 @@ workloads:
             max_body_bytes: 100 * 1024 * 1024,
             route_table: Arc::new(RouteTable::default()),
             clock_skew_tolerance_secs: zero_trust::DEFAULT_CLOCK_SKEW_SECS,
+            user_issuers: Arc::new(Vec::new()),
         }
     }
 
@@ -1310,6 +1533,33 @@ workloads:
         });
 
         (format!("http://{addr}"), hits)
+    }
+
+    /// Binds a real local upstream that always returns `200 OK` and records
+    /// the headers of the *last* request it received — used by the N10
+    /// tests below to prove what `forward_to_upstream` actually puts on the
+    /// wire to the backend (not just what the gateway's own response to the
+    /// client looks like).
+    async fn spawn_header_capturing_upstream() -> (String, Arc<std::sync::Mutex<Option<HeaderMap>>>) {
+        let captured = Arc::new(std::sync::Mutex::new(None));
+        let captured_for_handler = captured.clone();
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+
+        let app = Router::new().fallback(move |headers: HeaderMap| {
+            let captured = captured_for_handler.clone();
+            async move {
+                *captured.lock().unwrap() = Some(headers);
+                (SC::OK, "ok")
+            }
+        });
+
+        tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+
+        (format!("http://{addr}"), captured)
     }
 
     #[tokio::test]
@@ -1401,9 +1651,16 @@ workloads:
     #[tokio::test]
     async fn token_exchange_returns_a_token_with_the_gateway_appended_to_the_chain() {
         let state = test_state("http://unused.invalid".to_string());
+        // N3 fix (review 0002, Task 6): the inbound token's `aud` must now
+        // name this gateway's own protected workload (`test_state`'s
+        // `protected_workload` is `INVENTORY`) for the exchange to be
+        // allowed at all -- a token addressed to some other party (e.g.
+        // `API_GATEWAY`, used here before the fix) is exactly the
+        // unvalidated-audience hole N3 closes, so it's no longer a valid
+        // setup for "the exchange succeeds" tests like this one.
         let issued = state
             .identity
-            .issue_jwt_svid("orders-svc", API_GATEWAY, "orders-secret")
+            .issue_jwt_svid("orders-svc", INVENTORY, "orders-secret")
             .unwrap();
         let router = build_router(state);
 
@@ -1589,6 +1846,124 @@ workloads:
         let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
         assert_eq!(&bytes[..], b"hello from upstream");
         assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    // --- N10 fix (review 0002): delegation headers stripped before forward ---
+
+    /// A compromised or merely buggy client could set
+    /// `X-SPIFFE-Caller-Chain`/`X-SPIFFE-User-Principal` (and even
+    /// `X-SPIFFE-OBO-Token` itself) to anything it likes. Proves none of
+    /// those client-supplied values ever reach the backend verbatim, even
+    /// on an otherwise-allowed request.
+    #[tokio::test]
+    async fn delegation_headers_stripped_before_forward() {
+        let (upstream_addr, captured) = spawn_header_capturing_upstream().await;
+        let state = test_state(upstream_addr);
+        let issued = state
+            .identity
+            .issue_jwt_svid("orders-svc", INVENTORY, "orders-secret")
+            .unwrap();
+        let router = build_router(state);
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/some/path")
+            .header(HEADER_OBO_TOKEN, issued.token)
+            .header(HEADER_CALLER_CHAIN, "spiffe://chakra.internal/ns/forged/sa/forged")
+            .header(HEADER_USER_PRINCIPAL, "spiffe://chakra.internal/ns/forged/sa/forged-user")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), SC::OK);
+
+        let received = captured.lock().unwrap().take().expect("upstream should have been hit");
+        assert!(
+            !received.contains_key(HEADER_OBO_TOKEN),
+            "X-SPIFFE-OBO-Token must never reach the backend"
+        );
+        assert!(
+            !received.contains_key(HEADER_CALLER_CHAIN),
+            "X-SPIFFE-Caller-Chain must never reach the backend"
+        );
+        assert!(
+            !received.contains_key(HEADER_USER_PRINCIPAL),
+            "X-SPIFFE-User-Principal must never reach the backend"
+        );
+    }
+
+    /// The gateway's own verified identity for this request — not anything
+    /// the client sent — is what should show up on the upstream request,
+    /// under the gateway-owned `X-ZT-Verified-*` names.
+    #[tokio::test]
+    async fn verified_headers_added_after_strip() {
+        let (upstream_addr, captured) = spawn_header_capturing_upstream().await;
+        let state = test_state(upstream_addr);
+        let issued = state
+            .identity
+            .issue_jwt_svid("orders-svc", INVENTORY, "orders-secret")
+            .unwrap();
+        let router = build_router(state);
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/some/path")
+            .header(HEADER_OBO_TOKEN, issued.token)
+            .body(Body::empty())
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), SC::OK);
+
+        let received = captured.lock().unwrap().take().expect("upstream should have been hit");
+        let verified_user = received
+            .get(HEADER_VERIFIED_USER)
+            .expect("X-ZT-Verified-User should be set on an authenticated request")
+            .to_str()
+            .unwrap();
+        // `orders-svc` is the token's `current_actor` (no delegation chain
+        // here, so it's just `sub`) -- the verified immediate caller, which
+        // is what N10's gateway-owned header must carry.
+        assert_eq!(verified_user, ORDERS);
+
+        let verified_chain = received
+            .get(HEADER_VERIFIED_CHAIN)
+            .expect("X-ZT-Verified-Chain should be set on an authenticated request")
+            .to_str()
+            .unwrap();
+        assert_eq!(verified_chain, ORDERS);
+    }
+
+    /// `Authorization` is whatever bearer credential the *client* presented
+    /// to this gateway -- it's this gateway's to consume, never the
+    /// backend's to see or replay. Stripped by default, with no per-request
+    /// opt-out.
+    #[tokio::test]
+    async fn authorization_header_stripped_by_default() {
+        let (upstream_addr, captured) = spawn_header_capturing_upstream().await;
+        let state = test_state(upstream_addr);
+        let issued = state
+            .identity
+            .issue_jwt_svid("orders-svc", INVENTORY, "orders-secret")
+            .unwrap();
+        let router = build_router(state);
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/some/path")
+            .header(HEADER_OBO_TOKEN, issued.token)
+            .header("Authorization", "Bearer client-supplied-credential")
+            .body(Body::empty())
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), SC::OK);
+
+        let received = captured.lock().unwrap().take().expect("upstream should have been hit");
+        assert!(
+            !received.contains_key("authorization"),
+            "Authorization must never reach the backend by default"
+        );
     }
 
     #[tokio::test]
@@ -2364,6 +2739,7 @@ workloads:
 
         Router::new()
             .route("/v1/svid/jwt", post(issue_svid))
+            .route("/v1/svid/jwt-with-user", post(issue_svid_with_user))
             .route("/v1/svid/x509", post(issue_x509_svid))
             .route("/v1/authorize", post(authorize))
             .route("/v1/token-exchange", post(handle_token_exchange))
@@ -2414,30 +2790,11 @@ workloads:
         format!("00-{trace_id}-{span_id}-01")
     }
 
-    /// Spawns a real upstream that records the headers of the most recent
-    /// request it received (alongside returning 200 "ok"), so a test can
-    /// inspect what `forward_to_upstream` actually sent onward.
-    async fn spawn_header_capturing_upstream() -> (String, Arc<std::sync::Mutex<Option<HeaderMap>>>) {
-        let captured = Arc::new(std::sync::Mutex::new(None));
-        let captured_for_handler = captured.clone();
-
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-
-        let app = Router::new().fallback(move |headers: HeaderMap| {
-            let captured = captured_for_handler.clone();
-            async move {
-                *captured.lock().unwrap() = Some(headers);
-                (SC::OK, "ok")
-            }
-        });
-
-        tokio::spawn(async move {
-            axum::serve(listener, app).await.unwrap();
-        });
-
-        (format!("http://{addr}"), captured)
-    }
+    // Note: `spawn_header_capturing_upstream` is defined once, above, near
+    // the N10 header-stripping tests -- this duplicate definition (an
+    // artifact of two concurrent edits to this file both adding the same
+    // helper) was removed so the module compiles; both the N10 tests and
+    // the trace-propagation tests below share that single definition.
 
     #[tokio::test]
     async fn trace_context_is_propagated_onto_the_response_even_when_denied() {
@@ -2708,5 +3065,177 @@ workloads:
             2,
             "expected both hops to share one trace id, got {matching:?}"
         );
+    }
+
+    // --- Task 12: `obo.chain` in spans comes from the verified token, not
+    // the unsigned `X-SPIFFE-Caller-Chain` header (N11, review 0002) ---
+    //
+    // These exercise the `#[tracing::instrument]`-declared fields on
+    // `proxy_handler`'s own span (named "proxy_handler", default from the
+    // function name) -- a different span from the hand-rolled OTel
+    // "gateway_request" span the F12 tests above assert on via
+    // `test_span_exporter`/`record_obo_span_attributes`. Rather than bridge
+    // through `tracing-opentelemetry` (which would need its own
+    // `TracerProvider` wired as a `tracing_subscriber` layer), a minimal
+    // `Layer` captures whatever gets `Span::record`-ed onto the named span
+    // directly, keyed by field name.
+
+    use std::collections::HashMap;
+    use std::sync::Mutex as StdMutex;
+    use tracing::field::{Field, Visit};
+    use tracing::span::{Id as SpanId, Record as SpanRecord};
+    use tracing_subscriber::layer::Context as LayerContext;
+    use tracing_subscriber::registry::LookupSpan;
+
+    #[derive(Clone, Default)]
+    struct CapturedFields(Arc<StdMutex<HashMap<String, String>>>);
+
+    impl CapturedFields {
+        fn get(&self, key: &str) -> Option<String> {
+            self.0.lock().unwrap().get(key).cloned()
+        }
+    }
+
+    struct FieldVisitor<'a>(&'a CapturedFields);
+
+    impl<'a> Visit for FieldVisitor<'a> {
+        fn record_debug(&mut self, field: &Field, value: &dyn std::fmt::Debug) {
+            self.0 .0.lock().unwrap().insert(field.name().to_string(), format!("{value:?}"));
+        }
+
+        fn record_str(&mut self, field: &Field, value: &str) {
+            self.0 .0.lock().unwrap().insert(field.name().to_string(), value.to_string());
+        }
+    }
+
+    /// A minimal `tracing_subscriber::Layer` that captures every field
+    /// `Span::record`-ed onto the span named `span_name`, keyed by field
+    /// name -- just enough to assert on `proxy_handler`'s `obo.chain`/
+    /// `obo.chain_unverified` attributes without a real OTEL collector.
+    struct FieldCaptureLayer {
+        span_name: &'static str,
+        captured: CapturedFields,
+    }
+
+    impl<S> tracing_subscriber::Layer<S> for FieldCaptureLayer
+    where
+        S: tracing::Subscriber + for<'lookup> LookupSpan<'lookup>,
+    {
+        fn on_record(&self, id: &SpanId, values: &SpanRecord<'_>, ctx: LayerContext<'_, S>) {
+            if let Some(span_ref) = ctx.span(id) {
+                if span_ref.name() == self.span_name {
+                    values.record(&mut FieldVisitor(&self.captured));
+                }
+            }
+        }
+    }
+
+    /// Installs a `FieldCaptureLayer` as *this thread's* tracing
+    /// subscriber (via `tracing::subscriber::set_default`, not a process-
+    /// wide global) for the lifetime of the returned guard -- scoped per
+    /// test, so parallel `cargo test` runs (each on its own OS thread,
+    /// same as the rest of this suite) never interfere with each other.
+    fn capture_span_fields(span_name: &'static str) -> (CapturedFields, tracing::subscriber::DefaultGuard) {
+        let captured = CapturedFields::default();
+        let layer = FieldCaptureLayer {
+            span_name,
+            captured: captured.clone(),
+        };
+        let subscriber = tracing_subscriber::registry().with(layer);
+        let guard = tracing::subscriber::set_default(subscriber);
+        (captured, guard)
+    }
+
+    #[tokio::test]
+    async fn span_records_verified_chain() {
+        let (captured, _guard) = capture_span_fields("proxy_handler");
+        let (upstream_addr, hits) = spawn_test_upstream("hello from upstream").await;
+        let state = test_state(upstream_addr);
+        let issued = state
+            .identity
+            .issue_jwt_svid("orders-svc", INVENTORY, "orders-secret")
+            .unwrap();
+        let router = build_router(state);
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/some/path")
+            .header(HEADER_OBO_TOKEN, issued.token)
+            .body(Body::empty())
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), SC::OK);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        // No `act` claim on a freshly-issued token -> delegation_chain() is
+        // just [sub] -- the single verified hop.
+        assert_eq!(captured.get("obo.chain").as_deref(), Some(ORDERS));
+        // No unsigned X-SPIFFE-Caller-Chain header was sent at all.
+        assert_eq!(captured.get("obo.chain_unverified"), None);
+    }
+
+    #[tokio::test]
+    async fn span_records_unverified_header_separately() {
+        let (captured, _guard) = capture_span_fields("proxy_handler");
+        let (upstream_addr, hits) = spawn_test_upstream("hello from upstream").await;
+        let state = test_state(upstream_addr);
+        let issued = state
+            .identity
+            .issue_jwt_svid("orders-svc", INVENTORY, "orders-secret")
+            .unwrap();
+        let router = build_router(state);
+
+        // A backend between the caller and this gateway could set this
+        // unsigned header to anything -- here, a completely different
+        // (spoofed) chain from what the verified token actually says.
+        let spoofed_chain = "spiffe://chakra.internal/ns/evil/sa/evil-svc";
+        let request = Request::builder()
+            .method("GET")
+            .uri("/some/path")
+            .header(HEADER_OBO_TOKEN, issued.token)
+            .header(HEADER_CALLER_CHAIN, spoofed_chain)
+            .body(Body::empty())
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), SC::OK);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        // The verified chain (from the signed token) and the unverified
+        // header are recorded under distinct attributes, and the spoofed
+        // header never overwrites the verified value.
+        assert_eq!(captured.get("obo.chain").as_deref(), Some(ORDERS));
+        assert_eq!(captured.get("obo.chain_unverified").as_deref(), Some(spoofed_chain));
+        assert_ne!(captured.get("obo.chain"), captured.get("obo.chain_unverified"));
+    }
+
+    #[tokio::test]
+    async fn span_rejects_header_without_token() {
+        let (captured, _guard) = capture_span_fields("proxy_handler");
+        let (upstream_addr, hits) = spawn_test_upstream("should never be seen").await;
+        let state = test_state(upstream_addr);
+        let router = build_router(state);
+
+        // Only the unsigned header, no OBO token at all -> denied, and
+        // nothing verified for obo.chain to come from.
+        let spoofed_chain = "spiffe://chakra.internal/ns/evil/sa/evil-svc";
+        let request = Request::builder()
+            .method("GET")
+            .uri("/some/path")
+            .header(HEADER_CALLER_CHAIN, spoofed_chain)
+            .body(Body::empty())
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), SC::FORBIDDEN);
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+
+        // The unsigned header is still visible under its own clearly-
+        // unverified attribute (for troubleshooting)...
+        assert_eq!(captured.get("obo.chain_unverified").as_deref(), Some(spoofed_chain));
+        // ...but obo.chain itself was never recorded: the header alone,
+        // with no verified token behind it, is never trusted.
+        assert_eq!(captured.get("obo.chain"), None);
     }
 }

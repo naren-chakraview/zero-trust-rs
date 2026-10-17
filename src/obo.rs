@@ -52,7 +52,9 @@
 //! behalf" the request is made — and are never themselves checked against
 //! an allow-list.
 
-use crate::jwt::{JwtVerifier, OboClaims};
+use std::time::Duration;
+
+use crate::jwt::{CertBinding, JwtVerifier, OboClaims};
 use crate::registry::Registry;
 use crate::spiffe_id::SpiffeId;
 
@@ -104,6 +106,26 @@ pub fn current_actor(claims: &OboClaims) -> SpiffeId {
 ///
 /// [`GatewayConfig::clock_skew_tolerance_secs`]: crate::config::GatewayConfig::clock_skew_tolerance_secs
 pub const DEFAULT_CLOCK_SKEW_SECS: i64 = 60;
+
+/// RFC 8705 cert-binding match, shared by every call site that needs to
+/// compare a token's signed `cnf.x5t#S256` against whatever certificate was
+/// actually presented on the connection:
+/// [`validate_with_cert_binding_and_clock_skew`] (request-validation time)
+/// and, as of the N2 fix (review 0002), [`crate::token_exchange::exchange_token_with_cert_binding`]
+/// (exchange time) — so the two call sites can't drift on what "matches"
+/// means.
+///
+/// Returns `true` when `cnf` is absent (nothing to check — an unbound token
+/// matches any presented cert, or none at all) or present and its
+/// `x5t_s256` is exactly equal to `presented_thumbprint`. Fails closed: a
+/// bound token (`cnf: Some(_)`) with no presented certificate
+/// (`presented_thumbprint: None`) never matches.
+pub fn cert_binding_matches(cnf: Option<&CertBinding>, presented_thumbprint: Option<&str>) -> bool {
+    match cnf {
+        None => true,
+        Some(cnf) => presented_thumbprint.is_some_and(|thumb| thumb == cnf.x5t_s256),
+    }
+}
 
 /// Inputs to a single authorization decision. Mirrors the fields Envoy's
 /// `ext_authz` call would carry: who the request claims to be for
@@ -176,12 +198,39 @@ pub enum DenyReason {
     /// `iss` is **not** this — see the module doc on `validate` for the
     /// backward-compat rationale.
     IssuerInvalid,
-    /// Reserved for a future trusted-issuer registry check: `iss` is a
-    /// well-formed SPIFFE ID but isn't among the issuers this gateway
-    /// trusts. Not yet produced by `validate` — no such registry exists
-    /// yet — but the variant is added now so `DenyReason` and any
-    /// downstream exhaustive `match`/logging already account for it.
+    /// Task 13 (N12): `iss` is well-formed but isn't among the issuers this
+    /// gateway trusts (`GatewayConfig::trusted_issuers`) — or is missing
+    /// entirely, while a non-empty trusted-issuer list is configured. Never
+    /// produced by `validate`/`validate_with_clock_skew` themselves (which
+    /// have no trusted-issuer list to check against); only by
+    /// [`validate_with_issuer_and_replay_policy`].
     IssuerNotTrusted,
+    /// Task 13 (N12): the token's `jti` (JWT ID) was already presented
+    /// once before, within its replay-cache TTL — see
+    /// [`crate::registry::Registry::check_jti`]. Only produced by
+    /// [`validate_with_issuer_and_replay_policy`], and only when the
+    /// caller has opted into JTI replay detection
+    /// (`GatewayConfig::jti_cache_enabled`).
+    TokenReplayed,
+    /// Task 6 (N3, review 0002): at token-exchange time, the inbound
+    /// token's `aud` does not contain the exchanging gateway's protected
+    /// workload identity — i.e. this token was never addressed to this
+    /// gateway in the first place, so it has no business being exchanged
+    /// here. Only ever produced by
+    /// [`crate::token_exchange::exchange_token`]; `validate`/
+    /// `validate_with_clock_skew` already have their own, differently-named
+    /// equivalent ([`DenyReason::OboTokenInvalidAudience`]).
+    AudienceMismatch,
+    /// Task 6 (N3, review 0002): at token-exchange time, the inbound
+    /// token's signed delegation chain (`OboClaims::delegation_chain`) is
+    /// already as long as (or longer than) this gateway's configured
+    /// `max_obo_chain_depth` — exchanging it onward would let a chain grow
+    /// past the limit the destination's registry entry is supposed to
+    /// enforce. Only ever produced by
+    /// [`crate::token_exchange::exchange_token`]; `validate`/
+    /// `validate_with_clock_skew` already have their own, differently-named
+    /// equivalent ([`DenyReason::OboChainDepthExceeded`]).
+    ChainDepthExceeded,
 }
 
 impl DenyReason {
@@ -200,6 +249,9 @@ impl DenyReason {
             DenyReason::CertificateBindingMismatch => "certificate_binding_mismatch",
             DenyReason::IssuerInvalid => "issuer_invalid",
             DenyReason::IssuerNotTrusted => "issuer_not_trusted",
+            DenyReason::TokenReplayed => "token_replayed",
+            DenyReason::AudienceMismatch => "audience_mismatch",
+            DenyReason::ChainDepthExceeded => "chain_depth_exceeded",
         }
     }
 }
@@ -240,6 +292,54 @@ pub fn validate_with_clock_skew(
     now_unix_secs: i64,
     clock_skew_secs: i64,
 ) -> Decision {
+    validate_core(registry, verifier, request, now_unix_secs, clock_skew_secs, None)
+}
+
+/// Like [`validate_with_clock_skew`], but additionally treats the token's
+/// `user` claim as a trusted human principal -- not required to parse as a
+/// SPIFFE ID -- when the token's signed `iss` claim is named in
+/// `user_issuers`.
+///
+/// This is the N5 fix (review 0002): edge gateways mint tokens whose
+/// `user` claim carries a human principal string (e.g. `user@corp.internal`,
+/// see [`crate::LocalIssuer::issue_jwt_svid_with_user`]) with `iss` set to
+/// the trusted IdP that vouched for it. Without this entry point, such a
+/// token would be denied with [`DenyReason::InvalidUserPrincipal`] by
+/// [`validate`]/[`validate_with_clock_skew`], which still require every
+/// `user` claim to parse as a well-formed [`SpiffeId`].
+///
+/// A token whose `iss` is *not* present in `user_issuers` (including every
+/// token minted before this feature existed, which never carries an `iss`
+/// naming a human-principal IdP at all) falls through to exactly
+/// [`validate_with_clock_skew`]'s behavior -- this is what keeps every
+/// pre-N5, SPIFFE-ID-only `user` claim validating completely unchanged.
+/// `user` itself keeps its original meaning -- "on whose behalf" the
+/// request is made -- and, trusted issuer or not, is never itself checked
+/// against an allow-list.
+///
+/// [`GatewayConfig::user_issuers`]: crate::config::GatewayConfig::user_issuers
+pub fn validate_with_user_issuers(
+    registry: &Registry,
+    verifier: &JwtVerifier,
+    request: &ValidationRequest<'_>,
+    now_unix_secs: i64,
+    clock_skew_secs: i64,
+    user_issuers: &[String],
+) -> Decision {
+    validate_core(registry, verifier, request, now_unix_secs, clock_skew_secs, Some(user_issuers))
+}
+
+/// Shared implementation behind [`validate_with_clock_skew`] (`user_issuers:
+/// None`, preserving exact pre-N5 behavior) and
+/// [`validate_with_user_issuers`] (`user_issuers: Some(..)`, the N5 fix).
+fn validate_core(
+    registry: &Registry,
+    verifier: &JwtVerifier,
+    request: &ValidationRequest<'_>,
+    now_unix_secs: i64,
+    clock_skew_secs: i64,
+    user_issuers: Option<&[String]>,
+) -> Decision {
     let Some(destination_entry) = registry.get(request.destination) else {
         return Decision::Deny(DenyReason::UnknownDestination);
     };
@@ -278,25 +378,44 @@ pub fn validate_with_clock_skew(
         }
     }
 
+    // --- N5 fix (review 0002): a `user` claim whose token `iss` names a
+    // configured trusted user-issuer is a human principal, not a SPIFFE ID
+    // — see `validate_with_user_issuers`'s doc comment. This is computed
+    // once and reused by both the user-principal check and the `iss`
+    // check immediately below, since the N5 edge-mint token's `iss` is
+    // deliberately *not* `spiffe://`-shaped (it's the human's IdP, e.g.
+    // `auth.corp.internal`).
+    let iss_is_trusted_user_issuer = claims
+        .iss
+        .as_deref()
+        .zip(user_issuers)
+        .is_some_and(|(iss, trusted)| trusted.iter().any(|t| t == iss));
+
     // --- F2 fix: signed user principal, not the header -------------------
     // `request.caller_chain`'s unsigned sibling header
     // (`X-SPIFFE-User-Principal`) is never consulted here at all — only
     // the signed `user` claim, if the token carries one.
-    if let Some(user) = claims.extract_user_principal() {
-        if user.parse::<SpiffeId>().is_err() {
-            return Decision::Deny(DenyReason::InvalidUserPrincipal);
+    if !iss_is_trusted_user_issuer {
+        if let Some(user) = claims.extract_user_principal() {
+            if user.parse::<SpiffeId>().is_err() {
+                return Decision::Deny(DenyReason::InvalidUserPrincipal);
+            }
         }
     }
 
     // --- Task 2 / F15: issuer claim validation ---------------------------
     // A signed `iss` claim, if present, must be a well-formed SPIFFE ID
-    // (`spiffe://...`). A *missing* `iss` is explicitly allowed here for
-    // backward compatibility with tokens minted before this claim existed
-    // — tightening that (e.g. requiring `iss` and checking it against a
-    // trusted-issuer registry, which is what `DenyReason::IssuerNotTrusted`
-    // is reserved for) is left to a future task.
+    // (`spiffe://...`) *unless* it's a trusted user-issuer (N5 fix, just
+    // computed above) — a human IdP name is expected to never be
+    // `spiffe://`-shaped, and that's not a reason to deny on its own. A
+    // *missing* `iss` is, as before, explicitly allowed here for backward
+    // compatibility with tokens minted before this claim existed —
+    // tightening that further (e.g. requiring `iss` and checking it
+    // against a trusted-issuer registry, which is what
+    // `DenyReason::IssuerNotTrusted` is reserved for) is left to a future
+    // task.
     if let Some(iss) = &claims.iss {
-        if !iss.starts_with("spiffe://") {
+        if !iss.starts_with("spiffe://") && !iss_is_trusted_user_issuer {
             return Decision::Deny(DenyReason::IssuerInvalid);
         }
     }
@@ -417,16 +536,91 @@ pub fn validate_with_cert_binding_and_clock_skew(
 ) -> Decision {
     if let Some(token) = request.obo_token {
         if let Ok(claims) = verifier.verify_signature(token) {
-            if let Some(cnf) = &claims.cnf {
-                let cert_matches = peer_cert_thumbprint.is_some_and(|thumb| thumb == cnf.x5t_s256);
-                if !cert_matches {
-                    return Decision::Deny(DenyReason::CertificateBindingMismatch);
-                }
+            if !cert_binding_matches(claims.cnf.as_ref(), peer_cert_thumbprint) {
+                return Decision::Deny(DenyReason::CertificateBindingMismatch);
             }
         }
     }
 
     validate_with_clock_skew(registry, verifier, request, now_unix_secs, clock_skew_secs)
+}
+
+/// Like [`validate_with_clock_skew`], but additionally enforces a
+/// trusted-issuer allow-list and, optionally, JTI (JWT ID) replay detection
+/// (Task 13 / N12 fix, review 0002).
+///
+/// - `trusted_issuers`: when non-empty, the token's signed `iss` claim must
+///   exactly match one of these strings, or the request is denied with
+///   [`DenyReason::IssuerNotTrusted`] — including when `iss` is missing
+///   entirely. An **empty** `trusted_issuers` list disables this check
+///   completely (every `iss`, including none, passes), which is what keeps
+///   [`validate`]/[`validate_with_clock_skew`]'s existing,
+///   unparameterized behavior exactly as it was before this function
+///   existed — this is purely an opt-in addition.
+/// - `jti_cache_enabled`: when `true`, a present `jti` claim is checked
+///   against `registry`'s in-memory replay cache
+///   ([`crate::registry::Registry::check_jti`]) using `jti_ttl_secs` as the
+///   TTL. A `jti` already seen within that TTL is denied with
+///   [`DenyReason::TokenReplayed`], and otherwise is recorded as seen. A
+///   *missing* `jti` is never denied here, same as everywhere else in this
+///   module — only tokens minted to carry one can participate in replay
+///   detection at all. When `false` (the default), no replay check runs
+///   and `registry`'s cache is never touched by this call.
+///
+/// Every check [`validate_with_clock_skew`] performs runs first; this
+/// function's own checks only run once that decision is already `Allow`,
+/// so an otherwise-invalid token (expired, wrong audience, not
+/// allow-listed, ...) is still reported with its original, more specific
+/// `DenyReason`, never shadowed by an issuer/replay deny it would also have
+/// failed.
+pub fn validate_with_issuer_and_replay_policy(
+    registry: &Registry,
+    verifier: &JwtVerifier,
+    request: &ValidationRequest<'_>,
+    now_unix_secs: i64,
+    clock_skew_secs: i64,
+    trusted_issuers: &[String],
+    jti_cache_enabled: bool,
+    jti_ttl_secs: u64,
+) -> Decision {
+    let decision = validate_with_clock_skew(registry, verifier, request, now_unix_secs, clock_skew_secs);
+    if !decision.is_allow() {
+        return decision;
+    }
+
+    // No OBO token at all (the direct-call path): neither an issuer nor a
+    // jti exists to check.
+    let Some(token) = request.obo_token else {
+        return decision;
+    };
+    // `validate_with_clock_skew` already verified this signature
+    // successfully to reach `Allow` -- re-verifying here to read the
+    // claims again is the same pattern `validate_with_cert_binding_and_clock_skew`
+    // already uses, and keeps this function independent of any particular
+    // claims-threading refactor of the functions above it.
+    let Ok(claims) = verifier.verify_signature(token) else {
+        return decision; // unreachable in practice, see above
+    };
+
+    if !trusted_issuers.is_empty() {
+        let trusted = claims
+            .iss
+            .as_deref()
+            .is_some_and(|iss| trusted_issuers.iter().any(|t| t == iss));
+        if !trusted {
+            return Decision::Deny(DenyReason::IssuerNotTrusted);
+        }
+    }
+
+    if jti_cache_enabled {
+        if let Some(jti) = &claims.jti {
+            if registry.check_jti(jti, Duration::from_secs(jti_ttl_secs)).is_err() {
+                return Decision::Deny(DenyReason::TokenReplayed);
+            }
+        }
+    }
+
+    Decision::Allow
 }
 
 /// Convenience wrapper for long-lived call sites (a gateway holding one
@@ -1178,6 +1372,56 @@ workloads:
         assert_eq!(
             DenyReason::CertificateBindingMismatch.as_str(),
             "certificate_binding_mismatch"
+        );
+    }
+
+    // --- Trusted issuer + JTI replay detection (Task 13 / N12) ---
+
+    fn mint_token_with_iss_and_jti(signer: &JwtSigner, sub: &str, aud: &[&str], iss: Option<&str>, jti: Option<&str>) -> String {
+        let claims = OboClaims {
+            sub: sub.to_string(),
+            aud: aud.iter().map(|s| s.to_string()).collect(),
+            user: None,
+            act: None,
+            iat: 0,
+            exp: 300,
+            nbf: None,
+            jti: jti.map(|s| s.to_string()),
+            cnf: None,
+            iss: iss.map(|s| s.to_string()),
+        };
+        signer.sign(&claims).unwrap()
+    }
+
+    #[test]
+    fn issuer_not_trusted_deny_reason_has_a_populated_string() {
+        assert_eq!(DenyReason::IssuerNotTrusted.as_str(), "issuer_not_trusted");
+        assert_ne!(Decision::Deny(DenyReason::IssuerNotTrusted).deny_reason_str(), "none");
+    }
+
+    #[test]
+    fn token_replayed_deny_reason_has_a_populated_string() {
+        assert_eq!(DenyReason::TokenReplayed.as_str(), "token_replayed");
+        assert_ne!(Decision::Deny(DenyReason::TokenReplayed).deny_reason_str(), "none");
+    }
+
+    #[test]
+    fn empty_trusted_issuers_list_disables_the_issuer_check() {
+        let registry = test_registry();
+        let (signer, verifier) = test_keys();
+        let destination = id(INVENTORY);
+        let token = mint_token_with_iss_and_jti(&signer, ORDERS, &[INVENTORY], Some("spiffe://untrusted.example"), None);
+
+        let request = ValidationRequest {
+            destination: &destination,
+            source_principal: None,
+            obo_token: Some(&token),
+            caller_chain: None,
+        };
+
+        assert_eq!(
+            validate_with_issuer_and_replay_policy(&registry, &verifier, &request, 0, 60, &[], false, 3600),
+            Decision::Allow
         );
     }
 }

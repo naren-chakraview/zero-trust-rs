@@ -84,6 +84,14 @@ pub enum IdentityError {
     /// up from and why.
     #[error("SPIRE workload API error: {0}")]
     Spire(String),
+
+    /// N5 fix (review 0002): [`crate::LocalIssuer::issue_jwt_svid_with_user`]
+    /// refuses to mint a token vouching for a human principal from an IdP
+    /// that isn't named in the deployment's configured
+    /// `GatewayConfig::user_issuers` -- this gateway never signs a `user`
+    /// claim on behalf of an issuer it hasn't been told to trust.
+    #[error("untrusted user issuer: {0}")]
+    UntrustedUserIssuer(String),
 }
 
 /// Errors from loading a [`crate::config::GatewayConfig`].

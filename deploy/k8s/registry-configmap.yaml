@@ -2,6 +2,22 @@
 # zt-gateway instances below. Bootstrap tokens in plaintext are fine for a
 # local kind demo; not for anything real (see README's v0.1 identity
 # limitations).
+#
+# Task 7 (F16) addition: the `client` workload entry and the `client`
+# SPIFFE ID in each of the other three entries' `allowed_callers`. This is
+# required for scripts/demo-obo-chain.sh's *real* `/v1/token-exchange`
+# chain to authorize at all: `token_exchange::exchange_token` preserves
+# `sub` unchanged across every hop (see its doc comment), so
+# `obo::validate`'s final "is the caller allowed" check at every one of
+# api-gateway / orders-svc / inventory-svc is always evaluated against the
+# *originating* `client` identity, never the immediate calling gateway's
+# own identity. Without `client` registered here (and allow-listed
+# everywhere), the real chain is denied at hop 1 (api-gateway's
+# `allowed_callers` was empty) -- see docs/demo-obo-chain.md's "Known
+# limitations" section. The pre-existing `api-gateway`/`orders-svc`
+# entries in `inventory-svc`/`orders-svc`'s `allowed_callers` are left in
+# place (harmless; only load-bearing for the old synthetic-header-chain
+# demo this task replaces).
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -12,12 +28,21 @@ data:
     trust_domain: chakra.internal
 
     workloads:
+      - name: client
+        spiffe_id: spiffe://chakra.internal/ns/client/sa/client
+        namespace: client
+        service_account: client
+        max_obo_chain_depth: 0
+        allowed_callers: []
+        bootstrap_token: client-dev-secret
+
       - name: api-gateway
         spiffe_id: spiffe://chakra.internal/ns/api-gateway/sa/api-gateway
         namespace: api-gateway
         service_account: api-gateway
         max_obo_chain_depth: 1
-        allowed_callers: []
+        allowed_callers:
+          - spiffe://chakra.internal/ns/client/sa/client
         bootstrap_token: api-gateway-dev-secret
 
       - name: orders-svc
@@ -26,6 +51,7 @@ data:
         service_account: orders-svc
         max_obo_chain_depth: 3
         allowed_callers:
+          - spiffe://chakra.internal/ns/client/sa/client
           - spiffe://chakra.internal/ns/api-gateway/sa/api-gateway
         bootstrap_token: orders-dev-secret
 
@@ -35,6 +61,7 @@ data:
         service_account: inventory-svc
         max_obo_chain_depth: 3
         allowed_callers:
+          - spiffe://chakra.internal/ns/client/sa/client
           - spiffe://chakra.internal/ns/orders/sa/orders-svc
           - spiffe://chakra.internal/ns/api-gateway/sa/api-gateway
         bootstrap_token: inventory-dev-secret

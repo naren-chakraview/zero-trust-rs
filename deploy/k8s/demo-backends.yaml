@@ -1,0 +1,147 @@
+# Task 7 (F16): three standalone "leaf" backends for the real
+# `/v1/token-exchange` three-hop demo (scripts/demo-obo-chain.sh,
+# docs/demo-obo-chain.md).
+#
+# These are deliberately *not* the same thing as the `backend` sidecar
+# container already baked into each of api-gateway.yaml / orders-svc.yaml
+# / inventory-svc.yaml (the "hello from <workload>" http-echo each
+# zt-gateway instance already proxies to via `upstream_addr:
+# http://127.0.0.1:8080`) -- this task's brief explicitly asks for three
+# *new*, independently named backend-a/b/c Deployments+Services, so that's
+# what this file provides.
+#
+# IMPORTANT caveat, documented in full in docs/demo-obo-chain.md's "Known
+# limitations" section: none of api-gateway/orders-svc/inventory-svc's
+# `routes:` config (F14, src/config.rs's `GatewayConfig::routes`) points at
+# these Services today -- wiring that up would mean editing those three
+# gateways' ConfigMaps, which is out of this task's scope ("no code
+# changes to gateway", and those files are the already-deployed gateway
+# trio this task was told to use as-is, not recreate). So today,
+# scripts/demo-obo-chain.sh's three gateway hops still land on each
+# gateway's existing embedded sidecar backend, and this file's
+# backend-a/b/c are reachable standalone (directly, or once `routes:` is
+# wired up to point at them) -- the demo script curls them directly, in a
+# clearly separate step, purely to prove they're deployed and
+# distinguishable, not as part of the authorized OBO chain itself.
+#
+# Image/port/text choice per the brief: hashicorp/http-echo:latest,
+# listening on :8080, one distinct -text string per backend so a response
+# body alone tells you which one answered.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend-a
+  namespace: zero-trust-demo
+  labels:
+    app: backend-a
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: backend-a
+  template:
+    metadata:
+      labels:
+        app: backend-a
+    spec:
+      containers:
+        - name: http-echo
+          image: hashicorp/http-echo:latest
+          args:
+            - -listen=:8080
+            - -text=response from backend-a
+          ports:
+            - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend-a
+  namespace: zero-trust-demo
+spec:
+  selector:
+    app: backend-a
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend-b
+  namespace: zero-trust-demo
+  labels:
+    app: backend-b
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: backend-b
+  template:
+    metadata:
+      labels:
+        app: backend-b
+    spec:
+      containers:
+        - name: http-echo
+          image: hashicorp/http-echo:latest
+          args:
+            - -listen=:8080
+            - -text=response from backend-b
+          ports:
+            - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend-b
+  namespace: zero-trust-demo
+spec:
+  selector:
+    app: backend-b
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080
+
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend-c
+  namespace: zero-trust-demo
+  labels:
+    app: backend-c
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: backend-c
+  template:
+    metadata:
+      labels:
+        app: backend-c
+    spec:
+      containers:
+        - name: http-echo
+          image: hashicorp/http-echo:latest
+          args:
+            - -listen=:8080
+            - -text=response from backend-c
+          ports:
+            - containerPort: 8080
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend-c
+  namespace: zero-trust-demo
+spec:
+  selector:
+    app: backend-c
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080

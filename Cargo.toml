@@ -46,3 +46,9 @@ uuid = { version = "1.0", features = ["v4"] }
 # F12 tests: `InMemorySpanExporter`, for asserting on recorded span
 # attributes/status without a real OTLP collector.
 opentelemetry_sdk = { version = "0.27", features = ["testing"] }
+# F17: criterion benchmarks for the token-validation pipeline.
+criterion = { version = "0.5", features = ["html_reports"] }
+
+[[bench]]
+name = "gateway_benches"
+harness = false

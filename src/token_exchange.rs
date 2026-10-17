@@ -121,6 +121,7 @@ pub fn exchange_token(
         nbf: Some(now_secs),
         jti: Some(generate_jti()),
         cnf: inbound_claims.cnf.clone(),
+        iss: inbound_claims.iss.clone(),
     };
 
     let new_token = issuer
@@ -227,6 +228,7 @@ workloads:
             nbf: None,
             jti: Some("jti-1".into()),
             cnf: None,
+            iss: None,
         };
         let initial_token = issuer.sign_claims(&initial_claims).unwrap();
 
@@ -310,6 +312,7 @@ workloads:
             nbf: None,
             jti: Some("jti-0".into()),
             cnf: None,
+            iss: None,
         };
         let token_for_a = gw_a.sign_claims(&initial_claims).unwrap();
 
@@ -379,6 +382,7 @@ workloads:
             cnf: Some(CertBinding {
                 x5t_s256: "thumbprint".to_string(),
             }),
+            iss: None,
         };
         let token = issuer.sign_claims(&claims).unwrap();
 
@@ -416,6 +420,7 @@ workloads:
             nbf: None,
             jti: None,
             cnf: None,
+            iss: None,
         };
         let expired_token = issuer.sign_claims(&expired_claims).unwrap();
 
@@ -446,6 +451,7 @@ workloads:
             nbf: None,
             jti: None,
             cnf: None,
+            iss: None,
         };
         let token = issuer.sign_claims(&claims).unwrap();
 
@@ -477,6 +483,7 @@ workloads:
             nbf: None,
             jti: None,
             cnf: None,
+            iss: None,
         };
         // Signed by a *different* issuer's key than the one we try to
         // verify with below — same shape as a tampered/forged token.
@@ -525,6 +532,7 @@ workloads:
             nbf: None,
             jti: None,
             cnf: None,
+            iss: None,
         };
         let token = issuer.sign_claims(&claims).unwrap();
 

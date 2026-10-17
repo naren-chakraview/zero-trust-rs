@@ -2530,6 +2530,7 @@ workloads:
             nbf: None,
             jti: None,
             cnf: None,
+            iss: None,
         };
         let token = signer.sign(&claims).unwrap();
         state.identity = Arc::new(LocalIssuer::new(registry, signer, verifier, 300));

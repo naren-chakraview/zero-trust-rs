@@ -101,6 +101,17 @@ pub enum DenyReason {
     /// produced by [`validate_with_cert_binding`]; `validate` itself never
     /// looks at certificate binding.
     CertificateBindingMismatch,
+    /// Task 2 (F15): the token carries a signed `iss` claim, but it isn't a
+    /// well-formed SPIFFE ID (doesn't start with `spiffe://`). A *missing*
+    /// `iss` is **not** this — see the module doc on `validate` for the
+    /// backward-compat rationale.
+    IssuerInvalid,
+    /// Reserved for a future trusted-issuer registry check: `iss` is a
+    /// well-formed SPIFFE ID but isn't among the issuers this gateway
+    /// trusts. Not yet produced by `validate` — no such registry exists
+    /// yet — but the variant is added now so `DenyReason` and any
+    /// downstream exhaustive `match`/logging already account for it.
+    IssuerNotTrusted,
 }
 
 impl DenyReason {
@@ -117,6 +128,8 @@ impl DenyReason {
             DenyReason::InvalidUserPrincipal => "invalid_user_principal",
             DenyReason::OboTokenNotYetValid => "obo_token_not_yet_valid",
             DenyReason::CertificateBindingMismatch => "certificate_binding_mismatch",
+            DenyReason::IssuerInvalid => "issuer_invalid",
+            DenyReason::IssuerNotTrusted => "issuer_not_trusted",
         }
     }
 }
@@ -178,6 +191,19 @@ pub fn validate(
     if let Some(user) = claims.extract_user_principal() {
         if user.parse::<SpiffeId>().is_err() {
             return Decision::Deny(DenyReason::InvalidUserPrincipal);
+        }
+    }
+
+    // --- Task 2 / F15: issuer claim validation ---------------------------
+    // A signed `iss` claim, if present, must be a well-formed SPIFFE ID
+    // (`spiffe://...`). A *missing* `iss` is explicitly allowed here for
+    // backward compatibility with tokens minted before this claim existed
+    // — tightening that (e.g. requiring `iss` and checking it against a
+    // trusted-issuer registry, which is what `DenyReason::IssuerNotTrusted`
+    // is reserved for) is left to a future task.
+    if let Some(iss) = &claims.iss {
+        if !iss.starts_with("spiffe://") {
+            return Decision::Deny(DenyReason::IssuerInvalid);
         }
     }
 
@@ -346,6 +372,7 @@ workloads:
             nbf: None,
             jti: None,
             cnf: None,
+            iss: None,
         };
         signer.sign(&claims).unwrap()
     }
@@ -423,6 +450,7 @@ workloads:
             nbf: None,
             jti: None,
             cnf: None,
+            iss: None,
         };
         let token = signer.sign(&claims).unwrap();
 
@@ -472,6 +500,7 @@ workloads:
             nbf: None,
             jti: None,
             cnf: None,
+            iss: None,
         };
         let token = signer.sign(&claims).unwrap();
 
@@ -507,6 +536,7 @@ workloads:
             nbf: None,
             jti: None,
             cnf: None,
+            iss: None,
         };
         let token = signer.sign(&claims).unwrap();
 
@@ -539,6 +569,7 @@ workloads:
             nbf: None,
             jti: None,
             cnf: None,
+            iss: None,
         };
         let token = signer.sign(&claims).unwrap();
 
@@ -571,6 +602,7 @@ workloads:
             nbf: None,
             jti: None,
             cnf: None,
+            iss: None,
         };
         let token = signer.sign(&claims).unwrap();
 
@@ -607,6 +639,7 @@ workloads:
             nbf: None,
             jti: None,
             cnf: None,
+            iss: None,
         };
         let token = signer.sign(&claims).unwrap();
 
@@ -650,6 +683,7 @@ workloads:
             nbf: Some(1_000), // far beyond the 30s clock-skew allowance at now=0
             jti: None,
             cnf: None,
+            iss: None,
         };
         claims.exp = 2_000;
         let token = signer.sign(&claims).unwrap();
@@ -682,6 +716,7 @@ workloads:
             nbf: Some(20), // within the 30s clock-skew allowance at now=0
             jti: None,
             cnf: None,
+            iss: None,
         };
         let token = signer.sign(&claims).unwrap();
 
@@ -864,6 +899,7 @@ workloads:
             cnf: Some(CertBinding {
                 x5t_s256: cert_thumbprint.to_string(),
             }),
+            iss: None,
         };
         signer.sign(&claims).unwrap()
     }
@@ -977,6 +1013,7 @@ workloads:
             cnf: Some(CertBinding {
                 x5t_s256: "cert-a-thumbprint".to_string(),
             }),
+            iss: None,
         };
         let token = signer.sign(&claims).unwrap();
 

@@ -64,6 +64,12 @@ pub struct OboClaims {
     /// validation.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cnf: Option<CertBinding>,
+    /// Issuer claim (Task 2/F15): identifies who minted this token, as a
+    /// SPIFFE ID (e.g. `spiffe://chakra.internal`). `None` for old tokens
+    /// minted before this claim existed — `obo::validate` treats a missing
+    /// `iss` as backward-compatible, not as a deny.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub iss: Option<String>,
 }
 
 impl OboClaims {
@@ -259,6 +265,7 @@ mod tests {
             nbf: None,
             jti: None,
             cnf: None,
+            iss: None,
         }
     }
 

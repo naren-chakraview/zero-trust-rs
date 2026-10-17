@@ -241,6 +241,7 @@ impl LocalIssuer {
             cnf: Some(CertBinding {
                 x5t_s256: cert_thumbprint.to_string(),
             }),
+            iss: Some(format!("spiffe://{}", self.registry.trust_domain())),
         };
 
         let token = self.signer.sign(&claims)?;
@@ -279,6 +280,7 @@ impl IdentityProvider for LocalIssuer {
             nbf: None,
             jti: None,
             cnf: None,
+            iss: Some(format!("spiffe://{}", self.registry.trust_domain())),
         };
 
         let token = self.signer.sign(&claims)?;
@@ -547,6 +549,7 @@ workloads:
             nbf: None,
             jti: None,
             cnf: None,
+            iss: None,
         };
         let rogue_token = rogue_signer.sign(&claims).unwrap();
 

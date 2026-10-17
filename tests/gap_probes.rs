@@ -182,6 +182,7 @@ fn f1_signed_chain_depth_enforced_header_has_no_effect() {
         nbf: None,
         jti: None,
         cnf: None,
+        iss: None,
     };
     let token = signer.sign(&claims).unwrap();
 
@@ -229,6 +230,7 @@ fn f1_chain_entries_must_be_valid_spiffe_ids() {
         nbf: None,
         jti: None,
         cnf: None,
+        iss: None,
     };
     let token = signer.sign(&claims).unwrap();
 
@@ -265,6 +267,7 @@ fn f2_user_principal_is_signed_and_validated() {
         nbf: None,
         jti: None,
         cnf: None,
+        iss: None,
     };
     let good_token = signer.sign(&good_claims).unwrap();
     let good_request = ValidationRequest {

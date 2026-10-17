@@ -497,3 +497,183 @@ fn three_hop_chain_has_the_latest_hop_as_the_outermost_act() {
         ]
     );
 }
+
+// --- Task 2 (N1): authorize the current actor, not the originator ----------
+//
+// Review 0002 finding N1: `obo::validate` used to check the delegation
+// chain's *originator* (`sub`) against a destination's allow-list and
+// against the transport-verified mTLS peer. That's wrong once a token has
+// been exchanged more than once — `sub` never moves, so the originator
+// (e.g. api-gateway) would stay allow-listed at every hop even though the
+// workload actually presenting the token (e.g. orders) is a different
+// identity entirely. These tests build the same two-hop chain the N4 test
+// above exercises (api-gateway -> orders), then prove `validate` now
+// authorizes `orders` (the current actor, i.e. the outermost `act.sub`) —
+// not `api-gateway` (`sub`, the originator) — both via the allow-list and
+// via the mTLS peer check.
+
+const N1_ORDERS: &str = "spiffe://chakra.internal/ns/orders/sa/orders-svc";
+const N1_API_GATEWAY: &str = "spiffe://chakra.internal/ns/api-gateway/sa/api-gateway";
+const N1_INVENTORY: &str = "spiffe://chakra.internal/ns/inventory/sa/inventory-svc";
+
+/// Builds a registry for `inventory-svc` with exactly one SPIFFE ID in its
+/// `allowed_callers`, so each test can independently check "orders allowed,
+/// api-gateway allowed" by constructing a fresh registry per case.
+fn n1_registry_allowing(allowed: &str) -> Registry {
+    Registry::from_yaml_str(&format!(
+        r#"
+trust_domain: chakra.internal
+workloads:
+  - name: inventory-svc
+    spiffe_id: {N1_INVENTORY}
+    max_obo_chain_depth: 5
+    allowed_callers:
+      - {allowed}
+"#
+    ))
+    .unwrap()
+}
+
+/// Mints a token with `sub = api-gateway` (the originator) and a single
+/// `act` hop recording `orders` as the current actor — i.e. the token
+/// api-gateway produced, then exchanged to orders, exactly as
+/// `exchange_token` would leave it: `sub` stays at the originator, and
+/// `act.sub` is the current (most recent) actor.
+fn n1_two_hop_token(signer: &JwtSigner) -> String {
+    let claims = OboClaims {
+        sub: N1_API_GATEWAY.to_string(),
+        aud: vec![N1_INVENTORY.to_string()],
+        user: None,
+        act: Some(Box::new(ActClaim {
+            sub: N1_ORDERS.to_string(),
+            act: None,
+        })),
+        iat: 0,
+        exp: 300,
+        nbf: None,
+        jti: None,
+        cnf: None,
+        iss: None,
+    };
+    signer.sign(&claims).unwrap()
+}
+
+/// 1. Allow-list check: a two-hop chain (api-gateway -> orders) must be
+///    authorized against `orders` (the current actor), not `api-gateway`
+///    (the originator).
+#[test]
+fn two_hop_chain_allow_list_checks_current_actor() {
+    let (signer, verifier) = test_keys();
+    let destination: SpiffeId = N1_INVENTORY.parse().unwrap();
+    let token = n1_two_hop_token(&signer);
+
+    // Allow-listing the current actor (orders) -- PASS.
+    let registry_orders = n1_registry_allowing(N1_ORDERS);
+    let request = ValidationRequest {
+        destination: &destination,
+        source_principal: None,
+        obo_token: Some(&token),
+        caller_chain: None,
+    };
+    assert_eq!(
+        validate(&registry_orders, &verifier, &request, 0),
+        Decision::Allow,
+        "current actor (orders) must be allow-listed, not the originator"
+    );
+
+    // Allow-listing only the originator (api-gateway), not the current
+    // actor -- FAIL. Under the pre-N1 behavior this would have been
+    // Decision::Allow (checking `sub`); after the fix it must deny.
+    let registry_gateway = n1_registry_allowing(N1_API_GATEWAY);
+    assert_eq!(
+        validate(&registry_gateway, &verifier, &request, 0),
+        Decision::Deny(DenyReason::CallerNotInAllowList),
+        "originator (api-gateway) alone in the allow-list must no longer be sufficient"
+    );
+}
+
+/// 2. mTLS peer check: the transport-verified peer must match the current
+///    actor (orders), not the token's `sub` (api-gateway).
+#[test]
+fn mtls_cert_checked_against_current_actor() {
+    let (signer, verifier) = test_keys();
+    let destination: SpiffeId = N1_INVENTORY.parse().unwrap();
+    let token = n1_two_hop_token(&signer);
+    // Allow-list both, so the only thing distinguishing the two assertions
+    // below is the no-impersonation (mTLS peer) check, not the allow-list.
+    let registry = Registry::from_yaml_str(&format!(
+        r#"
+trust_domain: chakra.internal
+workloads:
+  - name: inventory-svc
+    spiffe_id: {N1_INVENTORY}
+    max_obo_chain_depth: 5
+    allowed_callers:
+      - {N1_ORDERS}
+      - {N1_API_GATEWAY}
+"#
+    ))
+    .unwrap();
+
+    // Presented mTLS cert matches the current actor (orders) -- PASS.
+    let orders_peer: SpiffeId = N1_ORDERS.parse().unwrap();
+    let request_orders = ValidationRequest {
+        destination: &destination,
+        source_principal: Some(&orders_peer),
+        obo_token: Some(&token),
+        caller_chain: None,
+    };
+    assert_eq!(
+        validate(&registry, &verifier, &request_orders, 0),
+        Decision::Allow,
+        "mTLS peer matching the current actor (orders) must be allowed"
+    );
+
+    // Presented mTLS cert matches `sub` (api-gateway, the originator), not
+    // the current actor -- FAIL.
+    let gateway_peer: SpiffeId = N1_API_GATEWAY.parse().unwrap();
+    let request_gateway = ValidationRequest {
+        destination: &destination,
+        source_principal: Some(&gateway_peer),
+        obo_token: Some(&token),
+        caller_chain: None,
+    };
+    assert_eq!(
+        validate(&registry, &verifier, &request_gateway, 0),
+        Decision::Deny(DenyReason::OboTokenSubjectMismatch),
+        "mTLS peer matching only the originator (sub), not the current actor, must be denied"
+    );
+}
+
+/// 3. `current_actor` itself: single-hop (no delegation) returns `sub`
+///    unchanged -- behavior for non-delegated tokens is untouched by N1.
+#[test]
+fn current_actor_defaults_to_sub_with_no_delegation() {
+    let claims = OboClaims {
+        sub: N1_ORDERS.to_string(),
+        aud: vec![N1_INVENTORY.to_string()],
+        user: None,
+        act: None,
+        iat: 0,
+        exp: 300,
+        nbf: None,
+        jti: None,
+        cnf: None,
+        iss: None,
+    };
+    assert_eq!(current_actor(&claims).to_string(), N1_ORDERS);
+}
+
+/// 4. `current_actor` on a two-hop chain returns the outermost `act.sub`
+///    (orders), never `sub` (api-gateway).
+#[test]
+fn current_actor_returns_outermost_act_sub_when_present() {
+    let (signer, verifier) = test_keys();
+    let token = n1_two_hop_token(&signer);
+    let claims = verifier.verify_signature(&token).unwrap();
+
+    assert_eq!(current_actor(&claims).to_string(), N1_ORDERS);
+    assert_ne!(current_actor(&claims).to_string(), N1_API_GATEWAY);
+    // `sub` itself is unchanged -- still the originator.
+    assert_eq!(claims.sub, N1_API_GATEWAY);
+}

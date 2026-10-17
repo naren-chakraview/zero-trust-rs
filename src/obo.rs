@@ -7,8 +7,9 @@
 //! and `identity/obo-token-policy.rego`, package `chakra.identity.obo`).
 //! Where they differ, this module follows `validate-obo-chain.rego` — the
 //! one actually wired into the runtime `ext_authz` path — including its
-//! "no impersonation" check (the OBO token's `sub` must match an
-//! independently-verified `source_principal`, when one is available).
+//! "no impersonation" check (the OBO token's *current actor* — see the N1
+//! fix below — must match an independently-verified `source_principal`,
+//! when one is available).
 //!
 //! Deliberate additions with no Rego equivalent:
 //! - [`DenyReason::UnknownDestination`]: Rego's `data.spiffe_registry[dest]`
@@ -30,10 +31,68 @@
 //! `OboClaims::extract_user_principal`, from Task 3). `request.caller_chain`
 //! remains on [`ValidationRequest`] only for callers that want to log or
 //! trace the raw header value — `validate` never reads it.
+//!
+//! ## N1 fix (review 0002)
+//!
+//! `validate` used to authorize the delegation chain's *originator*
+//! (`claims.sub`) against the destination's allow-list and against the
+//! transport-verified peer. That's wrong for a multi-hop chain: `sub`
+//! never moves across a token exchange, so after two hops (say,
+//! api-gateway -> orders -> inventory) the token presented to inventory
+//! still carries `sub = api-gateway`, even though orders is the workload
+//! actually calling inventory. Checking `sub` meant inventory's allow-list
+//! had to name api-gateway (the originator) rather than orders (its real,
+//! immediate caller) — any hop could borrow the originator's standing
+//! simply by forwarding its token onward.
+//!
+//! `validate` now computes [`current_actor`] (the outermost `act.sub`, or
+//! `sub` itself when there's no delegation) and checks *that* identity
+//! against both the allow-list and `source_principal` instead.
+//! `claims.sub`/`claims.user` keep their original meaning — "on whose
+//! behalf" the request is made — and are never themselves checked against
+//! an allow-list.
 
-use crate::jwt::JwtVerifier;
+use crate::jwt::{JwtVerifier, OboClaims};
 use crate::registry::Registry;
 use crate::spiffe_id::SpiffeId;
+
+/// N1 fix (review 0002): the workload *currently* exercising delegated
+/// authority — the outermost `act.sub` on `claims` (the most recent hop to
+/// act, per RFC 8693 §4.1 and [`crate::token_exchange::exchange_token`]'s
+/// newest-first nesting, Task 1 / N4), or `claims.sub` itself when there is
+/// no `act` claim at all (no delegation has happened, so the originator
+/// *is* the current actor).
+///
+/// This is deliberately different from `claims.sub`, which never moves
+/// across a delegation chain — it always names the party that *started*
+/// the chain, not the party presenting the token at this hop. Authorizing
+/// against `sub` lets every downstream hop skip its own allow-list check by
+/// hiding behind the originator's identity; authorizing against
+/// `current_actor` instead means each hop must itself be allow-listed by
+/// the destination it's calling.
+///
+/// Example: after two exchanges (api-gateway -> orders -> inventory), the
+/// token's `sub` is still api-gateway (the originator) but
+/// `current_actor()` is orders (the immediate caller presenting the token
+/// to inventory) — `orders`, not `api-gateway`, is what inventory's
+/// allow-list must name.
+///
+/// # Panics
+///
+/// Panics if the outermost chain entry (or `sub`, when there's no `act`
+/// claim) isn't a well-formed SPIFFE ID. Every caller in this module calls
+/// this only after [`validate_with_clock_skew`]'s chain-entry check (the F1
+/// fix) has already confirmed every hop in `claims.delegation_chain()`
+/// parses as a [`SpiffeId`], so that can't happen on any path reachable
+/// through `validate`/`validate_with_clock_skew`.
+pub fn current_actor(claims: &OboClaims) -> SpiffeId {
+    let chain = claims.delegation_chain();
+    chain
+        .last()
+        .expect("delegation_chain() always returns at least [sub]")
+        .parse::<SpiffeId>()
+        .expect("chain entries must already be validated as well-formed SpiffeIds before calling current_actor")
+}
 
 /// Default `nbf` clock-skew allowance (seconds) used by [`validate`] and
 /// [`validate_with_cert_binding`] — the two call sites that don't take an
@@ -271,20 +330,29 @@ pub fn validate_with_clock_skew(
         return Decision::Deny(DenyReason::OboTokenInvalidAudience);
     }
 
+    // --- N1 fix (review 0002): authorize the CURRENT actor, not the
+    // originator. `claims.sub`/`claims.user` remain "on whose behalf" this
+    // request is made (never checked against the allow-list below) --
+    // `current_actor` is the party actually presenting this token at this
+    // hop, and it's that identity the destination's allow-list and
+    // transport-verified peer must agree with. See `current_actor`'s doc
+    // comment for why: `sub` never moves across a delegation chain, so
+    // checking it here would authorize the chain's originator at every
+    // hop instead of the immediate caller.
+    let actor = current_actor(&claims);
+
     // No-impersonation check: when the transport layer independently
-    // verified a peer identity, the OBO token's subject must match it.
+    // verified a peer identity, the current actor must match it.
     if let Some(source) = request.source_principal {
-        if claims.sub != source.to_string() {
+        if &actor != source {
             return Decision::Deny(DenyReason::OboTokenSubjectMismatch);
         }
     }
 
-    match claims.sub.parse::<SpiffeId>() {
-        Ok(sub_id) if destination_entry.allowed_callers.contains(&sub_id) => Decision::Allow,
-        // Unreachable in practice: an unparseable `sub` is already caught
-        // by the chain-entry check above (`sub` is `chain[0]`). Kept as a
-        // fail-closed fallback rather than an `unreachable!()`.
-        _ => Decision::Deny(DenyReason::CallerNotInAllowList),
+    if destination_entry.allowed_callers.contains(&actor) {
+        Decision::Allow
+    } else {
+        Decision::Deny(DenyReason::CallerNotInAllowList)
     }
 }
 

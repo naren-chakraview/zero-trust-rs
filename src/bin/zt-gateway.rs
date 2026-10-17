@@ -42,11 +42,11 @@ use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
 use zero_trust::{
-    build_client_cert_verifier, build_server_config, compute_cert_thumbprint_x5t_s256, exchange_token, load_certs,
-    now_unix_secs, validate_with_cert_binding_and_clock_skew, CaError, CertificateAuthority, ClientAuth, Decision,
-    GatewayConfig, IdentityError, IdentityProvider, LocalCa, LocalIssuer, Registry, RouteTable, ServerCertificate,
-    SpiffeId, SpireProvider, TokenExchangeError, TokenExchangeRequest, TokenExchangeResponse, ValidationRequest,
-    HEADER_CALLER_CHAIN, HEADER_OBO_TOKEN, HEADER_USER_PRINCIPAL,
+    build_client_cert_verifier, build_server_config, compute_cert_thumbprint_x5t_s256, current_actor, exchange_token,
+    load_certs, now_unix_secs, validate_with_cert_binding_and_clock_skew, CaError, CertificateAuthority, ClientAuth,
+    Decision, GatewayConfig, IdentityError, IdentityProvider, LocalCa, LocalIssuer, Registry, RouteTable,
+    ServerCertificate, SpiffeId, SpireProvider, TokenExchangeError, TokenExchangeRequest, TokenExchangeResponse,
+    ValidationRequest, HEADER_CALLER_CHAIN, HEADER_OBO_TOKEN, HEADER_USER_PRINCIPAL,
 };
 
 /// Everything a request handler needs, cheap to clone (every field is an
@@ -878,8 +878,12 @@ fn with_trace_headers(mut response: Response, cx: &OtelContext) -> Response {
 /// verification alone can still vouch for, for audit purposes.
 ///
 /// Attribute names follow the brief's F12 naming:
-/// - `obo.immediate_caller` — the verified direct caller (token `sub`, or
-///   the mTLS-verified `source_principal` for a direct, tokenless call).
+/// - `obo.immediate_caller` — the verified direct caller. N1 fix (review
+///   0002): this is `zero_trust::current_actor(claims)` (the outermost
+///   `act.sub`, or `sub` itself with no delegation) — never bare `sub`,
+///   which names the chain's *originator* and would misreport a delegated
+///   token's immediate caller as whoever started the chain. Falls back to
+///   the mTLS-verified `source_principal` for a direct, tokenless call.
 /// - `obo.user_principal` — the signed `user` claim, if the token carries
 ///   one (the originating human/service the whole chain acts on behalf
 ///   of).
@@ -902,7 +906,13 @@ fn record_obo_span_attributes(
         Decision::Allow => {
             if let Some(claims) = &verified_claims {
                 let chain = claims.delegation_chain();
-                span.set_attribute(KeyValue::new("obo.immediate_caller", claims.sub.clone()));
+                // Safe to call `current_actor` (which panics on an
+                // unparseable chain entry) only because `decision` is
+                // already `Allow` here: `obo::validate` only ever returns
+                // `Allow` after its own chain-entry check has confirmed
+                // every hop in this same `delegation_chain()` parses as a
+                // SPIFFE ID.
+                span.set_attribute(KeyValue::new("obo.immediate_caller", current_actor(claims).to_string()));
                 span.set_attribute(KeyValue::new("obo.delegation_depth", chain.len() as i64));
                 span.set_attribute(KeyValue::new("obo.delegation_chain", chain.join(" -> ")));
                 if let Some(user) = claims.extract_user_principal() {
@@ -925,6 +935,12 @@ fn record_obo_span_attributes(
             // rule as the Allow path above -- an invalid/absent token or
             // signature simply means there's nothing trustworthy to record.
             if let Some(claims) = &verified_claims {
+                // Deliberately `claims.sub`, not `current_actor(claims)`,
+                // here: the deny may be exactly `InvalidChainEntry` (an
+                // unparseable hop), in which case `current_actor` would
+                // panic. `sub` is always present and already a validated
+                // SPIFFE ID in every other case, so it's the only field
+                // safe to read unconditionally on a deny.
                 span.set_attribute(KeyValue::new("obo.attempted_caller", claims.sub.clone()));
             } else if let Some(source) = source_principal {
                 span.set_attribute(KeyValue::new("obo.attempted_caller", source.to_string()));
@@ -1075,7 +1091,13 @@ async fn proxy_handler(
     if decision.is_allow() {
         if let Some(token) = obo_token.as_deref() {
             if let Ok(claims) = state.identity.verifier().verify_signature(token) {
-                span.record("obo.caller_principal", claims.sub.as_str());
+                // N1 fix: `current_actor`, not `claims.sub` -- the decision
+                // is already `Allow`, so `obo::validate` has already
+                // confirmed `current_actor` (not the originator) is what
+                // was actually authorized here. Safe to call unconditionally:
+                // `Allow` implies every chain entry already parsed as a
+                // SPIFFE ID.
+                span.record("obo.caller_principal", current_actor(&claims).to_string().as_str());
                 span.record("obo.token_ttl_seconds", claims.exp - now_unix_secs());
                 if let Some(user) = claims.user.as_deref() {
                     span.record("obo.user_principal", user);

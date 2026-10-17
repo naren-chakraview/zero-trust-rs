@@ -57,9 +57,11 @@ impl std::error::Error for TokenExchangeError {}
 /// - `sub`: unchanged — the end-to-end originator binding never moves.
 /// - `aud`: replaced with `next_audience`.
 /// - `user`: preserved verbatim from the inbound token.
-/// - `act`: `{sub: gateway_id, act: <inbound act, if any>}` — this hop is
-///   prepended to the chain as the *new* immediate actor, pushing whatever
-///   was already there one level deeper.
+/// - `act`: `{sub: gateway_id, act: <inbound act, if any>}` — per RFC 8693
+///   §4.1, `act` identifies the party to whom authority has been
+///   *currently* delegated, so this hop becomes the new outermost `act`
+///   (the current actor), with whatever was already there nested one
+///   level deeper as the prior actor.
 /// - `cnf`: preserved verbatim (cert binding survives re-minting).
 /// - `iat`/`exp`: fresh, `now_secs` .. `now_secs + ttl_secs`.
 /// - `jti`: freshly generated, unique per call.
@@ -102,15 +104,14 @@ pub fn exchange_token(
         .parse()
         .map_err(|_| TokenExchangeError::InvalidAudience)?;
 
-    // Step 4: re-mint. `sub`/`user`/`cnf` carry over unchanged; this
-    // gateway is appended at the *end* of the existing `act` chain (not
-    // wrapped around its outside) — `delegation_chain()` reads
-    // `[sub, act.sub, act.act.sub, ...]`, and `sub` never changes here, so
-    // the only way two successive exchanges produce the chronologically
-    // correct order `[originator, hop_1, hop_2]` is for each new hop to
-    // land at the deepest nesting level, consistent with this crate's
-    // "each hop appending itself" delegation-chain semantics (see
-    // `OboClaims`'s doc comment).
+    // Step 4: re-mint. `sub`/`user`/`cnf` carry over unchanged; per RFC
+    // 8693 §4.1, `act` names the party currently exercising delegated
+    // authority, so this gateway is prepended as the new *outermost* `act`
+    // — pushing whatever hop was previously outermost one level deeper, as
+    // the prior actor. `delegation_chain()` reads `[sub, act.sub,
+    // act.act.sub, ...]` but internally un-reverses this nesting so its
+    // *output* order stays chronological (`[originator, hop_1, hop_2]`)
+    // even though the signed `act` nesting itself is newest-first.
     let new_claims = OboClaims {
         sub: inbound_claims.sub.clone(),
         aud: vec![next_aud.to_string()],
@@ -131,17 +132,14 @@ pub fn exchange_token(
     Ok((new_token, ttl_secs))
 }
 
-/// Appends `new_sub` as a new hop at the end (deepest nesting) of an `act`
-/// chain, preserving every hop already recorded. With `act` `None` (no
-/// prior delegation), this is simply the first hop.
+/// Prepends `new_sub` as the new outermost hop of an `act` chain, nesting
+/// whatever was already there one level deeper as the prior actor. This is
+/// RFC 8693 §4.1's convention: the outermost `act` is always the *current*
+/// actor, so a fresh hop replaces that position rather than burying itself
+/// at the bottom of the chain. With `act` `None` (no prior delegation),
+/// this is simply the first hop.
 fn append_hop(act: Option<Box<ActClaim>>, new_sub: String) -> Option<Box<ActClaim>> {
-    match act {
-        None => Some(Box::new(ActClaim { sub: new_sub, act: None })),
-        Some(mut hop) => {
-            hop.act = append_hop(hop.act, new_sub);
-            Some(hop)
-        }
-    }
+    Some(Box::new(ActClaim { sub: new_sub, act }))
 }
 
 /// A short, random, hex-encoded JWT ID — unique per exchanged token, for

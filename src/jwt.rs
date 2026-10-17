@@ -33,9 +33,10 @@ pub fn compute_cert_thumbprint_x5t_s256(cert_der: &[u8]) -> String {
 /// Extended per RFC 8693 (token exchange) to optionally carry a signed
 /// delegation chain: `user` is the originating principal who kicked off the
 /// delegation, `act` is a recursively nested chain of intermediate actors
-/// (each hop appending itself), `cnf` binds the token to a client
-/// certificate (RFC 8705, consumed by cert-binding validation), and `nbf`/
-/// `jti` support not-before and replay-cache checks. All five are optional
+/// (each hop prepending itself as the new outermost/current actor, per RFC
+/// 8693 §4.1), `cnf` binds the token to a client certificate (RFC 8705,
+/// consumed by cert-binding validation), and `nbf`/`jti` support not-before
+/// and replay-cache checks. All five are optional
 /// and skip serialization when absent, so tokens minted without delegation
 /// are byte-for-byte unchanged from before this extension.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -86,16 +87,27 @@ impl OboClaims {
         depth
     }
 
-    /// The full chain of identities that have held this token, outermost
-    /// first: `[sub, act.sub, act.act.sub, ...]`. With no `act` claim this
-    /// is just `[sub]`.
+    /// The full chain of identities that have held this token, in
+    /// chronological order: `[sub (originator), oldest hop, ..., current
+    /// actor]`. With no `act` claim this is just `[sub]`.
+    ///
+    /// Per RFC 8693 §4.1, the signed `act` claim nests *newest-first* — the
+    /// outermost `act.sub` is the current actor, and each further level of
+    /// nesting is an older, prior actor (see [`crate::token_exchange::exchange_token`],
+    /// which prepends each new hop at the outermost level). This method
+    /// walks that nesting outermost-to-innermost (current-to-oldest) and
+    /// then reverses the hops, so its returned order stays chronological
+    /// and independent of which way the underlying claim happens to nest.
     pub fn delegation_chain(&self) -> Vec<String> {
-        let mut chain = vec![self.sub.clone()];
+        let mut hops = Vec::new();
         let mut act = self.act.as_deref();
         while let Some(a) = act {
-            chain.push(a.sub.clone());
+            hops.push(a.sub.clone());
             act = a.act.as_deref();
         }
+        hops.reverse();
+        let mut chain = vec![self.sub.clone()];
+        chain.extend(hops);
         chain
     }
 
@@ -106,8 +118,10 @@ impl OboClaims {
 }
 
 /// One hop of an RFC 8693 delegation chain: `{"sub": "...", "act": {...}}`.
-/// Each `act` claim may itself nest a further `act`, recording every actor
-/// that has acted on behalf of the original `user` in order.
+/// Each `act` claim may itself nest a further `act`; per §4.1, the
+/// outermost `act` is always the *current* actor, with each nested `act`
+/// one step further back (older) in the chain of actors that have acted on
+/// behalf of the original `user`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ActClaim {
     pub sub: String,
@@ -419,10 +433,14 @@ mod tests {
         let mut claims = sample_claims(2000);
         claims.sub = "spiffe://backend".to_string();
         claims.user = Some("spiffe://alice".to_string());
+        // Raw `act` nesting is newest-first per RFC 8693 §4.1 (gw-a
+        // delegated first, gw-b is the current/outermost actor) — see
+        // `append_hop`. `delegation_chain()` un-reverses this so its
+        // *output* stays chronological: [backend, gw-a, gw-b].
         claims.act = Some(Box::new(ActClaim {
-            sub: "spiffe://gw-a".to_string(),
+            sub: "spiffe://gw-b".to_string(),
             act: Some(Box::new(ActClaim {
-                sub: "spiffe://gw-b".to_string(),
+                sub: "spiffe://gw-a".to_string(),
                 act: None,
             })),
         }));

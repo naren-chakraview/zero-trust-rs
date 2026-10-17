@@ -371,3 +371,129 @@ workloads:
 
     assert_eq!(claims.nbf, Some(claims.iat));
 }
+
+// --- Task 1 (N4): RFC 8693 `act` nesting direction -------------------------
+//
+// RFC 8693 §4.1 defines the outermost `act` as the party *currently*
+// exercising delegated authority, not the party that started the chain.
+// Each `exchange_token` call must therefore *prepend* the exchanging hop as
+// the new outermost `act`, nesting whatever was already there one level
+// deeper as the prior actor — not bury the new hop at the bottom of the
+// chain.
+
+const GATEWAY: &str = "spiffe://chakra.internal/ns/api-gateway/sa/api-gateway";
+const HOP_ORDERS: &str = "spiffe://chakra.internal/ns/orders-hop/sa/orders-hop";
+const HOP_INVENTORY: &str = "spiffe://chakra.internal/ns/inventory-hop/sa/inventory-hop";
+
+fn placeholder_registry() -> Registry {
+    Registry::from_yaml_str(
+        r#"
+trust_domain: chakra.internal
+workloads:
+  - name: placeholder
+    spiffe_id: spiffe://chakra.internal/ns/placeholder/sa/placeholder
+    max_obo_chain_depth: 5
+    allowed_callers: []
+"#,
+    )
+    .unwrap()
+}
+
+/// Three successive exchanges (api-gateway, then an "orders" hop, then an
+/// "inventory" hop) must leave the *most recently* exchanging hop
+/// (inventory) as the outermost `act.sub` — the current actor, per RFC
+/// 8693 §4.1 — with every older hop nested progressively deeper and
+/// `sub` (the originator) never moving. Before the N4 fix, `append_hop`
+/// buried each new hop at the bottom of the chain instead, so the
+/// outermost `act.sub` after three hops was api-gateway (the *oldest*
+/// hop) rather than inventory (the current one) — exactly the inversion
+/// this test guards against.
+#[test]
+fn three_hop_chain_has_the_latest_hop_as_the_outermost_act() {
+    let issuer = LocalIssuer::generate(placeholder_registry(), 300).unwrap();
+    let now = 1_000i64;
+
+    let originator_claims = OboClaims {
+        sub: "spiffe://chakra.internal/ns/originator/sa/originator".to_string(),
+        aud: vec![GATEWAY.to_string()],
+        user: Some("spiffe://chakra.internal/ns/alice/sa/alice".to_string()),
+        act: None,
+        iat: now,
+        exp: now + 300,
+        nbf: None,
+        jti: None,
+        cnf: None,
+        iss: None,
+    };
+    let token_0 = issuer.sign_claims(&originator_claims).unwrap();
+
+    // Hop 1: api-gateway exchanges toward the orders hop.
+    let (token_1, _) = exchange_token(
+        &token_0,
+        HOP_ORDERS,
+        &issuer,
+        issuer.verifier(),
+        &GATEWAY.parse::<SpiffeId>().unwrap(),
+        300,
+        now,
+    )
+    .unwrap();
+
+    // Hop 2: the orders hop exchanges toward the inventory hop.
+    let (token_2, _) = exchange_token(
+        &token_1,
+        HOP_INVENTORY,
+        &issuer,
+        issuer.verifier(),
+        &HOP_ORDERS.parse::<SpiffeId>().unwrap(),
+        300,
+        now,
+    )
+    .unwrap();
+
+    // Hop 3: the inventory hop exchanges toward a final backend — this is
+    // the most recent hop, so it must land as the *outermost* `act` on the
+    // resulting token.
+    let (token_3, _) = exchange_token(
+        &token_2,
+        "spiffe://chakra.internal/ns/backend/sa/backend",
+        &issuer,
+        issuer.verifier(),
+        &HOP_INVENTORY.parse::<SpiffeId>().unwrap(),
+        300,
+        now,
+    )
+    .unwrap();
+
+    let final_claims = issuer.verifier().verify_signature(&token_3).unwrap();
+
+    // The outermost `act.sub` is the LATEST hop (inventory), not the
+    // oldest hop (api-gateway) — RFC 8693 §4.1's "current actor" position.
+    let outermost = final_claims.act.as_deref().expect("act claim must be present");
+    assert_eq!(outermost.sub, HOP_INVENTORY);
+    assert_ne!(outermost.sub, GATEWAY);
+
+    // Nested one level deeper is the prior (orders) hop...
+    let middle = outermost.act.as_deref().expect("nested act must be present");
+    assert_eq!(middle.sub, HOP_ORDERS);
+
+    // ...and nested deepest is the oldest hop (api-gateway).
+    let innermost = middle.act.as_deref().expect("innermost act must be present");
+    assert_eq!(innermost.sub, GATEWAY);
+    assert!(innermost.act.is_none());
+
+    // `sub` (the end-to-end originator) never moves across any exchange.
+    assert_eq!(final_claims.sub, "spiffe://chakra.internal/ns/originator/sa/originator");
+
+    // `delegation_chain()`'s public API still reports chronological order
+    // regardless of the underlying (newest-first) `act` nesting direction.
+    assert_eq!(
+        final_claims.delegation_chain(),
+        vec![
+            "spiffe://chakra.internal/ns/originator/sa/originator".to_string(),
+            GATEWAY.to_string(),
+            HOP_ORDERS.to_string(),
+            HOP_INVENTORY.to_string(),
+        ]
+    );
+}

@@ -991,3 +991,119 @@ fn exchange_allows_matching_audience_and_depth() {
     assert_eq!(new_claims.aud, vec![N3_DOWNSTREAM.to_string()]);
     assert_eq!(new_claims.delegation_chain().len(), 3); // hop-a, then orders-gw appended
 }
+
+// --- Task 9 (N5): edge mint path for a human user principal -----------------
+//
+// Review 0002 finding N5: edge gateways (the mesh's entry points) need to
+// mint tokens carrying a human user principal claim, not just a SPIFFE ID,
+// so an action can be attributed end-to-end to the human who triggered it,
+// not only to whichever service identity happened to make the call.
+// `LocalIssuer::issue_jwt_svid_with_user` mints such a token (`sub` =
+// gateway, `user` = human principal, `iss` = the trusted IdP that vouched
+// for it), and `obo::validate_with_user_issuers` accepts that `user` claim
+// as a human principal string -- not a SPIFFE ID -- when its `iss` is
+// named in the configured trusted-issuer list.
+
+const N5_EDGE_GATEWAY: &str = "spiffe://chakra.internal/ns/edge-gateway/sa/edge-gateway";
+const N5_TRUSTED_ISSUER: &str = "auth.corp.internal";
+const N5_HUMAN_PRINCIPAL: &str = "alice@corp.internal";
+
+fn n5_registry() -> Registry {
+    Registry::from_yaml_str(&format!(
+        r#"
+trust_domain: chakra.internal
+workloads:
+  - name: edge-gateway
+    spiffe_id: {N5_EDGE_GATEWAY}
+    max_obo_chain_depth: 3
+    allowed_callers:
+      - {N5_EDGE_GATEWAY}
+"#
+    ))
+    .unwrap()
+}
+
+/// 1. `LocalIssuer::issue_jwt_svid_with_user` mints a token whose `sub` is
+///    the gateway's own SPIFFE ID and whose `user` claim carries the human
+///    principal verbatim (not a SPIFFE ID) -- the edge-mint path itself.
+#[test]
+fn user_principal_edge_mint() {
+    let issuer = LocalIssuer::generate(n5_registry(), 300).unwrap();
+    let gateway_id: SpiffeId = N5_EDGE_GATEWAY.parse().unwrap();
+    let trusted_issuers = vec![N5_TRUSTED_ISSUER.to_string()];
+
+    let issued = issuer
+        .issue_jwt_svid_with_user(&gateway_id, N5_HUMAN_PRINCIPAL, N5_TRUSTED_ISSUER, &trusted_issuers)
+        .unwrap();
+
+    let claims = issuer.verifier().verify_signature(&issued.token).unwrap();
+    assert_eq!(claims.sub, N5_EDGE_GATEWAY); // sub = gateway
+    assert_eq!(claims.user, Some(N5_HUMAN_PRINCIPAL.to_string())); // user = human principal
+    assert_eq!(claims.iss, Some(N5_TRUSTED_ISSUER.to_string()));
+}
+
+/// 2. `obo::validate_with_user_issuers` accepts a `user` claim from a
+///    trusted issuer even though it isn't a well-formed SPIFFE ID -- and,
+///    as a control, the exact same token is still rejected by the plain
+///    `validate` entry point (which has no trusted-issuer list to consult),
+///    proving the acceptance comes specifically from the N5 path, not from
+///    some unrelated loosening of the user-principal check.
+#[test]
+fn user_principal_validation_accepts_user_claim() {
+    let reg = n5_registry();
+    let (signer, verifier) = test_keys();
+    let destination: SpiffeId = N5_EDGE_GATEWAY.parse().unwrap();
+
+    let claims = OboClaims {
+        sub: N5_EDGE_GATEWAY.to_string(),
+        aud: vec![N5_EDGE_GATEWAY.to_string()],
+        user: Some(N5_HUMAN_PRINCIPAL.to_string()), // human principal, not a SPIFFE ID
+        act: None,
+        iat: 0,
+        exp: 300,
+        nbf: None,
+        jti: None,
+        cnf: None,
+        iss: Some(N5_TRUSTED_ISSUER.to_string()),
+    };
+    let token = signer.sign(&claims).unwrap();
+
+    let request = ValidationRequest {
+        destination: &destination,
+        source_principal: None,
+        obo_token: Some(&token),
+        caller_chain: None,
+    };
+
+    let trusted_issuers = vec![N5_TRUSTED_ISSUER.to_string()];
+    assert_eq!(
+        validate_with_user_issuers(&reg, &verifier, &request, 0, 60, &trusted_issuers),
+        Decision::Allow,
+        "a user claim from a trusted issuer must be accepted, not rejected as an invalid principal"
+    );
+
+    // Control: the plain `validate` entry point (no trusted-issuer list)
+    // still denies the identical token -- the N5 acceptance is opt-in, not
+    // a blanket loosening of `InvalidUserPrincipal`.
+    assert_eq!(
+        validate(&reg, &verifier, &request, 0),
+        Decision::Deny(DenyReason::InvalidUserPrincipal)
+    );
+}
+
+/// 3. A user credential whose claimed issuer is *not* in the configured
+///    trusted-issuer list is rejected outright at mint time -- this
+///    gateway never signs a `user` claim vouching for an IdP it hasn't
+///    been told to trust.
+#[test]
+fn untrusted_user_issuer_rejected() {
+    let issuer = LocalIssuer::generate(n5_registry(), 300).unwrap();
+    let gateway_id: SpiffeId = N5_EDGE_GATEWAY.parse().unwrap();
+    let trusted_issuers = vec![N5_TRUSTED_ISSUER.to_string()];
+
+    let err = issuer
+        .issue_jwt_svid_with_user(&gateway_id, N5_HUMAN_PRINCIPAL, "untrusted-idp.example", &trusted_issuers)
+        .unwrap_err();
+
+    assert!(matches!(err, IdentityError::UntrustedUserIssuer(iss) if iss == "untrusted-idp.example"));
+}

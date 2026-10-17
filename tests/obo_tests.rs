@@ -213,3 +213,161 @@ workloads:
     let iss = claims.iss.expect("issued token must carry an iss claim");
     assert!(iss.starts_with("spiffe://"));
 }
+
+// --- Task 3: `nbf` (not-before) and `jti` (JWT ID) validation ---
+//
+// `obo::validate`'s `nbf` check already existed (see `src/obo.rs`'s
+// `obo_token_not_yet_valid_is_denied` / `obo_token_nbf_within_clock_skew_is_allowed`
+// unit tests), but the clock-skew tolerance it used was a fixed constant.
+// Task 3 makes that tolerance configurable (`GatewayConfig::clock_skew_tolerance_secs`,
+// plumbed through `validate_with_clock_skew`) and has `LocalIssuer` stamp
+// every issued token with `nbf`/`jti`. These integration tests exercise both
+// through the crate's public API.
+
+/// 1. A token whose `nbf` is in the future, beyond the configured clock-skew
+///    tolerance, is rejected with `DenyReason::OboTokenNotYetValid` — even
+///    with a custom (non-default) skew value, proving the configured
+///    tolerance, not just the fixed default, is what's enforced.
+#[test]
+fn token_with_nbf_beyond_configured_clock_skew_is_rejected() {
+    let reg = registry();
+    let (signer, verifier) = test_keys();
+    let destination: SpiffeId = INVENTORY.parse().unwrap();
+
+    let mut claims = claims_with_iss(None);
+    claims.nbf = Some(100); // valid starting at t=100
+    claims.exp = 1_000;
+    let token = signer.sign(&claims).unwrap();
+
+    let request = ValidationRequest {
+        destination: &destination,
+        source_principal: None,
+        obo_token: Some(&token),
+        caller_chain: None,
+    };
+
+    // now=0, skew=10s: nbf (100) is far beyond now+skew (10) -> denied.
+    assert_eq!(
+        validate_with_clock_skew(&reg, &verifier, &request, 0, 10),
+        Decision::Deny(DenyReason::OboTokenNotYetValid)
+    );
+}
+
+/// 2. A token whose `nbf` is in the future, but within the configured
+///    clock-skew tolerance, is accepted — including a tolerance wider than
+///    the library's own default, proving the configured value (not the
+///    default) is what's actually applied.
+#[test]
+fn token_with_nbf_within_configured_clock_skew_is_accepted() {
+    let reg = registry();
+    let (signer, verifier) = test_keys();
+    let destination: SpiffeId = INVENTORY.parse().unwrap();
+
+    let mut claims = claims_with_iss(None);
+    claims.nbf = Some(100); // valid starting at t=100
+    claims.exp = 1_000;
+    let token = signer.sign(&claims).unwrap();
+
+    let request = ValidationRequest {
+        destination: &destination,
+        source_principal: None,
+        obo_token: Some(&token),
+        caller_chain: None,
+    };
+
+    // now=0, skew=120s (wider than DEFAULT_CLOCK_SKEW_SECS): nbf (100) is
+    // within now+skew (120) -> allowed.
+    assert_eq!(
+        validate_with_clock_skew(&reg, &verifier, &request, 0, 120),
+        Decision::Allow
+    );
+
+    // The same request, at the plain (default-skew) `validate` entry point,
+    // is denied -- nbf=100 exceeds `now + DEFAULT_CLOCK_SKEW_SECS` (0 + 60).
+    // This pins down that the 120s tolerance used above is doing real work,
+    // not just happening to agree with the default.
+    assert_eq!(
+        validate(&reg, &verifier, &request, 0),
+        Decision::Deny(DenyReason::OboTokenNotYetValid)
+    );
+}
+
+/// 3. `LocalIssuer::issue_jwt_svid` stamps every issued token with a
+///    present `jti` claim (a non-empty string) — required for downstream
+///    replay-cache tracking, even though `obo::validate` itself never
+///    denies on a missing `jti` (old tokens must keep working).
+#[test]
+fn issued_tokens_carry_a_present_jti_claim() {
+    let reg = Registry::from_yaml_str(&format!(
+        r#"
+trust_domain: chakra.internal
+workloads:
+  - name: orders-svc
+    spiffe_id: {ORDERS}
+    max_obo_chain_depth: 3
+    allowed_callers: []
+    bootstrap_token: orders-secret
+"#
+    ))
+    .unwrap();
+    let issuer = LocalIssuer::generate(reg, 300).unwrap();
+
+    let issued = issuer.issue_jwt_svid("orders-svc", INVENTORY, "orders-secret").unwrap();
+    let claims = issuer.verifier().verify_signature(&issued.token).unwrap();
+
+    let jti = claims.jti.expect("issued token must carry a jti claim");
+    assert!(!jti.is_empty());
+}
+
+/// 3b. Two separately issued tokens get distinct `jti` values -- a
+///     constant/empty placeholder would defeat the whole point of a
+///     replay-cache key.
+#[test]
+fn issued_tokens_have_distinct_jti_values() {
+    let reg = Registry::from_yaml_str(&format!(
+        r#"
+trust_domain: chakra.internal
+workloads:
+  - name: orders-svc
+    spiffe_id: {ORDERS}
+    max_obo_chain_depth: 3
+    allowed_callers: []
+    bootstrap_token: orders-secret
+"#
+    ))
+    .unwrap();
+    let issuer = LocalIssuer::generate(reg, 300).unwrap();
+
+    let issued_1 = issuer.issue_jwt_svid("orders-svc", INVENTORY, "orders-secret").unwrap();
+    let issued_2 = issuer.issue_jwt_svid("orders-svc", INVENTORY, "orders-secret").unwrap();
+
+    let jti_1 = issuer.verifier().verify_signature(&issued_1.token).unwrap().jti;
+    let jti_2 = issuer.verifier().verify_signature(&issued_2.token).unwrap().jti;
+
+    assert_ne!(jti_1, jti_2);
+}
+
+/// 4. `LocalIssuer::issue_jwt_svid` also stamps every issued token with
+///    `nbf` set to the issuance time (`iat`), so a freshly issued token is
+///    immediately valid under `obo::validate` at that same instant.
+#[test]
+fn issued_tokens_carry_an_nbf_equal_to_iat() {
+    let reg = Registry::from_yaml_str(&format!(
+        r#"
+trust_domain: chakra.internal
+workloads:
+  - name: orders-svc
+    spiffe_id: {ORDERS}
+    max_obo_chain_depth: 3
+    allowed_callers: []
+    bootstrap_token: orders-secret
+"#
+    ))
+    .unwrap();
+    let issuer = LocalIssuer::generate(reg, 300).unwrap();
+
+    let issued = issuer.issue_jwt_svid("orders-svc", INVENTORY, "orders-secret").unwrap();
+    let claims = issuer.verifier().verify_signature(&issued.token).unwrap();
+
+    assert_eq!(claims.nbf, Some(claims.iat));
+}

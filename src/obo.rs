@@ -35,6 +35,17 @@ use crate::jwt::JwtVerifier;
 use crate::registry::Registry;
 use crate::spiffe_id::SpiffeId;
 
+/// Default `nbf` clock-skew allowance (seconds) used by [`validate`] and
+/// [`validate_with_cert_binding`] — the two call sites that don't take an
+/// explicit skew. [`GatewayConfig::clock_skew_tolerance_secs`] (Task 3)
+/// defaults to this same value, but a deployment that widens or narrows it
+/// reaches `validate` through [`validate_with_clock_skew`] /
+/// [`validate_with_cert_binding_and_clock_skew`] instead, never through this
+/// constant.
+///
+/// [`GatewayConfig::clock_skew_tolerance_secs`]: crate::config::GatewayConfig::clock_skew_tolerance_secs
+pub const DEFAULT_CLOCK_SKEW_SECS: i64 = 60;
+
 /// Inputs to a single authorization decision. Mirrors the fields Envoy's
 /// `ext_authz` call would carry: who the request claims to be for
 /// (`destination`), who the transport layer says the direct peer is
@@ -140,11 +151,35 @@ impl DenyReason {
 /// `Decision::Deny(reason)`, mirroring OPA/Rego's "undefined evaluates to
 /// deny" philosophy: callers always get an auditable decision + reason,
 /// never a try/catch branch to remember.
+///
+/// Uses [`DEFAULT_CLOCK_SKEW_SECS`] for the `nbf` check — a caller that
+/// wants a configured tolerance (e.g. from
+/// [`GatewayConfig::clock_skew_tolerance_secs`][skew]) should call
+/// [`validate_with_clock_skew`] instead.
+///
+/// [skew]: crate::config::GatewayConfig::clock_skew_tolerance_secs
 pub fn validate(
     registry: &Registry,
     verifier: &JwtVerifier,
     request: &ValidationRequest<'_>,
     now_unix_secs: i64,
+) -> Decision {
+    validate_with_clock_skew(registry, verifier, request, now_unix_secs, DEFAULT_CLOCK_SKEW_SECS)
+}
+
+/// Like [`validate`], but with an explicit `nbf` clock-skew allowance
+/// (seconds) instead of [`DEFAULT_CLOCK_SKEW_SECS`] — this is what lets
+/// [`GatewayConfig::clock_skew_tolerance_secs`][skew] (Task 3) actually
+/// reach the decision, rather than the fixed default every other caller of
+/// `validate` gets.
+///
+/// [skew]: crate::config::GatewayConfig::clock_skew_tolerance_secs
+pub fn validate_with_clock_skew(
+    registry: &Registry,
+    verifier: &JwtVerifier,
+    request: &ValidationRequest<'_>,
+    now_unix_secs: i64,
+    clock_skew_secs: i64,
 ) -> Decision {
     let Some(destination_entry) = registry.get(request.destination) else {
         return Decision::Deny(DenyReason::UnknownDestination);
@@ -211,13 +246,24 @@ pub fn validate(
         return Decision::Deny(DenyReason::OboTokenExpired);
     }
 
-    // Not-before, with a short clock-skew allowance (unlike `exp` above,
-    // which is checked strictly, with none).
+    // Not-before, with a clock-skew allowance (unlike `exp` above, which is
+    // checked strictly, with none). Equivalent to `now_unix_secs < nbf -
+    // clock_skew_secs`, just rearranged to avoid subtracting into
+    // `i64::MIN` territory on pathological `nbf` values.
     if let Some(nbf) = claims.nbf {
-        const CLOCK_SKEW_SECS: i64 = 30;
-        if nbf > now_unix_secs + CLOCK_SKEW_SECS {
+        if nbf > now_unix_secs + clock_skew_secs {
             return Decision::Deny(DenyReason::OboTokenNotYetValid);
         }
+    }
+
+    // `jti` (JWT ID, Task 3): tracked for replay-cache purposes elsewhere,
+    // not enforced here. A missing `jti` is never a deny — only tokens
+    // minted after this task carry one at all, and older tokens must keep
+    // validating exactly as before. Logged (not denied) purely so an
+    // operator can see, over time, whether any pre-Task-3 tokens are still
+    // in circulation.
+    if claims.jti.is_none() {
+        tracing::debug!("OBO token has no jti claim (pre-Task-3 token, or minted by a provider that omits it)");
     }
 
     let destination_str = request.destination.to_string();
@@ -276,6 +322,31 @@ pub fn validate_with_cert_binding(
     peer_cert_thumbprint: Option<&str>,
     now_unix_secs: i64,
 ) -> Decision {
+    validate_with_cert_binding_and_clock_skew(
+        registry,
+        verifier,
+        request,
+        peer_cert_thumbprint,
+        now_unix_secs,
+        DEFAULT_CLOCK_SKEW_SECS,
+    )
+}
+
+/// Like [`validate_with_cert_binding`], but with an explicit `nbf`
+/// clock-skew allowance (seconds) — the cert-binding counterpart of
+/// [`validate_with_clock_skew`], for callers that want
+/// [`GatewayConfig::clock_skew_tolerance_secs`][skew] (Task 3) honored on
+/// the cert-bound path too.
+///
+/// [skew]: crate::config::GatewayConfig::clock_skew_tolerance_secs
+pub fn validate_with_cert_binding_and_clock_skew(
+    registry: &Registry,
+    verifier: &JwtVerifier,
+    request: &ValidationRequest<'_>,
+    peer_cert_thumbprint: Option<&str>,
+    now_unix_secs: i64,
+    clock_skew_secs: i64,
+) -> Decision {
     if let Some(token) = request.obo_token {
         if let Ok(claims) = verifier.verify_signature(token) {
             if let Some(cnf) = &claims.cnf {
@@ -287,7 +358,7 @@ pub fn validate_with_cert_binding(
         }
     }
 
-    validate(registry, verifier, request, now_unix_secs)
+    validate_with_clock_skew(registry, verifier, request, now_unix_secs, clock_skew_secs)
 }
 
 /// Convenience wrapper for long-lived call sites (a gateway holding one

@@ -68,6 +68,16 @@ fn default_max_concurrent_connections() -> u32 {
     1000
 }
 
+/// Clock skew tolerance for `nbf` (not-before) validation, in seconds
+/// (Task 3). Two clocks in a real deployment are never perfectly
+/// synchronized, so a token minted a few seconds "in the future" by this
+/// gateway's clock but already valid by the issuer's clock shouldn't be
+/// denied outright — `obo::validate` allows `now >= nbf - clock_skew`
+/// rather than strictly `now >= nbf`. Default: 60 seconds.
+fn default_clock_skew_secs() -> u64 {
+    60
+}
+
 /// How strictly `zt-gateway` requires a TLS client certificate.
 /// See `docs/design/0001-tls-mtls-termination.md` for the full rollout story.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
@@ -327,6 +337,11 @@ pub struct GatewayConfig {
     /// back to `upstream_addr`/`protected_workload`.
     #[serde(default)]
     pub routes: Vec<Route>,
+
+    /// Clock skew tolerance for `nbf` (not-before) validation, in seconds
+    /// (Task 3). See [`default_clock_skew_secs`]'s doc comment. Default: 60.
+    #[serde(default = "default_clock_skew_secs")]
+    pub clock_skew_tolerance_secs: u64,
 }
 
 impl GatewayConfig {
@@ -412,6 +427,11 @@ impl GatewayConfig {
                 .parse()
                 .unwrap_or_else(|e| panic!("ZT_GATEWAY_MAX_CONCURRENT_CONNECTIONS={v:?} is not a valid u32: {e}"));
         }
+        if let Ok(v) = std::env::var("ZT_GATEWAY_CLOCK_SKEW_SECS") {
+            self.clock_skew_tolerance_secs = v
+                .parse()
+                .unwrap_or_else(|e| panic!("ZT_GATEWAY_CLOCK_SKEW_SECS={v:?} is not a valid u64: {e}"));
+        }
         self
     }
 
@@ -446,6 +466,7 @@ impl GatewayConfig {
             request_timeout_secs: default_request_timeout_secs(),
             max_concurrent_connections: default_max_concurrent_connections(),
             routes: Vec::new(),
+            clock_skew_tolerance_secs: default_clock_skew_secs(),
         }
     }
 
@@ -739,5 +760,30 @@ protected_workload: spiffe://chakra.internal/ns/inventory/sa/inventory-svc
         std::env::remove_var("ZT_GATEWAY_READ_TIMEOUT_SECS");
         std::env::remove_var("ZT_GATEWAY_REQUEST_TIMEOUT_SECS");
         std::env::remove_var("ZT_GATEWAY_MAX_CONCURRENT_CONNECTIONS");
+    }
+
+    // --- Clock skew tolerance (Task 3) ---
+
+    #[test]
+    fn default_clock_skew_tolerance_is_60_seconds() {
+        let config = GatewayConfig::from_yaml_str(MINIMAL).unwrap();
+        assert_eq!(config.clock_skew_tolerance_secs, 60);
+    }
+
+    #[test]
+    fn clock_skew_tolerance_is_configurable_in_yaml() {
+        let yaml = format!("{MINIMAL}\nclock_skew_tolerance_secs: 120\n");
+        let config = GatewayConfig::from_yaml_str(&yaml).unwrap();
+        assert_eq!(config.clock_skew_tolerance_secs, 120);
+    }
+
+    #[test]
+    fn env_var_overrides_clock_skew_tolerance() {
+        std::env::set_var("ZT_GATEWAY_CLOCK_SKEW_SECS", "15");
+
+        let config = GatewayConfig::from_yaml_str(MINIMAL).unwrap().with_env_overrides();
+        assert_eq!(config.clock_skew_tolerance_secs, 15);
+
+        std::env::remove_var("ZT_GATEWAY_CLOCK_SKEW_SECS");
     }
 }

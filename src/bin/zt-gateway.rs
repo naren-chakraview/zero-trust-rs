@@ -43,10 +43,10 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 use zero_trust::{
     build_client_cert_verifier, build_server_config, compute_cert_thumbprint_x5t_s256, exchange_token, load_certs,
-    now_unix_secs, validate_with_cert_binding, CaError, CertificateAuthority, ClientAuth, Decision, GatewayConfig,
-    IdentityError, IdentityProvider, LocalCa, LocalIssuer, Registry, RouteTable, ServerCertificate, SpiffeId,
-    TokenExchangeError, TokenExchangeRequest, TokenExchangeResponse, ValidationRequest, HEADER_CALLER_CHAIN,
-    HEADER_OBO_TOKEN, HEADER_USER_PRINCIPAL,
+    now_unix_secs, validate_with_cert_binding_and_clock_skew, CaError, CertificateAuthority, ClientAuth, Decision,
+    GatewayConfig, IdentityError, IdentityProvider, LocalCa, LocalIssuer, Registry, RouteTable, ServerCertificate,
+    SpiffeId, TokenExchangeError, TokenExchangeRequest, TokenExchangeResponse, ValidationRequest,
+    HEADER_CALLER_CHAIN, HEADER_OBO_TOKEN, HEADER_USER_PRINCIPAL,
 };
 
 /// Everything a request handler needs, cheap to clone (every field is an
@@ -78,6 +78,12 @@ struct AppState {
     /// `GatewayConfig::routes` is unset — see `resolve_route`'s doc
     /// comment for the backward-compatible fallback this enables.
     route_table: Arc<RouteTable>,
+    /// `nbf` clock-skew allowance (seconds, Task 3). Mirrors
+    /// `GatewayConfig::clock_skew_tolerance_secs`, threaded through to every
+    /// `validate_with_cert_binding_and_clock_skew` call below so an
+    /// operator-configured tolerance actually reaches the decision, instead
+    /// of the fixed `DEFAULT_CLOCK_SKEW_SECS` plain `validate` would use.
+    clock_skew_tolerance_secs: i64,
 }
 
 /// Sets up structured stdout logs (always) plus, when
@@ -229,6 +235,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         token_exchange_ttl_secs: config.token_ttl_seconds.max(0) as u64,
         max_body_bytes: (config.max_body_mb as usize) * 1024 * 1024,
         route_table: Arc::new(RouteTable::new(config.routes.clone())),
+        clock_skew_tolerance_secs: config.clock_skew_tolerance_secs as i64,
     };
 
     let listener_config = ListenerConfig {
@@ -721,12 +728,13 @@ async fn authorize(
         obo_token: req.obo_token.as_deref(),
     };
     // F5 fix: also enforce RFC 8705 cert binding, same as the proxy path.
-    let decision = validate_with_cert_binding(
+    let decision = validate_with_cert_binding_and_clock_skew(
         &state.registry,
         state.identity.verifier(),
         &request,
         peer_cert_thumbprint.as_deref(),
         now_unix_secs(),
+        state.clock_skew_tolerance_secs,
     );
 
     (
@@ -1021,12 +1029,13 @@ async fn proxy_handler(
     // signed `cnf.x5t#S256` claim is rejected outright unless this exact
     // connection's client certificate thumbprint matches it. Tokens with
     // no `cnf` claim (the backward-compatible default) are unaffected.
-    let decision = validate_with_cert_binding(
+    let decision = validate_with_cert_binding_and_clock_skew(
         &state.registry,
         state.identity.verifier(),
         &request,
         peer_cert_thumbprint.as_deref(),
         now_unix_secs(),
+        state.clock_skew_tolerance_secs,
     );
 
     let span = tracing::Span::current();
@@ -1235,6 +1244,7 @@ workloads:
             token_exchange_ttl_secs: 300,
             max_body_bytes: 100 * 1024 * 1024,
             route_table: Arc::new(RouteTable::default()),
+            clock_skew_tolerance_secs: zero_trust::DEFAULT_CLOCK_SKEW_SECS,
         }
     }
 

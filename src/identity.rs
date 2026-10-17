@@ -39,6 +39,16 @@ fn parse_jwks(jwks_data: &str) -> Result<Vec<JwksKeyEntry>, IdentityError> {
     Ok(document.keys)
 }
 
+/// A fresh, random JWT ID (`jti`) for a newly issued token (Task 3): a v4
+/// UUID, unique enough that two independently issued tokens are never
+/// expected to collide. Used by both [`LocalIssuer::issue_jwt_svid`] and
+/// [`LocalIssuer::issue_jwt_svid_with_cert_binding`] so every token this
+/// provider mints carries one, for downstream replay-cache tracking.
+fn generate_jti() -> String {
+    use uuid::Uuid;
+    Uuid::new_v4().to_string()
+}
+
 /// A freshly minted JWT SVID and when it expires (Unix seconds).
 #[derive(Debug, Clone)]
 pub struct IssuedToken {
@@ -236,8 +246,8 @@ impl LocalIssuer {
             act: None,
             iat: now,
             exp: now + self.ttl_seconds,
-            nbf: None,
-            jti: None,
+            nbf: Some(now),
+            jti: Some(generate_jti()),
             cnf: Some(CertBinding {
                 x5t_s256: cert_thumbprint.to_string(),
             }),
@@ -277,8 +287,8 @@ impl IdentityProvider for LocalIssuer {
             act: None,
             iat: now,
             exp: now + self.ttl_seconds,
-            nbf: None,
-            jti: None,
+            nbf: Some(now),
+            jti: Some(generate_jti()),
             cnf: None,
             iss: Some(format!("spiffe://{}", self.registry.trust_domain())),
         };

@@ -32,15 +32,17 @@
 //!   a gateway runs with `SpireProvider` as its `IdentityProvider`. See
 //!   this module's write-up in the Task 5 report for the follow-up this
 //!   implies.
-//! - [`SpireProvider::verifier`] only trusts RSA JWT authorities out of
-//!   whatever JWT bundle SPIRE hands back at construction time -- this
-//!   crate's [`crate::jwt::JwtVerifier`]/[`crate::jwt::JwtSigner`] are
-//!   RS256-only today, while a real SPIRE server's default JWT-SVID key
-//!   type is EC (ES256). An EC-only trust domain builds a `verifier()`
-//!   with zero usable keys; every signature check then fails closed
-//!   (`JwtError::UnknownKeyId`/`MissingKeyId`), never open. Adding ES256
-//!   support to `jwt.rs` is a prerequisite for this to work against a real
-//!   default-configured SPIRE deployment.
+//! - [`SpireProvider::verifier`] trusts both RSA (RS256) and EC/P-256
+//!   (ES256) JWT authorities out of whatever JWT bundle SPIRE hands back
+//!   at construction time (Task 11 / N8 -- see
+//!   [`crate::jwt::JwtVerifier::from_jwks_entries_with_algorithms`]). A
+//!   real SPIRE server's default JWT-SVID key type is EC (ES256), so this
+//!   is what makes a default-configured SPIRE deployment actually work
+//!   out-of-the-box: before this, an EC-only trust domain built a
+//!   `verifier()` with zero usable keys, and every signature check failed
+//!   closed (`JwtError::UnknownKeyId`/`MissingKeyId`), never open. Any
+//!   other key type (anything that's neither RSA nor EC/P-256) is still
+//!   silently skipped the same way RSA-only skipped EC before this.
 
 use spiffe::{JwtBundleSet, WorkloadApiClient, X509Svid};
 
@@ -102,22 +104,24 @@ impl SpireProvider {
     }
 }
 
-/// Builds a [`JwtVerifier`] trusting every *RSA* JWT authority across every
-/// trust domain in `bundles` -- see the module doc comment's third bullet
-/// for why non-RSA (e.g. SPIRE's default ES256) authorities are silently
-/// skipped rather than this failing outright: an EC-only trust domain still
-/// produces *a* verifier, just one with no keys, which fails closed on
-/// every verification rather than refusing to start at all.
+/// Builds a [`JwtVerifier`] trusting every *RSA* (RS256) or *EC/P-256*
+/// (ES256) JWT authority across every trust domain in `bundles` (Task 11 /
+/// N8) -- any other key type is silently skipped rather than this failing
+/// outright: a trust domain whose authorities are all unsupported key
+/// types still produces *a* verifier, just one with no keys, which fails
+/// closed on every verification rather than refusing to start at all.
 fn verifier_from_jwt_bundles(bundles: &JwtBundleSet) -> JwtVerifier {
     let mut entries = Vec::new();
     for (_trust_domain, bundle) in bundles.iter() {
         for authority in bundle.jwt_authorities() {
             if let Some(decoding_key) = rsa_decoding_key_from_jwk(authority.jwk_json()) {
-                entries.push((authority.key_id().to_string(), decoding_key));
+                entries.push((authority.key_id().to_string(), decoding_key, jsonwebtoken::Algorithm::RS256));
+            } else if let Some(decoding_key) = ec_decoding_key_from_jwk(authority.jwk_json()) {
+                entries.push((authority.key_id().to_string(), decoding_key, jsonwebtoken::Algorithm::ES256));
             }
         }
     }
-    JwtVerifier::from_jwks_entries(entries)
+    JwtVerifier::from_jwks_entries_with_algorithms(entries)
 }
 
 /// Parses `jwk_json` (a single JWK, as SPIRE's JWT bundle hands back per
@@ -132,6 +136,28 @@ fn rsa_decoding_key_from_jwk(jwk_json: &[u8]) -> Option<jsonwebtoken::DecodingKe
     let n = jwk.get("n")?.as_str()?;
     let e = jwk.get("e")?.as_str()?;
     jsonwebtoken::DecodingKey::from_rsa_components(n, e).ok()
+}
+
+/// Parses `jwk_json` into a [`jsonwebtoken::DecodingKey`], or `None` if it
+/// isn't a P-256 EC key -- Task 11 / N8, this is SPIRE's *default*
+/// JWT-SVID key type, so this is the branch that makes a
+/// default-configured SPIRE deployment actually produce usable keys. Only
+/// `"kty": "EC"` with `"crv": "P-256"` is recognized (other curves, e.g.
+/// P-384/P-521, aren't supported by this crate's ES256-only EC support and
+/// are treated the same as any other unrecognized key type). A JWK's
+/// `x`/`y` fields are already base64url-encoded, the exact form
+/// [`jsonwebtoken::DecodingKey::from_ec_components`] expects.
+fn ec_decoding_key_from_jwk(jwk_json: &[u8]) -> Option<jsonwebtoken::DecodingKey> {
+    let jwk: serde_json::Value = serde_json::from_slice(jwk_json).ok()?;
+    if jwk.get("kty")?.as_str()? != "EC" {
+        return None;
+    }
+    if jwk.get("crv")?.as_str()? != "P-256" {
+        return None;
+    }
+    let x = jwk.get("x")?.as_str()?;
+    let y = jwk.get("y")?.as_str()?;
+    jsonwebtoken::DecodingKey::from_ec_components(x, y).ok()
 }
 
 impl IdentityProvider for SpireProvider {
@@ -208,6 +234,7 @@ impl IdentityProvider for SpireProvider {
 mod tests {
     use super::*;
     use base64::engine::{general_purpose, Engine as _};
+    use rsa::pkcs1::{EncodeRsaPrivateKey, LineEnding};
     use rsa::traits::PublicKeyParts;
 
     #[test]
@@ -257,6 +284,204 @@ mod tests {
         // An empty verifier still exists and simply rejects every token --
         // "fails closed", not a panic or an unwrap at the trait boundary.
         assert!(verifier.verify_signature("not.a.token").is_err());
+    }
+
+    // --- ES256 (Task 11 / N8) ---
+
+    /// Generates a fresh P-256 TEST-ONLY EC keypair: a PKCS#8 PEM private
+    /// key (what [`crate::jwt::JwtSigner::from_ec_pem_with_kid`] expects)
+    /// and the matching `(x, y)` base64url JWK components -- the exact
+    /// shape SPIRE's JWT bundle hands back per EC authority. Never do this
+    /// in production code -- a real SPIRE deployment hands over
+    /// already-formed JWKS, not raw EC scalars.
+    fn generate_ec_keypair_with_jwk_xy() -> (Vec<u8>, String, String) {
+        use p256::elliptic_curve::pkcs8::{EncodePrivateKey, LineEnding as EcLineEnding};
+        use p256::elliptic_curve::sec1::ToEncodedPoint;
+
+        let secret_key = p256::SecretKey::random(&mut rand::rngs::OsRng);
+        let private_pem = secret_key.to_pkcs8_pem(EcLineEnding::LF).expect("encode ec private key");
+        let encoded_point = secret_key.public_key().to_encoded_point(false);
+        let x = general_purpose::URL_SAFE_NO_PAD.encode(encoded_point.x().expect("x coordinate"));
+        let y = general_purpose::URL_SAFE_NO_PAD.encode(encoded_point.y().expect("y coordinate"));
+
+        (private_pem.as_bytes().to_vec(), x, y)
+    }
+
+    #[test]
+    fn ec_decoding_key_from_jwk_accepts_a_p256_jwk() {
+        // Mirrors `rsa_decoding_key_from_jwk_accepts_an_rsa_jwk` above, but
+        // for SPIRE's *default* JWT-SVID key type: EC/P-256.
+        let (_private_pem, x, y) = generate_ec_keypair_with_jwk_xy();
+        let jwk = serde_json::json!({ "kty": "EC", "crv": "P-256", "x": x, "y": y, "kid": "ec-key-1" }).to_string();
+
+        assert!(ec_decoding_key_from_jwk(jwk.as_bytes()).is_some());
+    }
+
+    #[test]
+    fn ec_decoding_key_from_jwk_rejects_a_non_p256_curve() {
+        // `crv` values other than P-256 aren't supported by this crate's
+        // ES256-only EC support -- same "silently skip, don't fail" policy
+        // as any other unrecognized key type.
+        let jwk = serde_json::json!({
+            "kty": "EC",
+            "crv": "P-384",
+            "x": "ngLYQnlfF6GsojUwqtcEE3WgTNG2RUlsGhK73RNEl5k",
+            "y": "tKbiDSUSsQ3F1P7wteeHNXIcU-cx6CgSbroeQrQHTLM",
+            "kid": "ec-key-1"
+        })
+        .to_string();
+
+        assert!(ec_decoding_key_from_jwk(jwk.as_bytes()).is_none());
+    }
+
+    #[test]
+    fn ec_decoding_key_from_jwk_rejects_an_rsa_jwk() {
+        let mut rng = rand::rngs::OsRng;
+        let private_key = rsa::RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let public_key = rsa::RsaPublicKey::from(&private_key);
+        let n = general_purpose::URL_SAFE_NO_PAD.encode(public_key.n().to_bytes_be());
+        let e = general_purpose::URL_SAFE_NO_PAD.encode(public_key.e().to_bytes_be());
+        let jwk = serde_json::json!({ "kty": "RSA", "n": n, "e": e, "kid": "key-1" }).to_string();
+
+        assert!(ec_decoding_key_from_jwk(jwk.as_bytes()).is_none());
+    }
+
+    /// Test 1/3 required by the Task 11 / N8 brief: a mock ES256 (EC
+    /// P-256) key, loaded exactly the way [`Self::new`] would load it from
+    /// a live SPIRE JWT bundle (via [`JwtBundle::from_jwt_authorities`] +
+    /// [`verifier_from_jwt_bundles`]), is recognized and produces a usable
+    /// key -- proven here by successfully verifying a token signed by the
+    /// matching private key.
+    #[test]
+    fn es256_keys_loaded_from_spire() {
+        let (private_pem, x, y) = generate_ec_keypair_with_jwk_xy();
+        let jwks = serde_json::json!({
+            "keys": [
+                { "kty": "EC", "crv": "P-256", "x": x, "y": y, "kid": "spire-ec-key" }
+            ]
+        })
+        .to_string();
+
+        let trust_domain = spiffe::TrustDomain::new("example.org").unwrap();
+        let bundle = spiffe::JwtBundle::from_jwt_authorities(trust_domain, jwks.as_bytes()).unwrap();
+        let mut bundles = JwtBundleSet::default();
+        bundles.add_bundle(bundle);
+
+        let verifier = verifier_from_jwt_bundles(&bundles);
+
+        let signer = crate::jwt::JwtSigner::from_ec_pem_with_kid(&private_pem, "spire-ec-key".to_string()).unwrap();
+        let claims = crate::jwt::OboClaims {
+            sub: "spiffe://example.org/ns/orders/sa/orders-svc".to_string(),
+            aud: vec!["spiffe://example.org/ns/inventory/sa/inventory-svc".to_string()],
+            user: None,
+            act: None,
+            exp: 9_999_999_999,
+            iat: 0,
+            nbf: None,
+            jti: None,
+            cnf: None,
+            iss: None,
+        };
+        let token = signer.sign(&claims).unwrap();
+
+        assert!(
+            verifier.verify_signature(&token).is_ok(),
+            "ES256 key loaded from a SPIRE-shaped JWT bundle should be recognized and usable"
+        );
+    }
+
+    /// Test 2/3 required by the Task 11 / N8 brief: a token signed with
+    /// ES256 verifies successfully against a [`SpireProvider`]-style
+    /// verifier (i.e. one built by [`verifier_from_jwt_bundles`]).
+    #[test]
+    fn es256_token_verified() {
+        let (private_pem, x, y) = generate_ec_keypair_with_jwk_xy();
+        let jwks = serde_json::json!({
+            "keys": [
+                { "kty": "EC", "crv": "P-256", "x": x, "y": y, "kid": "es256-kid" }
+            ]
+        })
+        .to_string();
+
+        let trust_domain = spiffe::TrustDomain::new("chakra.internal").unwrap();
+        let bundle = spiffe::JwtBundle::from_jwt_authorities(trust_domain, jwks.as_bytes()).unwrap();
+        let mut bundles = JwtBundleSet::default();
+        bundles.add_bundle(bundle);
+        let verifier = verifier_from_jwt_bundles(&bundles);
+
+        let signer = crate::jwt::JwtSigner::from_ec_pem_with_kid(&private_pem, "es256-kid".to_string()).unwrap();
+        let token = signer
+            .sign(&crate::jwt::OboClaims {
+                sub: "spiffe://chakra.internal/ns/orders/sa/orders-svc".to_string(),
+                aud: vec!["spiffe://chakra.internal/ns/inventory/sa/inventory-svc".to_string()],
+                user: None,
+                act: None,
+                exp: 9_999_999_999,
+                iat: 0,
+                nbf: None,
+                jti: None,
+                cnf: None,
+                iss: None,
+            })
+            .unwrap();
+
+        let decoded = verifier.verify_signature(&token).unwrap();
+        assert_eq!(decoded.sub, "spiffe://chakra.internal/ns/orders/sa/orders-svc");
+    }
+
+    /// Test 3/3 required by the Task 11 / N8 brief: a JWT bundle
+    /// containing *both* an RSA and an EC/P-256 authority loads both key
+    /// types, and each verifies only tokens signed with its own matching
+    /// key/algorithm.
+    #[test]
+    fn mixed_rs256_and_es256_keys() {
+        let mut rng = rand::rngs::OsRng;
+        let rsa_private_key = rsa::RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let rsa_public_key = rsa::RsaPublicKey::from(&rsa_private_key);
+        let n = general_purpose::URL_SAFE_NO_PAD.encode(rsa_public_key.n().to_bytes_be());
+        let e = general_purpose::URL_SAFE_NO_PAD.encode(rsa_public_key.e().to_bytes_be());
+        let rsa_private_pem = rsa_private_key
+            .to_pkcs1_pem(LineEnding::LF)
+            .expect("encode rsa private key")
+            .to_string();
+
+        let (ec_private_pem, x, y) = generate_ec_keypair_with_jwk_xy();
+
+        let jwks = serde_json::json!({
+            "keys": [
+                { "kty": "RSA", "n": n, "e": e, "kid": "rsa-kid" },
+                { "kty": "EC", "crv": "P-256", "x": x, "y": y, "kid": "ec-kid" }
+            ]
+        })
+        .to_string();
+
+        let trust_domain = spiffe::TrustDomain::new("mixed.test").unwrap();
+        let bundle = spiffe::JwtBundle::from_jwt_authorities(trust_domain, jwks.as_bytes()).unwrap();
+        let mut bundles = JwtBundleSet::default();
+        bundles.add_bundle(bundle);
+        let verifier = verifier_from_jwt_bundles(&bundles);
+
+        let sample_claims = || crate::jwt::OboClaims {
+            sub: "spiffe://mixed.test/workload".to_string(),
+            aud: vec!["spiffe://mixed.test/aud".to_string()],
+            user: None,
+            act: None,
+            exp: 9_999_999_999,
+            iat: 0,
+            nbf: None,
+            jti: None,
+            cnf: None,
+            iss: None,
+        };
+
+        let rsa_signer =
+            crate::jwt::JwtSigner::from_rsa_pem_with_kid(rsa_private_pem.as_bytes(), "rsa-kid".to_string()).unwrap();
+        let rsa_token = rsa_signer.sign(&sample_claims()).unwrap();
+        assert!(verifier.verify_signature(&rsa_token).is_ok(), "RSA key from a mixed bundle should verify");
+
+        let ec_signer = crate::jwt::JwtSigner::from_ec_pem_with_kid(&ec_private_pem, "ec-kid".to_string()).unwrap();
+        let ec_token = ec_signer.sign(&sample_claims()).unwrap();
+        assert!(verifier.verify_signature(&ec_token).is_ok(), "EC key from a mixed bundle should verify");
     }
 
     /// Fix-round-1 regression: `issue_jwt_svid` used to bridge onto a

@@ -54,6 +54,13 @@ uuid = { version = "1.0", features = ["v4"] }
 spiffe = { version = "0.18", features = ["workload-api"] }
 
 [dev-dependencies]
+# Task 11 / N8: generates EC (P-256) test keypairs for ES256 coverage in
+# `src/jwt.rs` and `src/spire_provider.rs` -- production code never needs
+# this crate, since `jsonwebtoken::EncodingKey`/`DecodingKey` already know
+# how to sign/verify ES256 once handed PEM/JWK material; this is only for
+# *generating* that test-only material (SPIRE/real deployments hand over
+# already-formed JWKS, never raw EC scalars).
+p256 = { version = "0.13", features = ["jwk"] }
 # F12 tests: `InMemorySpanExporter`, for asserting on recorded span
 # attributes/status without a real OTLP collector.
 opentelemetry_sdk = { version = "0.27", features = ["testing"] }

@@ -1,10 +1,23 @@
 //! Signing and verifying JWT SVIDs (the OBO delegation token).
 //!
 //! Deliberately split into two narrow types: [`JwtSigner`] only signs,
-//! [`JwtVerifier`] only checks the RS256 signature and decodes claims — it
+//! [`JwtVerifier`] only checks the signature and decodes claims — it
 //! does **not** check `exp`/`aud`. Those checks happen centrally in
 //! `obo::validate` so each failure can map to a precise, distinct
 //! `DenyReason` instead of a single opaque "token invalid" error.
+//!
+//! ## Algorithms (Task 11 / N8)
+//!
+//! Both RS256 (RSA) and ES256 (EC, P-256) are supported. [`JwtSigner`]
+//! remembers which algorithm it was constructed for ([`Self::from_rsa_pem`]
+//! family vs. [`Self::from_ec_pem`] family) and stamps every token's
+//! header accordingly. [`JwtVerifier`] can hold a mix of RS256 and ES256
+//! keys side by side — each registered key carries its own
+//! [`jsonwebtoken::Algorithm`], and [`JwtVerifier::verify_signature`]
+//! looks that up (never trusting the unverified token header's own `alg`)
+//! before building a [`Validation`] restricted to exactly that one
+//! algorithm. This is what lets [`crate::SpireProvider`] trust a real
+//! SPIRE deployment's default ES256 JWT-SVID keys, not just RS256 ones.
 
 use base64::engine::{general_purpose, Engine as _};
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};
@@ -139,16 +152,20 @@ pub struct CertBinding {
     pub x5t_s256: String,
 }
 
-/// Signs JWT SVIDs with an RS256 private key.
+/// Signs JWT SVIDs with either an RS256 or an ES256 private key.
 ///
-/// `kid` is `None` for the original single-key flow ([`Self::from_rsa_pem`])
-/// and `Some` when built via [`Self::from_rsa_pem_with_kid`] — the latter
-/// stamps every signed token's header with that `kid`, so a verifier
-/// holding multiple keys (see [`JwtVerifier::from_jwks_entries`]) knows
-/// which one to use without changing anything about how the signature
-/// itself is produced.
+/// `kid` is `None` for the original single-key flows
+/// ([`Self::from_rsa_pem`]/[`Self::from_ec_pem`]) and `Some` when built via
+/// the `_with_kid` constructors — the latter stamp every signed token's
+/// header with that `kid`, so a verifier holding multiple keys (see
+/// [`JwtVerifier::from_jwks_entries`]) knows which one to use without
+/// changing anything about how the signature itself is produced. The
+/// signing algorithm itself (RS256 vs. ES256) is fixed at construction
+/// time by which constructor is used, and every token this signer
+/// produces carries that same algorithm in its header.
 pub struct JwtSigner {
     encoding_key: EncodingKey,
+    algorithm: Algorithm,
     kid: Option<String>,
 }
 
@@ -156,7 +173,11 @@ impl JwtSigner {
     pub fn from_rsa_pem(private_key_pem: &[u8]) -> Result<Self, JwtError> {
         let encoding_key = EncodingKey::from_rsa_pem(private_key_pem)
             .map_err(|source| JwtError::InvalidKey(source.to_string()))?;
-        Ok(Self { encoding_key, kid: None })
+        Ok(Self {
+            encoding_key,
+            algorithm: Algorithm::RS256,
+            kid: None,
+        })
     }
 
     /// Like [`Self::from_rsa_pem`], but every token this signer produces
@@ -167,28 +188,69 @@ impl JwtSigner {
             .map_err(|source| JwtError::InvalidKey(source.to_string()))?;
         Ok(Self {
             encoding_key,
+            algorithm: Algorithm::RS256,
+            kid: Some(kid),
+        })
+    }
+
+    /// ES256 (EC, P-256) equivalent of [`Self::from_rsa_pem`] — Task 11 /
+    /// N8. `private_key_pem` must be a PKCS#8-encoded EC private key (the
+    /// form `jsonwebtoken::EncodingKey::from_ec_pem` requires), e.g.:
+    ///
+    /// ```sh
+    /// openssl ecparam -genkey -noout -name prime256v1 \
+    ///     | openssl pkcs8 -topk8 -nocrypt -out ec-private.pem
+    /// ```
+    pub fn from_ec_pem(private_key_pem: &[u8]) -> Result<Self, JwtError> {
+        let encoding_key = EncodingKey::from_ec_pem(private_key_pem)
+            .map_err(|source| JwtError::InvalidKey(source.to_string()))?;
+        Ok(Self {
+            encoding_key,
+            algorithm: Algorithm::ES256,
+            kid: None,
+        })
+    }
+
+    /// Like [`Self::from_ec_pem`], but every token this signer produces
+    /// carries `kid` in its JWT header — see [`Self::from_rsa_pem_with_kid`]
+    /// for why that matters once more than one key is registered on the
+    /// verifying side.
+    pub fn from_ec_pem_with_kid(private_key_pem: &[u8], kid: String) -> Result<Self, JwtError> {
+        let encoding_key = EncodingKey::from_ec_pem(private_key_pem)
+            .map_err(|source| JwtError::InvalidKey(source.to_string()))?;
+        Ok(Self {
+            encoding_key,
+            algorithm: Algorithm::ES256,
             kid: Some(kid),
         })
     }
 
     pub fn sign(&self, claims: &OboClaims) -> Result<String, JwtError> {
-        let mut header = Header::new(Algorithm::RS256);
+        let mut header = Header::new(self.algorithm);
         header.kid = self.kid.clone();
         let token = jsonwebtoken::encode(&header, claims, &self.encoding_key)?;
         Ok(token)
     }
 }
 
-/// Verifies the RS256 signature on JWT SVIDs and decodes their claims.
+/// Verifies the RS256 or ES256 signature on JWT SVIDs and decodes their
+/// claims.
 ///
-/// Holds one or more keys, each optionally keyed by `kid`. With exactly one
-/// key and no `kid` registered (the original [`Self::from_rsa_pem`] flow),
-/// verification behaves exactly as before — single key, no `kid` header
-/// required. With more than one key (see [`Self::from_jwks_entries`]), the
-/// token's `kid` header is mandatory and selects which registered key
-/// verifies the signature; never both validated speculatively.
+/// Holds one or more keys, each optionally keyed by `kid` and each
+/// carrying its own [`Algorithm`] — RS256 and ES256 keys can be registered
+/// side by side in the same verifier (Task 11 / N8; see
+/// [`Self::from_jwks_entries_with_algorithms`]), which is what lets a
+/// single verifier trust a real SPIRE JWT bundle's mix of key types. With
+/// exactly one key and no `kid` registered (the original
+/// [`Self::from_rsa_pem`] flow), verification behaves exactly as before —
+/// single key, no `kid` header required. With more than one key, the
+/// token's `kid` header is mandatory and selects which registered key (and
+/// which algorithm) verifies the signature; never both validated
+/// speculatively, and the algorithm used to validate is always the one
+/// *registered* for that key, never the unverified token header's own
+/// `alg`.
 pub struct JwtVerifier {
-    keys: Vec<(Option<String>, DecodingKey)>,
+    keys: Vec<(Option<String>, DecodingKey, Algorithm)>,
 }
 
 impl JwtVerifier {
@@ -196,26 +258,56 @@ impl JwtVerifier {
         let decoding_key = DecodingKey::from_rsa_pem(public_key_pem)
             .map_err(|source| JwtError::InvalidKey(source.to_string()))?;
         Ok(Self {
-            keys: vec![(None, decoding_key)],
+            keys: vec![(None, decoding_key, Algorithm::RS256)],
         })
     }
 
-    /// Builds a verifier that trusts every key in a JWKS-style key set,
-    /// each identified by `kid` — this is what lets a token signed by one
-    /// gateway's active key verify successfully at another gateway that
-    /// loaded the same shared JWKS but signs with a different active key.
+    /// ES256 (EC, P-256) equivalent of [`Self::from_rsa_pem`] — Task 11 /
+    /// N8. `public_key_pem` is an EC public key in PEM format (the form
+    /// `jsonwebtoken::DecodingKey::from_ec_pem` requires).
+    pub fn from_ec_pem(public_key_pem: &[u8]) -> Result<Self, JwtError> {
+        let decoding_key = DecodingKey::from_ec_pem(public_key_pem)
+            .map_err(|source| JwtError::InvalidKey(source.to_string()))?;
+        Ok(Self {
+            keys: vec![(None, decoding_key, Algorithm::ES256)],
+        })
+    }
+
+    /// Builds a verifier that trusts every key in a JWKS-style RSA key
+    /// set, each identified by `kid` — this is what lets a token signed by
+    /// one gateway's active key verify successfully at another gateway
+    /// that loaded the same shared JWKS but signs with a different active
+    /// key. Every entry is assumed RS256, matching this constructor's
+    /// pre-Task-11 behavior exactly; see
+    /// [`Self::from_jwks_entries_with_algorithms`] for a mix of algorithms.
     pub fn from_jwks_entries(entries: Vec<(String, DecodingKey)>) -> Self {
         Self {
-            keys: entries.into_iter().map(|(kid, key)| (Some(kid), key)).collect(),
+            keys: entries
+                .into_iter()
+                .map(|(kid, key)| (Some(kid), key, Algorithm::RS256))
+                .collect(),
+        }
+    }
+
+    /// Like [`Self::from_jwks_entries`], but each entry carries its own
+    /// [`Algorithm`] — Task 11 / N8, so a single verifier can trust a mix
+    /// of RS256 and ES256 keys (e.g. [`crate::SpireProvider`]'s JWT
+    /// bundle, which may contain both).
+    pub fn from_jwks_entries_with_algorithms(entries: Vec<(String, DecodingKey, Algorithm)>) -> Self {
+        Self {
+            keys: entries
+                .into_iter()
+                .map(|(kid, key, algorithm)| (Some(kid), key, algorithm))
+                .collect(),
         }
     }
 
     /// Verifies the signature and returns the claims. Does not check
     /// expiry or audience — see the module doc comment for why.
     pub fn verify_signature(&self, token: &str) -> Result<OboClaims, JwtError> {
-        let decoding_key = self.select_key(token)?;
+        let (decoding_key, algorithm) = self.select_key(token)?;
 
-        let mut validation = Validation::new(Algorithm::RS256);
+        let mut validation = Validation::new(algorithm);
         validation.validate_exp = false;
         validation.validate_aud = false;
         validation.required_spec_claims.clear();
@@ -224,21 +316,23 @@ impl JwtVerifier {
         Ok(data.claims)
     }
 
-    /// Resolves which registered key should verify `token`'s signature.
-    /// Signed claims are never trusted before this check — the `kid`
-    /// comes from the (unverified) header, but it only ever *selects* a
-    /// key to verify against; it never substitutes for the signature
-    /// check itself.
-    fn select_key(&self, token: &str) -> Result<&DecodingKey, JwtError> {
+    /// Resolves which registered key (and its registered algorithm)
+    /// should verify `token`'s signature. Signed claims are never trusted
+    /// before this check — the `kid` comes from the (unverified) header,
+    /// but it only ever *selects* a key to verify against; it never
+    /// substitutes for the signature check itself, and the algorithm used
+    /// is always the one this verifier registered for that key, never
+    /// whatever `alg` the unverified header happens to claim.
+    fn select_key(&self, token: &str) -> Result<(&DecodingKey, Algorithm), JwtError> {
         let header = jsonwebtoken::decode_header(token)?;
         match &header.kid {
             Some(kid) => self
                 .keys
                 .iter()
-                .find(|(registered_kid, _)| registered_kid.as_deref() == Some(kid.as_str()))
-                .map(|(_, key)| key)
+                .find(|(registered_kid, _, _)| registered_kid.as_deref() == Some(kid.as_str()))
+                .map(|(_, key, algorithm)| (key, *algorithm))
                 .ok_or_else(|| JwtError::UnknownKeyId(kid.clone())),
-            None if self.keys.len() == 1 => Ok(&self.keys[0].1),
+            None if self.keys.len() == 1 => Ok((&self.keys[0].1, self.keys[0].2)),
             None => Err(JwtError::MissingKeyId),
         }
     }
@@ -266,6 +360,43 @@ mod tests {
             .expect("encode public key");
 
         (private_pem.as_bytes().to_vec(), public_pem.into_bytes())
+    }
+
+    /// Generates a fresh P-256 TEST-ONLY EC keypair: a PKCS#8 PEM private
+    /// key (what [`JwtSigner::from_ec_pem`]/[`JwtVerifier::from_ec_pem`]
+    /// expect) and the matching SEC1/SPKI PEM public key. Task 11 / N8.
+    /// Never do this in production code — SPIRE hands over already-formed
+    /// JWT bundles, not raw EC scalars.
+    fn generate_ec_keypair() -> (Vec<u8>, Vec<u8>) {
+        use p256::elliptic_curve::pkcs8::{EncodePrivateKey, EncodePublicKey, LineEnding};
+
+        let secret_key = p256::SecretKey::random(&mut rand::rngs::OsRng);
+        let private_pem = secret_key.to_pkcs8_pem(LineEnding::LF).expect("encode ec private key");
+        let public_pem = secret_key
+            .public_key()
+            .to_public_key_pem(LineEnding::LF)
+            .expect("encode ec public key");
+
+        (private_pem.as_bytes().to_vec(), public_pem.into_bytes())
+    }
+
+    /// Base64url (no padding) `x`/`y` JWK components for a freshly
+    /// generated P-256 keypair's public key, alongside its PKCS#8 PEM
+    /// private key — the shape SPIRE's JWT bundle hands back per EC
+    /// authority (see `src/spire_provider.rs`'s `ec_decoding_key_from_jwk`).
+    fn generate_ec_keypair_with_jwk_xy() -> (Vec<u8>, String, String) {
+        use p256::elliptic_curve::sec1::ToEncodedPoint;
+
+        let secret_key = p256::SecretKey::random(&mut rand::rngs::OsRng);
+        let private_pem = {
+            use p256::elliptic_curve::pkcs8::{EncodePrivateKey, LineEnding};
+            secret_key.to_pkcs8_pem(LineEnding::LF).expect("encode ec private key")
+        };
+        let encoded_point = secret_key.public_key().to_encoded_point(false);
+        let x = general_purpose::URL_SAFE_NO_PAD.encode(encoded_point.x().expect("x coordinate"));
+        let y = general_purpose::URL_SAFE_NO_PAD.encode(encoded_point.y().expect("y coordinate"));
+
+        (private_pem.as_bytes().to_vec(), x, y)
     }
 
     fn sample_claims(exp: i64) -> OboClaims {
@@ -565,5 +696,104 @@ mod tests {
         assert_eq!(claims.jti, None);
         assert_eq!(claims.cnf, None);
         assert_eq!(claims.delegation_depth(), 0);
+    }
+
+    // --- ES256 (Task 11 / N8) ---
+
+    #[test]
+    fn es256_signs_and_verifies_round_trip() {
+        let (private_pem, public_pem) = generate_ec_keypair();
+        let signer = JwtSigner::from_ec_pem(&private_pem).unwrap();
+        let verifier = JwtVerifier::from_ec_pem(&public_pem).unwrap();
+
+        let claims = sample_claims(9_999_999_999);
+        let token = signer.sign(&claims).unwrap();
+        let decoded = verifier.verify_signature(&token).unwrap();
+
+        assert_eq!(decoded, claims);
+    }
+
+    #[test]
+    fn es256_token_stamps_es256_in_the_header() {
+        let (private_pem, _) = generate_ec_keypair();
+        let signer = JwtSigner::from_ec_pem(&private_pem).unwrap();
+        let token = signer.sign(&sample_claims(9_999_999_999)).unwrap();
+
+        let header = jsonwebtoken::decode_header(&token).unwrap();
+        assert_eq!(header.alg, Algorithm::ES256);
+    }
+
+    #[test]
+    fn es256_rejects_a_token_signed_by_a_different_key() {
+        let (private_pem_a, _) = generate_ec_keypair();
+        let (_, public_pem_b) = generate_ec_keypair();
+
+        let signer = JwtSigner::from_ec_pem(&private_pem_a).unwrap();
+        let verifier = JwtVerifier::from_ec_pem(&public_pem_b).unwrap();
+
+        let token = signer.sign(&sample_claims(9_999_999_999)).unwrap();
+        assert!(verifier.verify_signature(&token).is_err());
+    }
+
+    #[test]
+    fn es256_rejects_an_rs256_token_even_with_a_structurally_valid_kid() {
+        // An RS256-signed token must never verify against an ES256-only
+        // verifier, even if somehow handed the "right" kid — algorithms
+        // are never mixed up across key types.
+        let (rsa_private_pem, _) = generate_keypair();
+        let (_, ec_public_pem) = generate_ec_keypair();
+
+        let rsa_signer = JwtSigner::from_rsa_pem_with_kid(&rsa_private_pem, "key-1".to_string()).unwrap();
+        let ec_decoding_key = DecodingKey::from_ec_pem(&ec_public_pem).unwrap();
+        let verifier = JwtVerifier::from_jwks_entries_with_algorithms(vec![(
+            "key-1".to_string(),
+            ec_decoding_key,
+            Algorithm::ES256,
+        )]);
+
+        let token = rsa_signer.sign(&sample_claims(9_999_999_999)).unwrap();
+        assert!(verifier.verify_signature(&token).is_err());
+    }
+
+    #[test]
+    fn from_jwks_entries_with_algorithms_verifies_mixed_rs256_and_es256_keys() {
+        let (rsa_private_pem, rsa_public_pem) = generate_keypair();
+        let (ec_private_pem, ec_public_pem) = generate_ec_keypair();
+
+        let rsa_decoding_key = DecodingKey::from_rsa_pem(&rsa_public_pem).unwrap();
+        let ec_decoding_key = DecodingKey::from_ec_pem(&ec_public_pem).unwrap();
+        let verifier = JwtVerifier::from_jwks_entries_with_algorithms(vec![
+            ("rsa-key".to_string(), rsa_decoding_key, Algorithm::RS256),
+            ("ec-key".to_string(), ec_decoding_key, Algorithm::ES256),
+        ]);
+
+        let rsa_signer = JwtSigner::from_rsa_pem_with_kid(&rsa_private_pem, "rsa-key".to_string()).unwrap();
+        let ec_signer = JwtSigner::from_ec_pem_with_kid(&ec_private_pem, "ec-key".to_string()).unwrap();
+
+        let rsa_token = rsa_signer.sign(&sample_claims(9_999_999_999)).unwrap();
+        let ec_token = ec_signer.sign(&sample_claims(9_999_999_999)).unwrap();
+
+        assert!(verifier.verify_signature(&rsa_token).is_ok());
+        assert!(verifier.verify_signature(&ec_token).is_ok());
+    }
+
+    #[test]
+    fn decoding_key_from_ec_components_matches_a_jwk_style_x_y_pair() {
+        // Proves the (x, y) base64url JWK components SPIRE's JWT bundle
+        // hands back per EC authority (see `spire_provider::
+        // ec_decoding_key_from_jwk`) are exactly what
+        // `DecodingKey::from_ec_components` expects, by round-tripping a
+        // token through a verifier built that way instead of from a PEM.
+        let (private_pem, x, y) = generate_ec_keypair_with_jwk_xy();
+        let signer = JwtSigner::from_ec_pem(&private_pem).unwrap();
+
+        let decoding_key = DecodingKey::from_ec_components(&x, &y).unwrap();
+        let verifier = JwtVerifier { keys: vec![(None, decoding_key, Algorithm::ES256)] };
+
+        let claims = sample_claims(9_999_999_999);
+        let token = signer.sign(&claims).unwrap();
+        let decoded = verifier.verify_signature(&token).unwrap();
+
+        assert_eq!(decoded, claims);
     }
 }

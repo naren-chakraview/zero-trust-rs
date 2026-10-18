@@ -1107,3 +1107,524 @@ fn untrusted_user_issuer_rejected() {
 
     assert!(matches!(err, IdentityError::UntrustedUserIssuer(iss) if iss == "untrusted-idp.example"));
 }
+
+// --- Task 3 (N2): bind certificates at exchange -----------------------------
+//
+// Review 0002 finding N2: `exchange_token` used to copy `cnf` verbatim from
+// the inbound token, so a certificate-bound token died (or worse, stayed
+// bound to a *stale* cert) after a single hop -- the exchanging gateway
+// never got the chance to re-bind it to its own certificate. A gateway
+// compromised after minting a token could have that token stolen and
+// replayed elsewhere, since nothing re-anchored the binding to the actual
+// party presenting it at each hop.
+//
+// `exchange_token_with_cert_binding` fixes this: it (1) validates that the
+// inbound token's `cnf`, if present, matches the thumbprint of the cert the
+// *exchanging* caller actually presented, then (2) re-mints the new token
+// bound to *that* caller's cert -- never to whatever the inbound token
+// happened to carry. These integration tests exercise that behavior through
+// the crate's public API, the same way the N3/N4/N5 tests above do for their
+// own findings.
+
+const N2_ORDERS_GW: &str = "spiffe://chakra.internal/ns/orders-gw/sa/orders-gw";
+const N2_INVENTORY_GW: &str = "spiffe://chakra.internal/ns/inventory-gw/sa/inventory-gw";
+const N2_BACKEND: &str = "spiffe://chakra.internal/ns/backend/sa/backend";
+
+fn n2_issuer() -> LocalIssuer {
+    LocalIssuer::generate(placeholder_registry(), 300).unwrap()
+}
+
+/// 1. A token minted unbound at the originator (hop A), then exchanged at
+///    hop B while hop B presents its own certificate, comes back bound to
+///    **hop B's** thumbprint -- not left unbound, and not bound to anything
+///    hop A had (hop A's token carried no `cnf` at all).
+#[test]
+fn cert_binding_at_exchange() {
+    let issuer = n2_issuer();
+    let now = 1_000i64;
+    const HOP_B_THUMBPRINT: &str = "hop-b-cert-thumbprint";
+
+    // Hop A's token: no `cnf` at all -- an ordinary unbound token, exactly
+    // what a first-hop issuance looks like today.
+    let claims = OboClaims {
+        sub: "spiffe://chakra.internal/ns/originator/sa/originator".to_string(),
+        aud: vec![N2_ORDERS_GW.to_string()],
+        user: None,
+        act: None,
+        iat: now,
+        exp: now + 300,
+        nbf: None,
+        jti: None,
+        cnf: None,
+        iss: None,
+    };
+    let token_at_a = issuer.sign_claims(&claims).unwrap();
+
+    // Hop B exchanges it onward, presenting its own cert to the admin
+    // listener -- the new token must come back bound to that cert.
+    let destination_workload: SpiffeId = N2_ORDERS_GW.parse().unwrap();
+    let (token_at_b, _ttl) = exchange_token_with_cert_binding(
+        &token_at_a,
+        N2_INVENTORY_GW,
+        &destination_workload,
+        5,
+        &issuer,
+        issuer.verifier(),
+        &N2_ORDERS_GW.parse::<SpiffeId>().unwrap(),
+        300,
+        now,
+        Some(HOP_B_THUMBPRINT),
+    )
+    .unwrap();
+
+    let claims_at_b = issuer.verifier().verify_signature(&token_at_b).unwrap();
+    assert_eq!(
+        claims_at_b.cnf,
+        Some(CertBinding {
+            x5t_s256: HOP_B_THUMBPRINT.to_string()
+        }),
+        "the re-minted token must be bound to hop B's own cert, not left unbound"
+    );
+}
+
+/// 2. A token already bound to hop A's cert, presented for exchange by a
+///    caller whose presented cert thumbprint does *not* match, is rejected
+///    with `CertificateBindingMismatch` -- a stolen bound token can't simply
+///    be re-exchanged by whoever currently holds it.
+#[test]
+fn cert_binding_mismatch_at_exchange() {
+    let issuer = n2_issuer();
+    let now = 1_000i64;
+    const HOP_A_THUMBPRINT: &str = "hop-a-cert-thumbprint";
+    const ATTACKER_THUMBPRINT: &str = "attacker-cert-thumbprint";
+
+    let claims = OboClaims {
+        sub: "spiffe://chakra.internal/ns/originator/sa/originator".to_string(),
+        aud: vec![N2_ORDERS_GW.to_string()],
+        user: None,
+        act: None,
+        iat: now,
+        exp: now + 300,
+        nbf: None,
+        jti: None,
+        cnf: Some(CertBinding {
+            x5t_s256: HOP_A_THUMBPRINT.to_string(),
+        }),
+        iss: None,
+    };
+    let bound_token = issuer.sign_claims(&claims).unwrap();
+
+    let destination_workload: SpiffeId = N2_ORDERS_GW.parse().unwrap();
+
+    // The legitimate holder (presenting hop A's own cert) can still
+    // exchange it -- proves the mismatch below is really about the cert,
+    // not some other failure mode.
+    let legit_result = exchange_token_with_cert_binding(
+        &bound_token,
+        N2_INVENTORY_GW,
+        &destination_workload,
+        5,
+        &issuer,
+        issuer.verifier(),
+        &N2_ORDERS_GW.parse::<SpiffeId>().unwrap(),
+        300,
+        now,
+        Some(HOP_A_THUMBPRINT),
+    );
+    assert!(legit_result.is_ok(), "the legitimate cert holder must still be able to exchange");
+
+    // An attacker presenting a *different* cert (or the token stolen and
+    // replayed from a connection with no matching cert at all) must be
+    // denied -- the whole point of the N2 fix.
+    let mismatched_result = exchange_token_with_cert_binding(
+        &bound_token,
+        N2_INVENTORY_GW,
+        &destination_workload,
+        5,
+        &issuer,
+        issuer.verifier(),
+        &N2_ORDERS_GW.parse::<SpiffeId>().unwrap(),
+        300,
+        now,
+        Some(ATTACKER_THUMBPRINT),
+    );
+    assert_eq!(mismatched_result.unwrap_err(), TokenExchangeError::CertificateBindingMismatch);
+
+    // No cert presented at all is just as much a mismatch -- fails closed,
+    // never open.
+    let no_cert_result = exchange_token_with_cert_binding(
+        &bound_token,
+        N2_INVENTORY_GW,
+        &destination_workload,
+        5,
+        &issuer,
+        issuer.verifier(),
+        &N2_ORDERS_GW.parse::<SpiffeId>().unwrap(),
+        300,
+        now,
+        None,
+    );
+    assert_eq!(no_cert_result.unwrap_err(), TokenExchangeError::CertificateBindingMismatch);
+}
+
+/// 3. A three-hop chain (gw-a -> gw-b -> gw-c -> backend), with each
+///    exchanging hop presenting its *own* cert, ends up re-bound at every
+///    hop: hop 1's output is bound to gw-a, hop 2's to gw-b, hop 3's to
+///    gw-c -- never to some earlier hop's stale binding. Each hop's inbound
+///    token (simulating what that hop received, already consumed by its own
+///    transport-level cert-binding check at the proxy listener -- see the
+///    pre-existing `obo::validate_with_cert_binding`/F5 tests -- and handed
+///    to *this* exchange unbound) carries no `cnf` of its own; this isolates
+///    exactly the re-binding mechanism this test targets (`cnf` always ends
+///    up set to whatever the *current* exchanging hop presents) from the
+///    separate "does the presented cert match an existing binding" check,
+///    which `cert_binding_mismatch_at_exchange` above already covers.
+///    `sub`/`act` (the signed delegation chain) are threaded through for
+///    real at every hop, proving re-binding and chain-accumulation both
+///    work correctly together across all three exchanges.
+#[test]
+fn cert_binding_propagates_through_chain() {
+    let issuer = n2_issuer();
+    let now = 1_000i64;
+    const GW_A_THUMBPRINT: &str = "gw-a-cert-thumbprint";
+    const GW_B_THUMBPRINT: &str = "gw-b-cert-thumbprint";
+    const GW_C_THUMBPRINT: &str = "gw-c-cert-thumbprint";
+
+    let gw_a: SpiffeId = "spiffe://chakra.internal/ns/gw-a/sa/gw-a".parse().unwrap();
+    let gw_b: SpiffeId = "spiffe://chakra.internal/ns/gw-b/sa/gw-b".parse().unwrap();
+    let gw_c: SpiffeId = "spiffe://chakra.internal/ns/gw-c/sa/gw-c".parse().unwrap();
+
+    // Originator's token, addressed to gw-a, unbound.
+    let originator_claims = OboClaims {
+        sub: "spiffe://chakra.internal/ns/originator/sa/originator".to_string(),
+        aud: vec![gw_a.to_string()],
+        user: Some("spiffe://chakra.internal/ns/alice/sa/alice".to_string()),
+        act: None,
+        iat: now,
+        exp: now + 300,
+        nbf: None,
+        jti: None,
+        cnf: None,
+        iss: None,
+    };
+    let token_0 = issuer.sign_claims(&originator_claims).unwrap();
+
+    // Hop 1: gw-a exchanges toward gw-b, presenting its own cert -- the
+    // inbound token had no `cnf`, so there's nothing to mismatch against;
+    // the new token comes back bound to gw-a.
+    let (token_1, _) = exchange_token_with_cert_binding(
+        &token_0,
+        "spiffe://chakra.internal/ns/gw-b/sa/gw-b",
+        &gw_a,
+        5,
+        &issuer,
+        issuer.verifier(),
+        &gw_a,
+        300,
+        now,
+        Some(GW_A_THUMBPRINT),
+    )
+    .unwrap();
+    let claims_1 = issuer.verifier().verify_signature(&token_1).unwrap();
+    assert_eq!(
+        claims_1.cnf,
+        Some(CertBinding {
+            x5t_s256: GW_A_THUMBPRINT.to_string()
+        }),
+        "hop 1's output must be bound to gw-a's own cert"
+    );
+
+    // Hop 2: gw-b receives a token carrying the delegation chain built so
+    // far (`sub` + `act` from hop 1's output) but, as it arrives for *this*
+    // exchange, unbound -- re-signed as a fresh "inbound" claims set with
+    // `cnf: None`, exactly like `token_0` was. gw-b then exchanges it
+    // toward gw-c, presenting its own cert.
+    let hop2_inbound_claims = OboClaims {
+        sub: claims_1.sub.clone(),
+        aud: vec![gw_b.to_string()],
+        user: claims_1.user.clone(),
+        act: claims_1.act.clone(),
+        iat: now,
+        exp: now + 300,
+        nbf: None,
+        jti: None,
+        cnf: None,
+        iss: None,
+    };
+    let token_1_unbound = issuer.sign_claims(&hop2_inbound_claims).unwrap();
+
+    let (token_2, _) = exchange_token_with_cert_binding(
+        &token_1_unbound,
+        "spiffe://chakra.internal/ns/gw-c/sa/gw-c",
+        &gw_b,
+        5,
+        &issuer,
+        issuer.verifier(),
+        &gw_b,
+        300,
+        now,
+        Some(GW_B_THUMBPRINT),
+    )
+    .unwrap();
+    let claims_2 = issuer.verifier().verify_signature(&token_2).unwrap();
+    assert_eq!(
+        claims_2.cnf,
+        Some(CertBinding {
+            x5t_s256: GW_B_THUMBPRINT.to_string()
+        }),
+        "hop 2's output must be bound to gw-b's own cert, not gw-a's stale binding"
+    );
+    assert_ne!(claims_2.cnf, claims_1.cnf, "the binding must change at every hop, never survive unchanged");
+    // Chain so far: [originator, gw-a, gw-b].
+    assert_eq!(claims_2.delegation_depth(), 2);
+
+    // Hop 3: gw-c, same pattern -- receives the chain-so-far unbound, then
+    // exchanges toward the final backend presenting its own cert.
+    let hop3_inbound_claims = OboClaims {
+        sub: claims_2.sub.clone(),
+        aud: vec![gw_c.to_string()],
+        user: claims_2.user.clone(),
+        act: claims_2.act.clone(),
+        iat: now,
+        exp: now + 300,
+        nbf: None,
+        jti: None,
+        cnf: None,
+        iss: None,
+    };
+    let token_2_unbound = issuer.sign_claims(&hop3_inbound_claims).unwrap();
+
+    let (token_3, _) = exchange_token_with_cert_binding(
+        &token_2_unbound,
+        N2_BACKEND,
+        &gw_c,
+        5,
+        &issuer,
+        issuer.verifier(),
+        &gw_c,
+        300,
+        now,
+        Some(GW_C_THUMBPRINT),
+    )
+    .unwrap();
+    let final_claims = issuer.verifier().verify_signature(&token_3).unwrap();
+    assert_eq!(
+        final_claims.cnf,
+        Some(CertBinding {
+            x5t_s256: GW_C_THUMBPRINT.to_string()
+        }),
+        "the final token must be bound to the most recent hop's (gw-c's) cert"
+    );
+    assert_ne!(final_claims.cnf, claims_1.cnf);
+    assert_ne!(final_claims.cnf, claims_2.cnf);
+
+    // The delegation chain itself accumulates correctly across all three
+    // real exchange calls, exactly as the N4 fix proves separately --
+    // re-binding at every hop doesn't disturb it.
+    assert_eq!(
+        final_claims.delegation_chain(),
+        vec![
+            "spiffe://chakra.internal/ns/originator/sa/originator".to_string(),
+            gw_a.to_string(),
+            gw_b.to_string(),
+            gw_c.to_string(),
+        ]
+    );
+}
+
+// --- Task 5 (N7, review 0002): split private signing keys from public JWKS ---
+//
+// Before this fix, `LocalIssuer::with_jwks`'s document embedded a
+// `private_key_pem` for *every* `kid` in the trust domain, so any gateway
+// that loaded the shared JWKS could mint tokens as any key, not just its
+// own (review 0002 finding N7, carrying forward F4). These tests exercise
+// the fix: a private signing key loaded from one file (issuer-only), a
+// public JWKS loaded from a wholly separate file (every verifier), and
+// proof that the public document itself never carries private material.
+
+/// A fresh, TEST-ONLY 2048-bit RSA keypair's private half as PKCS#1 PEM
+/// bytes -- the same shape `GatewayConfig::signing_key_path` loads in
+/// production.
+fn generate_private_key_pem() -> Vec<u8> {
+    let mut rng = rand::rngs::OsRng;
+    let private_key = RsaPrivateKey::new(&mut rng, 2048).unwrap();
+    private_key.to_pkcs1_pem(LineEnding::LF).unwrap().as_bytes().to_vec()
+}
+
+/// A scratch directory for this test module's temp files, one per test
+/// (unlike `src/ca.rs`/`src/tls.rs`'s single shared dir) since more than
+/// one of these tests writes a `public-jwks.json` file and cargo test
+/// runs every test in this binary concurrently in one process.
+fn n7_scratch_dir(test_name: &str) -> std::path::PathBuf {
+    let dir = std::env::temp_dir().join(format!("zt-gateway-n7-test-{}-{test_name}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    dir
+}
+
+/// Test 1/3: a `public_jwks` document -- the file every gateway's
+/// `GatewayConfig::jwks_path` loads -- contains only standard public JWK
+/// fields (`kid`, `kty`, `n`, `e`) and none of RSA's private-key fields
+/// (`d`, `p`, `q`, `dp`, `dq`, `qi`). Written to and read back from an
+/// actual file on disk, the same round trip `zt-gateway`'s `main` does for
+/// `jwks_path`, not just an in-memory JSON string.
+#[test]
+fn public_jwks_contains_only_public_keys() {
+    let private_pem = generate_private_key_pem();
+    let public_jwks = JsonWebKeySet::from_rsa_private_pem("key-1".to_string(), &private_pem).unwrap();
+
+    let dir = n7_scratch_dir("public_jwks_contains_only_public_keys");
+    let jwks_path = dir.join("public-jwks.json");
+    std::fs::write(&jwks_path, public_jwks.to_json().unwrap()).unwrap();
+
+    let raw = std::fs::read_to_string(&jwks_path).unwrap();
+
+    // None of RSA's private-key PKCS#1 fields ever appear as a JSON key in
+    // the written document.
+    for private_field in ["\"d\":", "\"p\":", "\"q\":", "\"dp\":", "\"dq\":", "\"qi\":"] {
+        assert!(
+            !raw.contains(private_field),
+            "public_jwks file must never contain the private-key field {private_field}, but it did: {raw}"
+        );
+    }
+    // Sanity check this isn't just an empty/degenerate document -- the
+    // standard public fields are genuinely present.
+    assert!(raw.contains("\"kid\""));
+    assert!(raw.contains("\"kty\""));
+    assert!(raw.contains("\"n\""));
+    assert!(raw.contains("\"e\""));
+
+    // And it round-trips back into a `JsonWebKeySet` with the same key.
+    let loaded = JsonWebKeySet::from_json(&raw).unwrap();
+    assert_eq!(loaded.keys.len(), 1);
+    assert_eq!(loaded.keys[0].kid, "key-1");
+    assert_eq!(loaded.keys[0].kty, "RSA");
+}
+
+/// Test 2/3: `LocalIssuer::with_separated_keys` signs with the loaded
+/// private key (`signing_key_pem`), not with anything derived from the
+/// public JWKS -- and the resulting token verifies correctly against that
+/// same issuer's verifier (itself built from the public JWKS, never from
+/// the private key directly).
+#[test]
+fn signing_uses_private_key_not_public() {
+    let private_pem = generate_private_key_pem();
+    let public_jwks = JsonWebKeySet::from_rsa_private_pem("key-1".to_string(), &private_pem).unwrap();
+
+    let reg = Registry::from_yaml_str(&format!(
+        r#"
+trust_domain: chakra.internal
+workloads:
+  - name: orders-svc
+    spiffe_id: {ORDERS}
+    max_obo_chain_depth: 3
+    allowed_callers: []
+    bootstrap_token: orders-secret
+"#
+    ))
+    .unwrap();
+
+    let issuer =
+        LocalIssuer::with_separated_keys(reg, &private_pem, Some("key-1".to_string()), &public_jwks, 300).unwrap();
+    assert!(issuer.has_separated_signing_key(), "issuer must track its private key separately");
+
+    let issued = issuer.issue_jwt_svid("orders-svc", INVENTORY, "orders-secret").unwrap();
+
+    // The token is stamped with the kid this issuer signs with...
+    let header = jsonwebtoken::decode_header(&issued.token).unwrap();
+    assert_eq!(header.kid, Some("key-1".to_string()));
+
+    // ...and actually verifies: the signature was produced by the private
+    // key loaded from `signing_key_pem`, matching the public key published
+    // in `public_jwks` under the same kid.
+    let claims = issuer.verifier().verify_signature(&issued.token).unwrap();
+    assert_eq!(claims.sub, ORDERS);
+
+    // A token signed by some other, unrelated private key must NOT verify
+    // against this issuer -- proving the issuer's verifier is actually
+    // anchored to the public_jwks key material, not accepting anything.
+    let rogue_pem = generate_private_key_pem();
+    let rogue_signer = JwtSigner::from_rsa_pem_with_kid(&rogue_pem, "key-1".to_string()).unwrap();
+    let rogue_token = rogue_signer
+        .sign(&OboClaims {
+            sub: ORDERS.to_string(),
+            aud: vec![INVENTORY.to_string()],
+            user: None,
+            act: None,
+            iat: 0,
+            exp: 9_999_999_999,
+            nbf: None,
+            jti: None,
+            cnf: None,
+            iss: None,
+        })
+        .unwrap();
+    assert!(issuer.verifier().verify_signature(&rogue_token).is_err());
+}
+
+/// Test 3/3: the issuer side (holds the private key, loaded from
+/// `signing_key_pem`) and the verifier side (holds only `public_jwks`, and
+/// nothing else -- no `LocalIssuer`, no private key ever in scope) are
+/// genuinely separate objects built from separate inputs, and both work
+/// correctly: the issuer signs, the standalone verifier verifies, with
+/// zero private-key material anywhere in the verifier's construction
+/// path.
+#[test]
+fn issuer_and_verifier_paths_separate() {
+    let private_pem = generate_private_key_pem();
+    let public_jwks = JsonWebKeySet::from_rsa_private_pem("key-1".to_string(), &private_pem).unwrap();
+
+    // Round-trip public_jwks through a file, same as a verifier-only
+    // gateway loading `GatewayConfig::jwks_path` would.
+    let dir = n7_scratch_dir("issuer_and_verifier_paths_separate");
+    let jwks_path = dir.join("public-jwks.json");
+    std::fs::write(&jwks_path, public_jwks.to_json().unwrap()).unwrap();
+    let loaded_public_jwks = JsonWebKeySet::from_json(&std::fs::read_to_string(&jwks_path).unwrap()).unwrap();
+
+    // The issuer side: loads the private key (never written anywhere by
+    // this test other than directly into `with_separated_keys`) plus the
+    // public JWKS, and can sign.
+    let reg = Registry::from_yaml_str(&format!(
+        r#"
+trust_domain: chakra.internal
+workloads:
+  - name: orders-svc
+    spiffe_id: {ORDERS}
+    max_obo_chain_depth: 3
+    allowed_callers: []
+    bootstrap_token: orders-secret
+"#
+    ))
+    .unwrap();
+    let issuer = LocalIssuer::with_separated_keys(
+        reg,
+        &private_pem,
+        Some("key-1".to_string()),
+        &loaded_public_jwks,
+        300,
+    )
+    .unwrap();
+
+    // The verifier side: built directly from the public JWKS alone --
+    // `JsonWebKeySet::to_verifier` never sees `private_pem` at all. This
+    // is what a verify-only consumer of `jwks_path` would hold.
+    let standalone_verifier = loaded_public_jwks.to_verifier().unwrap();
+
+    let issued = issuer.issue_jwt_svid("orders-svc", INVENTORY, "orders-secret").unwrap();
+
+    // Both the issuer's own verifier and the wholly independent
+    // standalone verifier (which never touched the private key) accept
+    // the token the issuer signed.
+    assert!(issuer.verifier().verify_signature(&issued.token).is_ok());
+    let claims = standalone_verifier.verify_signature(&issued.token).unwrap();
+    assert_eq!(claims.sub, ORDERS);
+    assert_eq!(claims.aud, vec![INVENTORY.to_string()]);
+
+    // And the public_jwks document this all ran through still carries no
+    // private material (belt-and-suspenders with
+    // `public_jwks_contains_only_public_keys` above, this time against the
+    // exact file this test's issuer and verifier both actually loaded).
+    let raw = std::fs::read_to_string(&jwks_path).unwrap();
+    for private_field in ["\"d\":", "\"p\":", "\"q\":", "\"dp\":", "\"dq\":", "\"qi\":"] {
+        assert!(!raw.contains(private_field));
+    }
+}

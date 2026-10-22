@@ -161,8 +161,11 @@ pub struct Route {
     #[serde(default = "default_route_host_pattern")]
     pub host_pattern: String,
 
-    /// Wildcard pattern matched against the request's path, e.g.
-    /// `/api/inventory/*`.
+    /// Path pattern matched against the request's path. `*` matches one path
+    /// segment and `**` matches any number of segments, so `/api/inventory/*`
+    /// matches `/api/inventory/42` but not `/api/inventory/42/items`. Use
+    /// `/api/inventory/**` for the latter. Requests with dot-segments or encoded
+    /// slashes are refused before matching (review 0003 R4).
     pub path_pattern: String,
 
     /// The SPIFFE ID of the workload this route forwards to. Validated
@@ -210,7 +213,7 @@ impl RouteTable {
         let host = host.unwrap_or("");
         self.routes
             .iter()
-            .find(|route| wildcard_matches(&route.host_pattern, host) && wildcard_matches(&route.path_pattern, path))
+            .find(|route| wildcard_matches(&route.host_pattern, host) && path_matches(&route.path_pattern, path))
             .map(|route| (route.workload_id.clone(), route.upstream_addr.clone()))
     }
 }
@@ -228,6 +231,53 @@ pub(crate) fn wildcard_matches(pattern: &str, value: &str) -> bool {
         }
     }
     do_match(pattern.as_bytes(), value.as_bytes())
+}
+
+/// Matches a request path against a route or capability pattern (review 0003
+/// R4). `*` matches within one path segment and never crosses `/`. `**` matches
+/// any run of segments, including none. Everything else matches literally.
+///
+/// The paths passed in must already have passed [`unsafe_path_reason`], so a
+/// `*` can't be used to reach a segment the pattern author didn't mean.
+pub(crate) fn path_matches(pattern: &str, path: &str) -> bool {
+    fn do_match(pattern: &[u8], path: &[u8]) -> bool {
+        match pattern {
+            [] => path.is_empty(),
+            [b'*', b'*', rest @ ..] => (0..=path.len()).any(|i| do_match(rest, &path[i..])),
+            [b'*', rest @ ..] => {
+                for i in 0..=path.len() {
+                    if do_match(rest, &path[i..]) {
+                        return true;
+                    }
+                    // A single `*` can't consume a `/`, so stop at the first one.
+                    if path.get(i) == Some(&b'/') {
+                        break;
+                    }
+                }
+                false
+            }
+            [c, rest @ ..] => path.first() == Some(c) && do_match(rest, &path[1..]),
+        }
+    }
+    do_match(pattern.as_bytes(), path.as_bytes())
+}
+
+/// Why a request path must be refused before routing or authorization, or
+/// `None` when it's safe to match (review 0003 R4). Refuses dot-segments
+/// (`.`, `..`), empty segments (`//`), and percent-encoded dots or slashes,
+/// which a backend could decode into a different path than the gateway matched.
+pub fn unsafe_path_reason(path: &str) -> Option<&'static str> {
+    let lower = path.to_ascii_lowercase();
+    if lower.contains("%2e") || lower.contains("%2f") {
+        return Some("encoded_dot_or_slash");
+    }
+    if path.contains("//") {
+        return Some("empty_segment");
+    }
+    if path.split('/').any(|segment| segment == "." || segment == "..") {
+        return Some("dot_segment");
+    }
+    None
 }
 
 /// Loaded from a YAML file, with a handful of fields overridable by
@@ -1173,4 +1223,32 @@ protected_workload: spiffe://chakra.internal/ns/inventory/sa/inventory-svc
         assert!(config.require_cert_binding.is_none());
         assert!(!config.effective_require_cert_binding());
     }
+
+    // --- R4 (review 0003): segment-aware path matching ---
+
+    #[test]
+    fn single_star_matches_one_segment_only() {
+        assert!(path_matches("/orders/*", "/orders/42"));
+        assert!(!path_matches("/orders/*", "/orders/42/items"));
+        assert!(!path_matches("/orders/*", "/orders/../admin/keys"));
+    }
+
+    #[test]
+    fn double_star_matches_any_number_of_segments() {
+        assert!(path_matches("/orders/**", "/orders/42/items/7"));
+        assert!(path_matches("/orders/**", "/orders/"));
+        assert!(!path_matches("/orders/**", "/admin/orders/42"));
+    }
+
+    #[test]
+    fn unsafe_paths_are_refused_before_matching() {
+        assert_eq!(unsafe_path_reason("/orders/../admin"), Some("dot_segment"));
+        assert_eq!(unsafe_path_reason("/orders/./42"), Some("dot_segment"));
+        assert_eq!(unsafe_path_reason("/orders/%2e%2e/admin"), Some("encoded_dot_or_slash"));
+        assert_eq!(unsafe_path_reason("/orders%2F..%2Fadmin"), Some("encoded_dot_or_slash"));
+        assert_eq!(unsafe_path_reason("/orders//42"), Some("empty_segment"));
+        assert_eq!(unsafe_path_reason("/orders/42"), None);
+        assert_eq!(unsafe_path_reason("/a.b/c..d"), None, "dots inside a segment are not dot-segments");
+    }
+
 }

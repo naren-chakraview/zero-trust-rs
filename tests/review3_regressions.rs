@@ -1,0 +1,85 @@
+//! Regression tests for the review 0003 findings (docs/reviews/0003-third-pass-review.md).
+//!
+//! These are the review's Appendix A probes inverted: each asserts the CORRECT
+//! behavior, so a failing test means the finding is still open.
+
+use zero_trust::*;
+
+const AGENT: &str = "spiffe://chakra.internal/ns/agents/sa/research-agent";
+const ORD: &str = "spiffe://chakra.internal/ns/orders/sa/orders-svc";
+
+fn id(s: &str) -> SpiffeId {
+    s.parse().unwrap()
+}
+
+/// Admin may DELETE orders, but only through a workload that is granted
+/// DELETE too. The research agent holds GET only.
+fn policy() -> CapabilityPolicy {
+    CapabilityPolicy::from_yaml_str(
+        &format!(
+            r#"
+default: deny
+rules:
+  - method: GET
+    path: /orders/*
+    workloads: [{AGENT}]
+  - method: DELETE
+    path: /orders/*
+    users: [admin@example.com]
+    workloads: [{ORD}]
+"#
+        ),
+        now_unix_secs(),
+    )
+    .unwrap()
+}
+
+#[test]
+fn r1_q5_agent_inherits_the_users_rights_without_its_own_grant() {
+    // The original probe: the agent has no DELETE grant, but acts for an admin.
+    let agent = id(AGENT);
+    let d = policy().check(
+        &CapabilityRequest {
+            method: "DELETE",
+            path: "/orders/42",
+            user: Some("admin@example.com"),
+            caller: Some(&agent),
+        },
+        now_unix_secs(),
+    );
+    assert!(!d.is_allow(), "an agent with only a GET grant must not DELETE for an admin");
+}
+
+#[test]
+fn r1_q6_a_users_missing_grant_does_not_reach_data_through_the_agent() {
+    // The original probe: an intern with no grants reaches data through the agent's GET grant.
+    let agent = id(AGENT);
+    let d = policy().check(
+        &CapabilityRequest {
+            method: "GET",
+            path: "/orders/42",
+            user: Some("intern@example.com"),
+            caller: Some(&agent),
+        },
+        now_unix_secs(),
+    );
+    assert!(!d.is_allow(), "a user with no grant must not reach data through an agent");
+}
+
+#[test]
+fn r4_q7_capability_paths_are_not_matched_across_dot_segments() {
+    // The original probe: `*` crosses `/` and dot-segments are not normalized.
+    // The proxy refuses such paths before this check runs, and the matcher does
+    // not let `*` cross a separator.
+    let agent = id(AGENT);
+    let d = policy().check(
+        &CapabilityRequest {
+            method: "GET",
+            path: "/orders/../admin/keys",
+            user: None,
+            caller: Some(&agent),
+        },
+        now_unix_secs(),
+    );
+    assert!(!d.is_allow(), "a grant on /orders/* must not reach /admin/keys");
+}

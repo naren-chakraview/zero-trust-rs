@@ -25,7 +25,7 @@ const ORDERS: &str = "spiffe://chakra.internal/ns/orders/sa/orders-svc";
 fn single_route_matches_correctly() {
     let table = RouteTable::new(vec![route(
         "*",
-        "/api/inventory/*",
+        "/api/inventory/**",
         INVENTORY,
         "http://127.0.0.1:9001",
     )]);
@@ -35,6 +35,21 @@ fn single_route_matches_correctly() {
         resolved,
         Some((INVENTORY.to_string(), "http://127.0.0.1:9001".to_string()))
     );
+}
+
+/// R4 (review 0003): `*` matches one path segment. It no longer crosses `/`, so
+/// `/api/inventory/*` does not match a deeper path.
+#[test]
+fn single_star_does_not_match_across_segments() {
+    let table = RouteTable::new(vec![route(
+        "*",
+        "/api/inventory/*",
+        INVENTORY,
+        "http://127.0.0.1:9001",
+    )]);
+
+    assert!(table.resolve("GET", "/api/inventory/42", Some("gateway.example.com")).is_some());
+    assert_eq!(table.resolve("GET", "/api/inventory/items/42", Some("gateway.example.com")), None);
 }
 
 /// Requirement 2: a request that matches no configured route resolves to

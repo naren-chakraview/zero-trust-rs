@@ -19,7 +19,7 @@ mod token_exchange;
 mod user_auth;
 
 pub use ca::{CertificateAuthority, LocalCa, SignedCert};
-pub use config::{CaConfig, ClientAuth, GatewayConfig, Route, RouteTable, TlsConfig, UserIdpConfig};
+pub use config::{unsafe_path_reason, CaConfig, ClientAuth, GatewayConfig, Route, RouteTable, TlsConfig, UserIdpConfig};
 pub use error::{CaError, ConfigError, IdentityError, JwtError, RegistryError, SpiffeIdError, TlsError};
 pub use headers::{
     build_outbound_headers, CallerChain, OutboundHeaders, HEADER_CALLER_CHAIN, HEADER_OBO_TOKEN,

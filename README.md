@@ -214,17 +214,25 @@ default: allow                     # allow | deny
 default_allow_until: 1798761600    # unix seconds; required when default is allow
 rules:
   - method: POST                   # optional; omit to match any method
-    path: /tools/search            # wildcard pattern, same syntax as routes
-    users: [alice@corp.internal]   # matched against the verified user claim
+    path: /tools/search            # `*` matches one segment, `**` matches many
+    users: [alice@corp.internal]   # the verified user claim
+    workloads: [spiffe://chakra.internal/ns/agents/sa/research-agent]   # the verified caller
   - path: /inventory/*
-    workloads: [spiffe://chakra.internal/ns/orders/sa/orders-svc]   # matched against the verified caller
+    workloads: [spiffe://chakra.internal/ns/orders/sa/orders-svc]   # a machine-only grant
 ```
 
-- A request matches a rule when its method and path match and either the
-  verified user or the verified caller is listed. Rules are checked in order,
-  and the first match allows.
-- Workload grants match only identities the gateway has authenticated (mTLS
-  peer or signed OBO chain). A bare header never matches.
+- Every rule names at least one workload, since every request is made by a
+  workload. A rule that names users without workloads is refused at load.
+- A request that acts for a user is allowed only when one rule lists both that
+  user and the acting workload. The user's grant doesn't extend to an agent that
+  wasn't granted it, and the agent's grant doesn't extend to a user who wasn't
+  granted it (review 0003 R1). Only the current actor is checked, not the whole
+  chain.
+- A request with no user is allowed only by a rule with no `users`. Those rules
+  match only verified machine callers, so an agent acting for someone can't use
+  them.
+- Requests whose path contains dot-segments (`.`, `..`), empty segments, or
+  percent-encoded dots or slashes get `400` before routing or authorization.
 - A request no rule covers gets the default. `default: allow` stops allowing
   at `default_allow_until`, and startup refuses an allow default whose deadline
   is missing or already past. Moving to `default: deny` is therefore required

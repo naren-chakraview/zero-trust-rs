@@ -1,14 +1,21 @@
 //! Capability policy for proxied requests (F11, review 0002).
 //!
 //! After a request passes the OBO decision, this policy asks whether the
-//! verified caller may use this method and path. Grants come from two
-//! sources, both taken from verified identity and never from client headers:
+//! verified caller may use this method and path. Both sides are taken from
+//! verified identity and never from client headers:
 //!
-//! - `users`: the verified user principal, which is the signed `user` claim
-//!   of the OBO token.
-//! - `workloads`: the verified machine caller, from the mTLS peer or the
-//!   signed OBO chain. This is the machine-identity gate: a workload grant
-//!   can only match an identity the gateway has already authenticated.
+//! - `workloads`: the verified machine caller (the current actor, from the
+//!   mTLS peer or the signed OBO chain). Every rule names at least one. This
+//!   is the machine-identity gate.
+//! - `users`: the verified user principal (the signed `user` claim). A rule
+//!   with users matches only a request that carries one of them, from a
+//!   caller the same rule lists. A rule with no users matches only a request
+//!   with no user.
+//!
+//! A request acting for a user is therefore allowed only when the user and
+//! the acting workload both hold a grant in the same rule (review 0003 R1). An
+//! agent's rights never exceed its own grant, and a user's rights never reach
+//! data through an agent that wasn't granted them.
 //!
 //! A request with no matching rule falls through to the policy's default.
 //! `default: allow` is only valid until `default_allow_until`, after which it
@@ -21,7 +28,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-use crate::config::wildcard_matches;
+use crate::config::path_matches;
 use crate::spiffe_id::SpiffeId;
 
 /// Why loading a capability policy failed.
@@ -135,6 +142,16 @@ impl CapabilityPolicy {
             }
         }
 
+        for rule in &file.rules {
+            if rule.workloads.is_empty() {
+                return Err(CapabilityPolicyError::Invalid(format!(
+                    "rule for {:?} must name at least one workload: a request is always made by a workload, \
+                     and a user grant only counts together with the workload acting for that user",
+                    rule.path
+                )));
+            }
+        }
+
         let rules = file
             .rules
             .into_iter()
@@ -179,12 +196,19 @@ impl CapabilityPolicy {
                     continue;
                 }
             }
-            if !wildcard_matches(&rule.path, request.path) {
+            if !path_matches(&rule.path, request.path) {
                 continue;
             }
-            let user_granted = request.user.is_some_and(|user| rule.users.iter().any(|u| u == user));
-            let workload_granted = request.caller.is_some_and(|caller| rule.workloads.contains(caller));
-            if user_granted || workload_granted {
+            let caller_granted = request.caller.is_some_and(|caller| rule.workloads.contains(caller));
+            let user_granted = match (rule.users.is_empty(), request.user) {
+                // Workload-only rule: applies only when there is no user, so an
+                // agent acting for someone can't use a grant meant for machines.
+                (true, None) => true,
+                // User rule: the user must be listed in this same rule.
+                (false, Some(user)) => rule.users.iter().any(|u| u == user),
+                _ => false,
+            };
+            if caller_granted && user_granted {
                 return CapabilityDecision::Allow("rule_matched");
             }
         }
@@ -292,6 +316,7 @@ rules:
   - method: POST
     path: /tools/search
     users: [{ALICE}]
+    workloads: [{ORDERS}]
   - path: /inventory/*
     workloads: [{ORDERS}]
 "#
@@ -301,21 +326,24 @@ rules:
     #[test]
     fn user_grant_allows_the_listed_user_on_the_listed_tool() {
         let p = deny_policy();
-        let decision = p.check(&request("POST", "/tools/search", Some(ALICE), None), NOW);
+        let orders: SpiffeId = ORDERS.parse().unwrap();
+        let decision = p.check(&request("POST", "/tools/search", Some(ALICE), Some(&orders)), NOW);
         assert_eq!(decision, CapabilityDecision::Allow("rule_matched"));
     }
 
     #[test]
     fn same_user_is_denied_on_a_different_tool() {
         let p = deny_policy();
-        let decision = p.check(&request("POST", "/tools/delete", Some(ALICE), None), NOW);
+        let orders: SpiffeId = ORDERS.parse().unwrap();
+        let decision = p.check(&request("POST", "/tools/delete", Some(ALICE), Some(&orders)), NOW);
         assert_eq!(decision, CapabilityDecision::Deny("default_deny"));
     }
 
     #[test]
     fn a_different_user_is_denied_on_the_granted_tool() {
         let p = deny_policy();
-        let decision = p.check(&request("POST", "/tools/search", Some("bob@corp.internal"), None), NOW);
+        let orders: SpiffeId = ORDERS.parse().unwrap();
+        let decision = p.check(&request("POST", "/tools/search", Some("bob@corp.internal"), Some(&orders)), NOW);
         assert!(!decision.is_allow());
     }
 
@@ -403,10 +431,11 @@ rules:
 
         let handle = CapabilityPolicyHandle::new(CapabilityPolicy::from_file(&path, NOW).unwrap());
         let mut last_seen = Some(std::fs::read_to_string(&path).unwrap());
-        let probe = request("GET", "/x", Some(ALICE), None);
+        let caller: SpiffeId = ORDERS.parse().unwrap();
+        let probe = request("GET", "/x", Some(ALICE), Some(&caller));
         assert!(!handle.current().check(&probe, NOW).is_allow());
 
-        std::fs::write(&path, "default: deny\nrules:\n  - path: /x\n    users: [alice@corp.internal]\n").unwrap();
+        std::fs::write(&path, format!("default: deny\nrules:\n  - path: /x\n    users: [alice@corp.internal]\n    workloads: [{ORDERS}]\n")).unwrap();
         assert_eq!(reload_if_changed(&handle, &path, &mut last_seen, NOW).unwrap(), true);
         assert!(handle.current().check(&probe, NOW).is_allow());
 
@@ -420,21 +449,90 @@ rules:
         let dir = std::env::temp_dir().join(format!("zt-f11-bad-reload-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let path = dir.join("capability-policy.yaml");
-        std::fs::write(&path, "default: deny\nrules:\n  - path: /x\n    users: [alice@corp.internal]\n").unwrap();
+        std::fs::write(&path, format!("default: deny\nrules:\n  - path: /x\n    users: [alice@corp.internal]\n    workloads: [{ORDERS}]\n")).unwrap();
 
         let handle = CapabilityPolicyHandle::new(CapabilityPolicy::from_file(&path, NOW).unwrap());
         let mut last_seen = Some(std::fs::read_to_string(&path).unwrap());
+        let caller: SpiffeId = ORDERS.parse().unwrap();
 
         // A typo'd field must be rejected, and the allow rule must keep working.
-        std::fs::write(&path, "default: deny\nrules:\n  - path: /x\n    user: [alice@corp.internal]\n").unwrap();
+        std::fs::write(&path, format!("default: deny\nrules:\n  - path: /x\n    user: [alice@corp.internal]\n    workloads: [{ORDERS}]\n")).unwrap();
         assert!(reload_if_changed(&handle, &path, &mut last_seen, NOW).is_err());
-        assert!(handle.current().check(&request("GET", "/x", Some(ALICE), None), NOW).is_allow());
+        assert!(handle.current().check(&request("GET", "/x", Some(ALICE), Some(&caller)), NOW).is_allow());
 
         // An allow default whose deadline has passed is refused the same way.
         std::fs::write(&path, format!("default: allow\ndefault_allow_until: {NOW}\n")).unwrap();
         assert!(reload_if_changed(&handle, &path, &mut last_seen, NOW).is_err());
-        assert!(handle.current().check(&request("GET", "/x", Some(ALICE), None), NOW).is_allow());
+        assert!(handle.current().check(&request("GET", "/x", Some(ALICE), Some(&caller)), NOW).is_allow());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    // --- R1 (review 0003): a user and the agent acting for them both need the grant ---
+
+    const AGENT: &str = "spiffe://chakra.internal/ns/agents/sa/research-agent";
+    const ADMIN: &str = "admin@corp.internal";
+    const INTERN: &str = "intern@corp.internal";
+
+    fn agent_policy() -> CapabilityPolicy {
+        policy(&format!(
+            r#"
+default: deny
+rules:
+  - method: GET
+    path: /orders/*
+    workloads: [{AGENT}]
+  - method: DELETE
+    path: /orders/*
+    users: [{ADMIN}]
+    workloads: [{ORDERS}]
+  - method: DELETE
+    path: /orders/*
+    users: [{ADMIN}]
+    workloads: [{AGENT}]
+"#
+        ))
+    }
+
+    #[test]
+    fn r1_agent_with_only_a_get_grant_cannot_delete_for_an_admin() {
+        let agent: SpiffeId = AGENT.parse().unwrap();
+        let decision = agent_policy().check(&request("DELETE", "/orders/42", Some(INTERN), Some(&agent)), NOW);
+        assert!(!decision.is_allow(), "the agent may only read; it can't delete even when acting for a user");
+        let admin_via_agent = agent_policy().check(&request("DELETE", "/orders/42", Some(ADMIN), Some(&agent)), NOW);
+        assert_eq!(admin_via_agent, CapabilityDecision::Allow("rule_matched"),
+            "admin acting through an agent that holds DELETE can delete");
+    }
+
+    #[test]
+    fn r1_intern_with_no_grants_cannot_get_through_the_agent() {
+        let agent: SpiffeId = AGENT.parse().unwrap();
+        let decision = agent_policy().check(&request("GET", "/orders/42", Some(INTERN), Some(&agent)), NOW);
+        assert!(!decision.is_allow(), "the agent's own GET grant doesn't extend to a user who has none");
+    }
+
+    #[test]
+    fn r1_admin_delete_is_refused_when_the_acting_workload_has_no_grant() {
+        let stranger: SpiffeId = OTHER.parse().unwrap();
+        let decision = agent_policy().check(&request("DELETE", "/orders/42", Some(ADMIN), Some(&stranger)), NOW);
+        assert!(!decision.is_allow(), "a user's grant alone is not enough");
+    }
+
+    #[test]
+    fn r1_user_rule_without_a_workload_is_refused_at_load() {
+        let err = CapabilityPolicy::from_yaml_str(
+            &format!("default: deny\nrules:\n  - method: DELETE\n    path: /orders/*\n    users: [{ADMIN}]\n"),
+            NOW,
+        )
+        .unwrap_err();
+        assert!(matches!(err, CapabilityPolicyError::Invalid(_)));
+    }
+
+    #[test]
+    fn r4_a_single_star_grant_cannot_be_reached_through_dot_segments() {
+        let agent: SpiffeId = AGENT.parse().unwrap();
+        let decision = agent_policy().check(&request("GET", "/orders/../admin/keys", None, Some(&agent)), NOW);
+        assert!(!decision.is_allow(), "'*' must not match across '/' or through '..'");
+    }
+
 }

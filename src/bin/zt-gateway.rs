@@ -46,7 +46,7 @@ use zero_trust::{
     exchange_token_with_cert_binding, load_certs, now_unix_secs, validate_with_cert_binding_and_clock_skew,
     validate_for_proxy, CaError,
     CertificateAuthority, ClientAuth, Decision, GatewayConfig, IdentityError, IdentityProvider, JsonWebKeySet, LocalCa,
-    LocalIssuer, Registry, UserIdp, CapabilityDecision, CapabilityPolicy, CapabilityPolicyHandle, CapabilityRequest, RouteTable, watch_capability_policy, ServerCertificate, SpiffeId, SpireProvider, TokenExchangeError, TokenExchangeRequest,
+    LocalIssuer, Registry, UserIdp, CapabilityDecision, CapabilityPolicy, CapabilityPolicyHandle, CapabilityRequest, RouteTable, unsafe_path_reason, watch_capability_policy, ServerCertificate, SpiffeId, SpireProvider, TokenExchangeError, TokenExchangeRequest,
     TokenExchangeResponse, ValidationRequest, DEFAULT_MAX_OBO_CHAIN_DEPTH, HEADER_CALLER_CHAIN, HEADER_OBO_TOKEN,
     HEADER_USER_PRINCIPAL,
 };
@@ -1297,6 +1297,14 @@ async fn proxy_handler(
 ) -> Response {
     let (parts, body) = req.into_parts();
 
+    // R4 fix (review 0003): refuse dot-segments, empty segments, and encoded
+    // dots or slashes before routing or authorization. Otherwise a `*` in a
+    // route or capability pattern could match a path the backend resolves
+    // to somewhere else.
+    if let Some(reason) = unsafe_path_reason(parts.uri.path()) {
+        return error_response(StatusCode::BAD_REQUEST, format!("unsafe request path: {reason}"));
+    }
+
     // N9 fix (review 0002): enforce the limit while buffering, not after. An
     // unbounded read lets one request exhaust memory before the size check
     // in `forward_to_upstream` ever runs. `to_bytes` stops at the limit and
@@ -1998,6 +2006,28 @@ workloads:
         assert!(require_loopback_admin("10.0.0.5:6443".parse().unwrap()).is_err());
     }
 
+    // --- R4 fix (review 0003): unsafe paths never reach routing or the upstream ---
+
+    #[tokio::test]
+    async fn dot_segment_paths_are_refused_before_the_upstream() {
+        let (upstream_addr, hits) = spawn_test_upstream("ok").await;
+        let state = test_state(upstream_addr);
+        let issued = state.identity.issue_jwt_svid("orders-svc", INVENTORY, "orders-secret").unwrap();
+        let router = build_router(state);
+
+        for path in ["/some/../admin/keys", "/some/%2e%2e/admin", "/some//x"] {
+            let request = Request::builder()
+                .method("GET")
+                .uri(path)
+                .header(HEADER_OBO_TOKEN, issued.token.clone())
+                .body(Body::empty())
+                .unwrap();
+            let response = router.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), SC::BAD_REQUEST, "path {path} must be refused");
+        }
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+    }
+
     // --- F11 fix (review 0002): capability policy on the proxy path ---
 
     fn policy_state(upstream_addr: String, yaml: &str) -> AppState {
@@ -2691,7 +2721,7 @@ workloads:
         let mut state = test_state(default_upstream);
         state.route_table = Arc::new(RouteTable::new(vec![Route {
             host_pattern: "*".to_string(),
-            path_pattern: "/api/inventory/*".to_string(),
+            path_pattern: "/api/inventory/**".to_string(),
             workload_id: INVENTORY.to_string(),
             upstream_addr: routed_upstream,
         }]));

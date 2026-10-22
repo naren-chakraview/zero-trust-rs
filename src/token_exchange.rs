@@ -190,7 +190,9 @@ pub fn exchange_token(
     // immediate caller, so `> max_chain_depth` (not `>=`) is the correct
     // comparison: a chain *at* the limit may still take its next hop, same
     // convention `obo::validate`'s own chain-depth check uses.
-    if inbound_claims.delegation_chain().len() > max_chain_depth as usize {
+    // R5 fix (review 0003): the minted token's chain is the inbound chain plus this
+    // hop, so refuse once the inbound chain already fills the limit.
+    if inbound_claims.delegation_chain().len() + 1 > max_chain_depth as usize {
         return Err(TokenExchangeError::ChainDepthExceeded);
     }
 
@@ -306,7 +308,9 @@ pub fn exchange_token_with_cert_binding(
     // Step 3c (N3 fix): the signed chain so far must not already be at (or
     // past) this gateway's configured maximum -- see `exchange_token`'s
     // doc comment on `TokenExchangeError::ChainDepthExceeded`.
-    if inbound_claims.delegation_chain().len() > max_chain_depth as usize {
+    // R5 fix (review 0003): the minted token's chain is the inbound chain plus this
+    // hop, so refuse once the inbound chain already fills the limit.
+    if inbound_claims.delegation_chain().len() + 1 > max_chain_depth as usize {
         return Err(TokenExchangeError::ChainDepthExceeded);
     }
 

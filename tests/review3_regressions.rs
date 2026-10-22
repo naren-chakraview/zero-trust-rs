@@ -119,3 +119,40 @@ workloads:
     let minted_exp = short.verifier().verify_signature(&t2).unwrap().exp;
     assert!(minted_exp <= inbound_exp, "minted exp {minted_exp} outlives inbound exp {inbound_exp}");
 }
+
+// --- R5: the exchanged chain never exceeds max_obo_chain_depth ---
+
+#[test]
+fn r5_q2_exchange_does_not_mint_a_chain_past_max_depth() {
+    // Max depth 2. The inbound chain already holds two entries.
+    let issuer = LocalIssuer::generate(reg_for_depth(), 300).unwrap();
+    let t1 = issuer.issue_jwt_svid("api-gateway", ORD, "api-secret").unwrap().token;
+    let (t2, _) = exchange_token(&t1, INV, &id(ORD), 2, &issuer, issuer.verifier(), &id(ORD), 300, now_unix_secs())
+        .unwrap();
+    let res = exchange_token(&t2, ORD, &id(INV), 2, &issuer, issuer.verifier(), &id(INV), 300, now_unix_secs());
+    assert!(res.is_err(), "minting this hop would make a 3-entry chain against a max of 2");
+}
+
+fn reg_for_depth() -> Registry {
+    Registry::from_yaml_str(&format!(
+        r#"
+trust_domain: chakra.internal
+workloads:
+  - name: api-gateway
+    spiffe_id: spiffe://chakra.internal/ns/api-gateway/sa/api-gateway
+    max_obo_chain_depth: 2
+    allowed_callers: []
+    bootstrap_token: api-secret
+  - name: orders-svc
+    spiffe_id: {ORD}
+    max_obo_chain_depth: 2
+    allowed_callers: []
+    bootstrap_token: orders-secret
+  - name: inventory-svc
+    spiffe_id: {INV}
+    max_obo_chain_depth: 2
+    allowed_callers: []
+"#
+    ))
+    .unwrap()
+}

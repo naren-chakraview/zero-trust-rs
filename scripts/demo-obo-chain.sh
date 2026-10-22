@@ -22,15 +22,9 @@
 #      `obo.*` attributes recorded on each hop's span.
 #
 # See docs/demo-obo-chain.md for the full flow diagram, prerequisites, and
-# — importantly — the "Known limitations" section: this script's calls at
-# step 4/6 will be denied with a signature-verification error unless the
-# three gateways share one JWKS trust anchor, which the currently-deployed
-# ConfigMaps (deploy/k8s/{api-gateway,orders-svc,inventory-svc}.yaml)
-# don't yet set up. That wiring is out of this task's scope (it would mean
-# editing those three gateways' configs, and this task was explicitly
-# scoped to the demo script + a new backends manifest + docs, not the
-# already-deployed gateway trio) — it's called out here, and loudly in the
-# docs, rather than silently papered over.
+# the "Known limitations" section. The three gateways share one public JWKS
+# (scripts/deploy-all.sh creates it), so step 4 and step 6 verify each other's
+# tokens. The remaining gap is the backend routes, not the JWKS.
 set -euo pipefail
 export PATH="$HOME/.local/bin:$PATH"
 

@@ -16,7 +16,7 @@ findings text below is the original review and is not edited.
 | F1 | Fixed | `33a27b4`, `9a618ed`, `9eafb19` | N11 covers the span attribute. |
 | F2 | Fixed | `de4000d` | Human principals come from verified IdP credentials. |
 | F3 | Fixed | `c62625a`, `33a27b4`, `9a618ed` | Exchange checks audience and depth, and the proxy strips delegation headers. |
-| F4 | Partial | `fe0f802` | The gateway uses a public JWKS and a per-gateway signing key. The K8s manifests don't set `jwks_path`/`signing_key_path`, so cross-gateway verification isn't deployed. See the README's Known gaps. |
+| F4 | Fixed (static keys) | `fe0f802`, JWKS commit | The gateway uses a public JWKS and a per-gateway signing key. The K8s manifests and `deploy-all.sh` now deploy them (option 1). Verified locally. Not yet confirmed on a cluster. |
 | F5 | Fixed | `fe0f802`, `769b5fa` | Issuance binds to the caller's cert by default. Exchange re-binds to the exchanging hop. |
 | F6 | Fixed | `fa15537` | Request bodies are capped while buffering. Responses and the TLS handshake are bounded. |
 | F7 | Fixed | (earlier) | Admin and proxy are separate. |
@@ -37,13 +37,13 @@ findings text below is the original review and is not edited.
 | N4 | Fixed | `c62625a` | |
 | N5 | Fixed | `de4000d`, `fabd210` | Verified credentials, plus an integration test against a real OIDC IdP. |
 | N6 | Fixed | `fe0f802` | |
-| N7 | Fixed (code) | `fe0f802` | The legacy `with_jwks` loader still exists in the library. Deployment is Partial, as in F4. |
+| N7 | Fixed | `fe0f802`, JWKS commit | The public-only set is deployed. The legacy `with_jwks` loader still exists in the library, but the binary doesn't use it. |
 | N8 | Partial | `ba182b2`, `34a6ea8` | ES256 is in. A separate token-signing key for SPIRE delegation isn't built. |
 | N9 | Fixed | `fa15537` | |
 | N10 | Fixed | `9a618ed` | |
 | N11 | Fixed | `9a618ed` | |
 | N12 | Fixed | `26a5819`, `9eafb19` | The library functions existed. The gateway now calls them. |
-| N13 | Fixed | `5a228f6` | Manifests use `proxy_addr`/`admin_addr` and mTLS. They still lack the JWKS settings noted under F4. |
+| N13 | Fixed | `5a228f6`, JWKS commit | Manifests use `proxy_addr`/`admin_addr`, mTLS, and the JWKS settings. |
 | N14 | Fixed | `34a6ea8` | |
 | N15 | Fixed | `5a228f6`, `3712c69` | Agent files are untracked, but they remain in git history (13 commits). Rewriting history is a separate decision. |
 

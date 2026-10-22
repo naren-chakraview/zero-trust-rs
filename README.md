@@ -190,8 +190,18 @@ parse. The library's `with_jwks` loader still reads that legacy format, but the
 binary never uses it. Set `active_kid` to the `kid` this gateway
 signs with. Startup checks that the private key matches its published public key.
 
-Generate a public set from a private key with `JsonWebKeySet::from_rsa_private_pem`
-(see `src/identity.rs`), or with any JWKS tool that emits `n`/`e` only.
+The Kubernetes deployment uses static keys. `scripts/gen-gateway-keys.sh`
+generates one RSA key per gateway (kept in the git-ignored `deploy/k8s/keys/`)
+and the public set `public-jwks.json`. `scripts/deploy-all.sh` creates a Secret
+per gateway holding only that gateway's private key, plus a `zt-jwks` ConfigMap
+with the public set, and each gateway's `active_kid` matches its key. Rotating a
+key means adding the new public key to the set, restarting every gateway, and
+then switching `active_kid`. Remove the old key from the set only after no
+issued token still depends on it. A live JWKS endpoint would remove the restart
+(see the review 0002 options).
+
+To generate a public set from one private key, use
+`JsonWebKeySet::from_rsa_private_pem` (see `src/identity.rs`).
 
 ## Capability policy (F11)
 
@@ -241,10 +251,6 @@ Credentials are not single-use. A stolen credential works until its `exp`.
 
 These are open. The review trackers in `docs/reviews/` have the detail.
 
-- **Cross-gateway JWKS is not wired in the Kubernetes manifests.** The
-  manifests enable mTLS but set neither `jwks_path` nor `signing_key_path`. Each
-  gateway therefore generates an ephemeral key, and tokens minted by one gateway
-  cannot be verified by another. The three-hop demo is blocked on this.
 - **SPIRE token exchange.** Under `spire_socket_path`, the SPIRE provider can
   verify ES256 tokens but cannot sign, so `/v1/token-exchange` is unavailable.
   Delegation under SPIRE needs a separate token-signing key. See N8 in review 0002.

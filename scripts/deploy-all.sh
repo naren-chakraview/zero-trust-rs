@@ -15,6 +15,18 @@ if [[ ! -f "$DIR/zt-ca-secret.yaml" ]]; then
   exit 1
 fi
 kubectl apply -f "$DIR/zt-ca-secret.yaml"
+
+# Option 1 JWKS (review 0002 F4/N7): one signing key per gateway, plus the
+# public JWKS every gateway verifies against. Keys are generated on first run
+# and kept after that. Each gateway's Secret is mounted only into its own pod.
+KEYS_DIR="$DIR/keys"
+"$(dirname "$0")/gen-gateway-keys.sh" "$KEYS_DIR"
+for gw in api-gateway orders-svc inventory-svc; do
+  kubectl -n zero-trust-demo create secret generic "zt-signing-key-$gw" \
+    --from-file=signing-key.pem="$KEYS_DIR/$gw.pem" --dry-run=client -o yaml | kubectl apply -f -
+done
+kubectl -n zero-trust-demo create configmap zt-jwks \
+  --from-file=public-jwks.json="$KEYS_DIR/public-jwks.json" --dry-run=client -o yaml | kubectl apply -f -
 kubectl apply -f "$DIR/inventory-svc.yaml"
 kubectl apply -f "$DIR/orders-svc.yaml"
 kubectl apply -f "$DIR/api-gateway.yaml"

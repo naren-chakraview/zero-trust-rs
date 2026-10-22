@@ -142,15 +142,13 @@ delegation chains. It has not been re-run against the current manifests, and
 it is **expected to fail** until the gaps below are closed. Each one is
 listed here rather than worked around silently.
 
-1. **Cross-gateway JWKS sharing isn't wired up.** `exchange_token`'s output
-   is only verifiable by a gateway that holds the matching public key. None
-   of `deploy/k8s/{api-gateway,orders-svc,inventory-svc}.yaml` set
-   `jwks_path`, `signing_key_path`, or `active_kid`, so each instance uses its
-   own ephemeral keypair. **orders-svc cannot verify a token api-gateway
-   exchanged**, and the demo fails at hop 2 with `obo_token_signature_invalid`.
-   The fix is one public JWKS shared by all three gateways, each with its own
-   `signing_key_path` and `active_kid` (see the README's "Signing keys and
-   JWKS" section). This is a change to the three ConfigMaps.
+1. **Cross-gateway JWKS is wired, but not yet verified on a cluster.** Each
+   gateway signs with its own key (`signing_key_path`, `active_kid`), and all
+   three verify against the shared `jwks_path`. `scripts/deploy-all.sh` creates
+   those keys and the ConfigMap. Locally, three gateway processes with the same
+   settings passed the check: orders-svc accepted a token signed by api-gateway,
+   and it refused a token signed by an unknown key with
+   `obo_token_signature_invalid`. Confirm on the kind cluster with the demo.
 2. **SPIRE identity issuance and `/v1/token-exchange` are mutually
    exclusive.** `SpireProvider::sign_claims` always returns `Err`, so a gateway
    with `spire_socket_path` set cannot serve `/v1/token-exchange`. None of the
@@ -175,4 +173,4 @@ listed here rather than worked around silently.
    checked against a local gateway with the same TLS posture. It has not been
    run against the kind cluster.
 
-Until item 1 (and item 3, for the backend routes) is fixed, the script will print a clear status per hop but will not get to a fully passing, every-hop-`allow=true` run.
+Until item 3 (the backend routes) is fixed, the script will print a clear status per hop but will not get to a fully passing, every-hop-`allow=true` run, even with the JWKS wiring in place.

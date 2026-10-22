@@ -23,6 +23,9 @@ data:
     admin_addr: 127.0.0.1:6443
     upstream_addr: http://127.0.0.1:8080
     registry_path: /etc/zt-gateway/registry.yaml
+    signing_key_path: /etc/zt-gateway/keys/signing-key.pem
+    jwks_path: /etc/zt-gateway/jwks/public-jwks.json
+    active_kid: api-gateway
     protected_workload: spiffe://chakra.internal/ns/api-gateway/sa/api-gateway
     token_ttl_seconds: 300
     tls:
@@ -95,6 +98,14 @@ spec:
             - name: ca-material
               mountPath: /etc/zt-gateway/ca
               readOnly: true
+            # Option 1 JWKS (review 0002 F4/N7): only this gateway's own private
+            # key, never the other gateways'.
+            - name: signing-key
+              mountPath: /etc/zt-gateway/keys
+              readOnly: true
+            - name: jwks
+              mountPath: /etc/zt-gateway/jwks
+              readOnly: true
             - name: spire-agent-socket
               mountPath: /tmp/spire-agent
               readOnly: true
@@ -111,6 +122,14 @@ spec:
         - name: ca-material
           secret:
             secretName: zt-ca
+        # Created by scripts/deploy-all.sh from deploy/k8s/keys/ (git-ignored).
+        - name: signing-key
+          secret:
+            secretName: zt-signing-key-api-gateway
+        # Public verification set, identical in all three gateways.
+        - name: jwks
+          configMap:
+            name: zt-jwks
         # From deploy/k8s/spire-agent.yaml's DaemonSet: that agent mounts
         # its Workload API socket at this same fixed hostPath, so any pod
         # on the same node (any namespace) can reach it this way.

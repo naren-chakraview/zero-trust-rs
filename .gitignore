@@ -12,3 +12,7 @@ deploy/k8s/zt-ca-secret.yaml
 # Review 0002 / N15: superpowers plans and agent workspace files are local
 # working notes, not repository content.
 docs/superpowers/
+
+# Option 1 JWKS (review 0002 F4/N7): per-gateway private signing keys, generated
+# by scripts/gen-gateway-keys.sh. Never committed.
+deploy/k8s/keys/

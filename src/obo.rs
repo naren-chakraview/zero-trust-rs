@@ -611,11 +611,55 @@ pub fn validate_with_issuer_and_replay_policy(
     if !decision.is_allow() {
         return decision;
     }
+    check_issuer_and_replay(registry, verifier, request, trusted_issuers, jti_cache_enabled, jti_ttl_secs)
+}
 
+/// The proxy's full decision (N12 fix, review 0002). It runs the cert-binding,
+/// trusted-user-issuer, and claim checks, then the issuer allow-list and JTI
+/// replay check. The gateway calls this on every proxied request, so the
+/// configured `trusted_issuers` and `jti_cache_enabled` take effect.
+pub fn validate_for_proxy(
+    registry: &Registry,
+    verifier: &JwtVerifier,
+    request: &ValidationRequest<'_>,
+    peer_cert_thumbprint: Option<&str>,
+    user_issuers: &[String],
+    trusted_issuers: &[String],
+    jti_cache_enabled: bool,
+    jti_ttl_secs: u64,
+    now_unix_secs: i64,
+    clock_skew_secs: i64,
+) -> Decision {
+    let decision = validate_with_cert_binding_user_issuers_and_clock_skew(
+        registry,
+        verifier,
+        request,
+        peer_cert_thumbprint,
+        user_issuers,
+        now_unix_secs,
+        clock_skew_secs,
+    );
+    if !decision.is_allow() {
+        return decision;
+    }
+    check_issuer_and_replay(registry, verifier, request, trusted_issuers, jti_cache_enabled, jti_ttl_secs)
+}
+
+/// Issuer allow-list and JTI replay checks, shared by
+/// [`validate_with_issuer_and_replay_policy`] and [`validate_for_proxy`]. Call
+/// it only after the base decision has allowed the request.
+fn check_issuer_and_replay(
+    registry: &Registry,
+    verifier: &JwtVerifier,
+    request: &ValidationRequest<'_>,
+    trusted_issuers: &[String],
+    jti_cache_enabled: bool,
+    jti_ttl_secs: u64,
+) -> Decision {
     // No OBO token at all (the direct-call path): neither an issuer nor a
     // jti exists to check.
     let Some(token) = request.obo_token else {
-        return decision;
+        return Decision::Allow;
     };
     // `validate_with_clock_skew` already verified this signature
     // successfully to reach `Allow` -- re-verifying here to read the
@@ -623,7 +667,7 @@ pub fn validate_with_issuer_and_replay_policy(
     // already uses, and keeps this function independent of any particular
     // claims-threading refactor of the functions above it.
     let Ok(claims) = verifier.verify_signature(token) else {
-        return decision; // unreachable in practice, see above
+        return Decision::Allow; // unreachable in practice, see above
     };
 
     if !trusted_issuers.is_empty() {

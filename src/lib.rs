@@ -36,7 +36,7 @@ pub use obo::{
     cert_binding_matches, current_actor, validate, validate_with_cert_binding,
     validate_with_cert_binding_and_clock_skew, validate_with_cert_binding_user_issuers_and_clock_skew,
     validate_with_clock_skew, validate_with_issuer_and_replay_policy,
-    validate_with_user_issuers, Decision, DenyReason, ValidationRequest, Validator, DEFAULT_CLOCK_SKEW_SECS,
+    validate_for_proxy, validate_with_user_issuers, Decision, DenyReason, ValidationRequest, Validator, DEFAULT_CLOCK_SKEW_SECS,
 };
 pub use registry::{CredentialCheck, JtiReplayed, Registry, WorkloadEntry, DEFAULT_MAX_OBO_CHAIN_DEPTH};
 pub use spiffe_id::SpiffeId;

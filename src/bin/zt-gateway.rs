@@ -44,7 +44,7 @@ use tracing_subscriber::util::SubscriberInitExt;
 use zero_trust::{
     build_client_cert_verifier, build_server_config, compute_cert_thumbprint_x5t_s256, current_actor,
     exchange_token_with_cert_binding, load_certs, now_unix_secs, validate_with_cert_binding_and_clock_skew,
-    validate_with_cert_binding_user_issuers_and_clock_skew, CaError,
+    validate_for_proxy, CaError,
     CertificateAuthority, ClientAuth, Decision, GatewayConfig, IdentityError, IdentityProvider, JsonWebKeySet, LocalCa,
     LocalIssuer, Registry, UserIdp, CapabilityDecision, CapabilityPolicy, CapabilityPolicyHandle, CapabilityRequest, RouteTable, watch_capability_policy, ServerCertificate, SpiffeId, SpireProvider, TokenExchangeError, TokenExchangeRequest,
     TokenExchangeResponse, ValidationRequest, DEFAULT_MAX_OBO_CHAIN_DEPTH, HEADER_CALLER_CHAIN, HEADER_OBO_TOKEN,
@@ -102,6 +102,15 @@ struct AppState {
     /// F11 capability policy (review 0002), or `None` when no policy file is
     /// configured. Checked after the OBO decision on every proxied request.
     capability_policy: Option<Arc<CapabilityPolicyHandle>>,
+    /// Issuers this gateway accepts tokens from (N12 fix, review 0002),
+    /// mirrors `GatewayConfig::trusted_issuers`. Empty disables the check.
+    trusted_issuers: Arc<Vec<String>>,
+    /// Whether a token's `jti` is checked against the replay cache (N12 fix),
+    /// mirrors `GatewayConfig::jti_cache_enabled`.
+    jti_cache_enabled: bool,
+    /// How long a seen `jti` is remembered, in seconds. Mirrors
+    /// `GatewayConfig::jti_ttl_secs`.
+    jti_ttl_secs: u64,
     /// Mirrors `GatewayConfig::effective_require_cert_binding()` (N6 fix,
     /// review 0002): whether `POST /v1/svid/jwt` must refuse issuance
     /// outright when the caller presented no mTLS client certificate at
@@ -290,6 +299,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         user_issuers: Arc::new(config.user_issuers.clone()),
         user_idps: Arc::new(load_user_idps(&config)?),
         capability_policy: load_capability_policy(&config)?,
+        trusted_issuers: Arc::new(config.trusted_issuers.clone()),
+        jti_cache_enabled: config.jti_cache_enabled,
+        jti_ttl_secs: config.jti_ttl_secs,
         require_cert_binding: config.effective_require_cert_binding(),
     };
 
@@ -1328,12 +1340,17 @@ async fn proxy_handler(
     // N5 fix (review 0002): pass the trusted user issuers so an edge-minted
     // token's human `user` claim is accepted, instead of being denied as an
     // invalid principal before the capability policy below runs.
-    let decision = validate_with_cert_binding_user_issuers_and_clock_skew(
+    // N12 fix (review 0002): the full proxy decision. It also enforces the
+    // configured issuer allow-list and JTI replay check.
+    let decision = validate_for_proxy(
         &state.registry,
         state.identity.verifier(),
         &request,
         peer_cert_thumbprint.as_deref(),
         &state.user_issuers,
+        &state.trusted_issuers,
+        state.jti_cache_enabled,
+        state.jti_ttl_secs,
         now_unix_secs(),
         state.clock_skew_tolerance_secs,
     );
@@ -1722,6 +1739,9 @@ workloads:
             user_issuers: Arc::new(Vec::new()),
             user_idps: Arc::new(std::collections::HashMap::new()),
             capability_policy: None,
+            trusted_issuers: Arc::new(Vec::new()),
+            jti_cache_enabled: false,
+            jti_ttl_secs: 300,
             // Most existing tests call `/v1/svid/jwt` with no peer
             // certificate at all and expect the pre-N6 unbound token back
             // -- `false` preserves that. Tests exercising the N6 gate
@@ -1888,6 +1908,50 @@ workloads:
         );
         let config = GatewayConfig::from_yaml_str(&yaml).unwrap();
         assert!(load_user_idps(&config).is_err());
+    }
+
+    // --- N12 fix (review 0002): issuer allow-list and JTI replay on the proxy ---
+
+    #[tokio::test]
+    async fn proxy_refuses_a_token_from_an_issuer_not_on_the_allow_list() {
+        let (upstream_addr, hits) = spawn_test_upstream("ok").await;
+        let mut state = test_state(upstream_addr);
+        state.trusted_issuers = Arc::new(vec!["spiffe://chakra.internal/ns/other/sa/issuer".to_string()]);
+        let issued = state.identity.issue_jwt_svid("orders-svc", INVENTORY, "orders-secret").unwrap();
+        let router = build_router(state);
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/some/path")
+            .header(HEADER_OBO_TOKEN, issued.token)
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), SC::FORBIDDEN);
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn proxy_refuses_a_replayed_token_when_jti_replay_is_enabled() {
+        let (upstream_addr, hits) = spawn_test_upstream("ok").await;
+        let mut state = test_state(upstream_addr);
+        state.jti_cache_enabled = true;
+        let issued = state.identity.issue_jwt_svid("orders-svc", INVENTORY, "orders-secret").unwrap();
+        let router = build_router(state);
+
+        let send = |token: String| {
+            Request::builder()
+                .method("GET")
+                .uri("/some/path")
+                .header(HEADER_OBO_TOKEN, token)
+                .body(Body::empty())
+                .unwrap()
+        };
+        let first = router.clone().oneshot(send(issued.token.clone())).await.unwrap();
+        assert_eq!(first.status(), SC::OK);
+        let second = router.oneshot(send(issued.token)).await.unwrap();
+        assert_eq!(second.status(), SC::FORBIDDEN, "a replayed jti must be refused");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
     }
 
     // --- F11 fix (review 0002): capability policy on the proxy path ---

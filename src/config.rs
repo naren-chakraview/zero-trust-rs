@@ -427,12 +427,12 @@ pub struct GatewayConfig {
     pub capability_policy_reload_secs: u64,
 
     /// Issuer identities this gateway trusts (Task 13 / N12), checked
-    /// against a token's signed `iss` claim by
-    /// [`crate::obo::validate_with_issuer_and_replay_policy`]. An empty
-    /// list (the default) disables this check entirely — every token's
-    /// `iss` (including a missing one) passes, which keeps every existing
-    /// deployment's behavior unchanged until it opts in by listing at
-    /// least one trusted issuer here.
+    /// against a token's signed `iss` claim on every proxied request by
+    /// [`crate::obo::validate_for_proxy`]. An empty list (the default)
+    /// disables this check, so existing deployments are unchanged. Once any
+    /// issuer is listed, a token whose `iss` is missing or not listed is
+    /// refused. Gateway-issued tokens carry `iss = spiffe://<trust_domain>`,
+    /// so list that value to keep internal traffic working.
     #[serde(default)]
     pub trusted_issuers: Vec<String>,
 

@@ -293,14 +293,34 @@ pub(crate) fn path_matches(pattern: &str, path: &str) -> bool {
 /// which a backend could decode into a different path than the gateway matched.
 pub fn unsafe_path_reason(path: &str) -> Option<&'static str> {
     let lower = path.to_ascii_lowercase();
+    // S1 (review 0004): a backend can decode these into a different path than the
+    // gateway matched, so they are refused, not normalized.
     if lower.contains("%2e") || lower.contains("%2f") {
         return Some("encoded_dot_or_slash");
+    }
+    if lower.contains('\\') || lower.contains("%5c") {
+        return Some("backslash");
+    }
+    if lower.contains("%25") {
+        return Some("double_encoding");
+    }
+    // Overlong UTF-8 forms of '.' and '/' (%c0%ae, %c0%af, %c1...) that lax decoders
+    // read as the ASCII characters.
+    if lower.contains("%c0") || lower.contains("%c1") {
+        return Some("overlong_utf8");
     }
     if path.contains("//") {
         return Some("empty_segment");
     }
-    if path.split('/').any(|segment| segment == "." || segment == "..") {
-        return Some("dot_segment");
+    // Matrix parameters (`..;x`, Tomcat and Spring) and encoded semicolons (`..%3bx`)
+    // must not turn a dot-segment into something else. Check each segment with its
+    // `;` parameters and `%3b` stripped.
+    let decoded_semicolons = lower.replace("%3b", ";");
+    for segment in decoded_semicolons.split('/') {
+        let base = segment.split(';').next().unwrap_or("");
+        if base == "." || base == ".." {
+            return Some("dot_segment");
+        }
     }
     None
 }

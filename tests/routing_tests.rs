@@ -13,6 +13,8 @@ fn route(host_pattern: &str, path_pattern: &str, workload_id: &str, upstream_add
         path_pattern: path_pattern.to_string(),
         workload_id: workload_id.to_string(),
         upstream_addr: upstream_addr.to_string(),
+        delegate: false,
+        delegated_ttl_seconds: 60,
     }
 }
 

@@ -46,7 +46,7 @@ use zero_trust::{
     exchange_token_with_cert_binding, load_certs, now_unix_secs, validate_with_cert_binding_and_clock_skew,
     validate_for_proxy, CaError,
     CertificateAuthority, ClientAuth, Decision, GatewayConfig, IdentityError, IdentityProvider, JsonWebKeySet, LocalCa,
-    LocalIssuer, Registry, UserIdp, CapabilityDecision, CapabilityPolicy, CapabilityPolicyHandle, CapabilityRequest, RouteTable, unsafe_path_reason, watch_capability_policy, ServerCertificate, SpiffeId, SpireProvider, TokenExchangeError, TokenExchangeRequest,
+    LocalIssuer, Registry, UserIdp, CapabilityDecision, CapabilityPolicy, CapabilityPolicyHandle, CapabilityRequest, RouteTable, rebind_token, unsafe_path_reason, watch_capability_policy, ServerCertificate, SpiffeId, SpireProvider, TokenExchangeError, TokenExchangeRequest,
     TokenExchangeResponse, ValidationRequest, DEFAULT_MAX_OBO_CHAIN_DEPTH, HEADER_CALLER_CHAIN, HEADER_OBO_TOKEN,
     HEADER_USER_PRINCIPAL,
 };
@@ -111,6 +111,10 @@ struct AppState {
     /// How long a seen `jti` is remembered, in seconds. Mirrors
     /// `GatewayConfig::jti_ttl_secs`.
     jti_ttl_secs: u64,
+    /// This gateway's delegation identity (design 0002, option A): the thumbprint
+    /// of the certificate its co-located backend presents. `None` when no route
+    /// delegates.
+    delegation: Option<Arc<DelegationIdentity>>,
     /// Mirrors `GatewayConfig::effective_require_cert_binding()` (N6 fix,
     /// review 0002): whether `POST /v1/svid/jwt` must refuse issuance
     /// outright when the caller presented no mTLS client certificate at
@@ -309,7 +313,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         http_client: upstream_client,
         upstream_addr: config.upstream_addr.clone(),
         protected_workload: Arc::new(protected_workload),
-        gateway_id: Arc::new(gateway_id),
+        gateway_id: Arc::new(gateway_id.clone()),
         token_exchange_ttl_secs: config.token_ttl_seconds.max(0) as u64,
         max_body_bytes: (config.max_body_mb as usize) * 1024 * 1024,
         route_table: Arc::new(RouteTable::new(config.routes.clone())),
@@ -317,6 +321,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         user_issuers: Arc::new(config.user_issuers.clone()),
         user_idps: Arc::new(load_user_idps(&config)?),
         capability_policy: load_capability_policy(&config)?,
+        delegation: load_delegation(&config, &gateway_id)?,
         trusted_issuers: Arc::new(config.trusted_issuers.clone()),
         jti_cache_enabled: config.jti_cache_enabled,
         jti_ttl_secs: config.jti_ttl_secs,
@@ -823,6 +828,70 @@ fn require_loopback_admin(admin_addr: SocketAddr) -> Result<(), Box<dyn std::err
          bootstrap tokens only, so it must bind 127.0.0.1 or ::1"
     )
     .into())
+}
+
+/// This workload's delegation identity (design 0002): the thumbprint of the
+/// certificate the co-located backend presents, so rebound tokens can be bound to it.
+struct DelegationIdentity {
+    thumbprint: String,
+}
+
+/// Checks the delegating routes (design 0002, option A) and refuses to start if
+/// any is unsafe. A rebound token is useful only to a backend that holds this
+/// workload's key. It must be co-located (loopback), it must be addressed to this
+/// workload, and the proxy must verify client certificates, since binding needs a
+/// verified peer.
+fn validate_delegation_routes(config: &GatewayConfig, gateway_id: &SpiffeId) -> Result<(), String> {
+    let mtls = config.tls.as_ref().is_some_and(|tls| tls.client_auth != ClientAuth::None);
+    for route in config.routes.iter().filter(|route| route.delegate) {
+        if route.workload_id != gateway_id.to_string() {
+            return Err(format!(
+                "route {:?} delegates but its workload_id {} is not this gateway ({gateway_id})",
+                route.path_pattern, route.workload_id
+            ));
+        }
+        let host = reqwest::Url::parse(&route.upstream_addr)
+            .ok()
+            .and_then(|url| url.host_str().map(str::to_string))
+            .unwrap_or_default();
+        let loopback = matches!(host.as_str(), "127.0.0.1" | "localhost" | "[::1]" | "::1");
+        if !loopback {
+            return Err(format!(
+                "route {:?} delegates to {} which is not loopback; a delegating backend must be co-located",
+                route.path_pattern, route.upstream_addr
+            ));
+        }
+        if !mtls {
+            return Err(format!(
+                "route {:?} delegates, which needs mTLS on the proxy (tls.client_auth: optional or required)",
+                route.path_pattern
+            ));
+        }
+        if config.delegation_cert_path.is_none() {
+            return Err(format!(
+                "route {:?} delegates, which needs delegation_cert_path",
+                route.path_pattern
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Loads the delegation identity for a gateway with delegating routes. Returns
+/// `None` when no route delegates.
+fn load_delegation(
+    config: &GatewayConfig,
+    gateway_id: &SpiffeId,
+) -> Result<Option<Arc<DelegationIdentity>>, Box<dyn std::error::Error>> {
+    validate_delegation_routes(config, gateway_id)?;
+    let Some(path) = &config.delegation_cert_path else {
+        return Ok(None);
+    };
+    let certs = load_certs(path)?;
+    let leaf = certs.first().ok_or("delegation_cert_path holds no certificate")?;
+    Ok(Some(Arc::new(DelegationIdentity {
+        thumbprint: compute_cert_thumbprint_x5t_s256(leaf.as_ref()),
+    })))
 }
 
 /// Loads the F11 capability policy from `capability_policy_path`, or returns
@@ -1342,6 +1411,12 @@ async fn proxy_handler(
     let host_header = header_str(&parts.headers, "host");
     let (routed_workload_id, routed_upstream_addr) =
         resolve_route(&state, parts.method.as_str(), parts.uri.path(), host_header.as_deref());
+    // Design 0002: the TTL of the rebound token, when the matched route delegates.
+    let delegate_ttl = state
+        .route_table
+        .matched(parts.method.as_str(), parts.uri.path(), host_header.as_deref())
+        .filter(|route| route.delegate)
+        .map(|route| route.delegated_ttl_seconds);
 
     let destination: SpiffeId = match routed_workload_id.parse() {
         Ok(id) => id,
@@ -1524,6 +1599,35 @@ async fn proxy_handler(
         );
     }
 
+    // Design 0002, option A: rebind the inbound token to this workload's delegation
+    // cert, so the co-located backend can exchange it onward. This runs only once the
+    // OBO and capability checks have allowed the request. A rebind failure refuses
+    // the request, and the error is logged.
+    let rebound: Result<Option<String>, ()> = match (
+        decision.is_allow() && capability.is_allow(),
+        delegate_ttl,
+        state.delegation.as_ref(),
+        obo_token.as_deref(),
+    ) {
+        (true, Some(ttl), Some(delegation), Some(token)) => match rebind_token(
+            token,
+            &state.gateway_id,
+            state.identity.as_ref(),
+            state.identity.verifier(),
+            &delegation.thumbprint,
+            peer_cert_thumbprint.as_deref(),
+            ttl,
+            now_unix_secs(),
+        ) {
+            Ok((rebound_token, _)) => Ok(Some(rebound_token)),
+            Err(error) => {
+                tracing::warn!(%error, "rebinding the token for delegation failed");
+                Err(())
+            }
+        },
+        _ => Ok(None),
+    };
+
     let response = match decision {
         Decision::Allow if !capability.is_allow() => (
             StatusCode::FORBIDDEN,
@@ -1532,19 +1636,29 @@ async fn proxy_handler(
             }),
         )
             .into_response(),
-        Decision::Allow => {
-            forward_to_upstream(
-                &state,
-                parts,
-                body_bytes,
-                &trace_cx,
-                &routed_upstream_addr,
-                verified_caller.as_ref(),
-                verified_user.as_deref(),
-                verified_chain.as_deref(),
+        Decision::Allow => match rebound {
+            Err(()) => (
+                StatusCode::FORBIDDEN,
+                Json(DenyBody {
+                    deny_reason: "delegation_failed".to_string(),
+                }),
             )
-            .await
-        }
+                .into_response(),
+            Ok(rebound_token) => {
+                forward_to_upstream(
+                    &state,
+                    parts,
+                    body_bytes,
+                    &trace_cx,
+                    &routed_upstream_addr,
+                    verified_caller.as_ref(),
+                    verified_user.as_deref(),
+                    verified_chain.as_deref(),
+                    rebound_token,
+                )
+                .await
+            }
+        },
         Decision::Deny(reason) => (
             StatusCode::FORBIDDEN,
             Json(DenyBody {
@@ -1637,6 +1751,7 @@ async fn forward_to_upstream(
     verified_caller: Option<&SpiffeId>,
     verified_user: Option<&str>,
     verified_chain: Option<&[String]>,
+    rebound_token: Option<String>,
 ) -> Response {
     // Check body size limit (F6 fix)
     if body_bytes.len() > state.max_body_bytes {
@@ -1677,6 +1792,13 @@ async fn forward_to_upstream(
         .collect();
     for name in client_verified {
         headers.remove(name);
+    }
+    // Design 0002: the rebound token replaces the inbound one. It is gateway-owned
+    // and set only after the strip above, so the client's copy never survives.
+    if let Some(token) = rebound_token {
+        if let Ok(value) = axum::http::HeaderValue::from_str(&token) {
+            headers.insert(HeaderName::from_static("x-spiffe-obo-token"), value);
+        }
     }
     // F12 fix: propagate the same trace context onward to the upstream, so
     // a delegation chain that keeps going past this gateway still shows up
@@ -1808,6 +1930,7 @@ workloads:
             user_issuers: Arc::new(Vec::new()),
             user_idps: Arc::new(std::collections::HashMap::new()),
             capability_policy: None,
+            delegation: None,
             trusted_issuers: Arc::new(Vec::new()),
             jti_cache_enabled: false,
             jti_ttl_secs: 300,
@@ -2099,6 +2222,160 @@ workloads:
         let received = captured.lock().unwrap().take().expect("upstream should have been hit");
         assert_eq!(received.get(HEADER_VERIFIED_USER).unwrap().to_str().unwrap(), "alice@corp.internal");
         assert_eq!(received.get(HEADER_VERIFIED_CALLER).unwrap().to_str().unwrap(), ORDERS);
+    }
+
+    // --- Design 0002, option A: proxy-side rebind to this workload's delegation cert ---
+
+    /// A gateway whose own identity is INVENTORY, with one delegating route to a
+    /// loopback upstream. Its delegation cert thumbprint is DELEG-THUMB.
+    fn delegating_state(upstream_addr: String) -> AppState {
+        let mut state = test_state(upstream_addr.clone());
+        state.gateway_id = Arc::new(INVENTORY.parse().unwrap());
+        state.route_table = Arc::new(RouteTable::new(vec![Route {
+            host_pattern: "*".to_string(),
+            path_pattern: "/some/path".to_string(),
+            workload_id: INVENTORY.to_string(),
+            upstream_addr,
+            delegate: true,
+            delegated_ttl_seconds: 60,
+        }]));
+        state.delegation = Some(Arc::new(DelegationIdentity {
+            thumbprint: "DELEG-THUMB".to_string(),
+        }));
+        state
+    }
+
+    /// The token a backend would receive from the proxy: bound to the client cert
+    /// `CLIENT-THUMB`, presented by orders-svc.
+    fn client_bound_token(state: &AppState) -> String {
+        state
+            .identity
+            .issue_jwt_svid_with_cert_binding("orders-svc", INVENTORY, "CLIENT-THUMB", "orders-secret")
+            .unwrap()
+            .token
+    }
+
+    #[tokio::test]
+    async fn delegating_route_forwards_a_token_rebound_to_the_delegation_cert() {
+        let (upstream_addr, captured) = spawn_header_capturing_upstream().await;
+        let state = delegating_state(upstream_addr);
+        let inbound = client_bound_token(&state);
+        let router = build_router(state);
+
+        let mut request = Request::builder()
+            .method("GET")
+            .uri("/some/path")
+            .header(HEADER_OBO_TOKEN, inbound)
+            .body(Body::empty())
+            .unwrap();
+        request.extensions_mut().insert(PeerIdentity {
+            spiffe_id: Some(ORDERS.parse().unwrap()),
+            cert_thumbprint: Some("CLIENT-THUMB".to_string()),
+        });
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), SC::OK);
+
+        let received = captured.lock().unwrap().take().expect("upstream should have been hit");
+        let rebound = received.get(HEADER_OBO_TOKEN).expect("the rebound token is forwarded").to_str().unwrap();
+        let payload = base64_decode_url_nopad(rebound.split('.').nth(1).unwrap()).unwrap();
+        let claims: serde_json::Value = serde_json::from_slice(&payload).unwrap();
+        assert_eq!(claims["cnf"]["x5t#S256"], "DELEG-THUMB", "bound to this workload's delegation cert");
+        assert_eq!(claims["sub"], ORDERS, "the originator stays in sub");
+        assert!(claims.get("act").is_none(), "a rebind adds no chain entry");
+        assert_eq!(claims["aud"][0], INVENTORY, "addressed to this workload");
+    }
+
+    #[tokio::test]
+    async fn a_rebound_token_replayed_from_another_certificate_is_refused() {
+        let (upstream_addr, captured) = spawn_header_capturing_upstream().await;
+        let state = delegating_state(upstream_addr);
+        let inbound = client_bound_token(&state);
+        let first = build_router(state.clone());
+        let mut request = Request::builder()
+            .method("GET")
+            .uri("/some/path")
+            .header(HEADER_OBO_TOKEN, inbound)
+            .body(Body::empty())
+            .unwrap();
+        request.extensions_mut().insert(PeerIdentity {
+            spiffe_id: Some(ORDERS.parse().unwrap()),
+            cert_thumbprint: Some("CLIENT-THUMB".to_string()),
+        });
+        assert_eq!(first.oneshot(request).await.unwrap().status(), SC::OK);
+        let rebound = captured
+            .lock()
+            .unwrap()
+            .take()
+            .unwrap()
+            .get(HEADER_OBO_TOKEN)
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        // Presenting the rebound token from another certificate must be refused.
+        let mut replay = Request::builder()
+            .method("GET")
+            .uri("/some/path")
+            .header(HEADER_OBO_TOKEN, rebound)
+            .body(Body::empty())
+            .unwrap();
+        replay.extensions_mut().insert(PeerIdentity {
+            spiffe_id: Some(ORDERS.parse().unwrap()),
+            cert_thumbprint: Some("SOMEONE-ELSE".to_string()),
+        });
+        let response = build_router(state).oneshot(replay).await.unwrap();
+        assert_eq!(response.status(), SC::FORBIDDEN);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8_lossy(&bytes);
+        assert!(body.contains("certificate_binding_mismatch"), "unexpected refusal: {body}");
+    }
+
+    fn delegation_config(route_upstream: &str, workload: &str, tls: &str, cert: bool) -> GatewayConfig {
+        let cert_line = if cert { "delegation_cert_path: /etc/zt-gateway/delegation/cert.pem\n" } else { "" };
+        let yaml = format!(
+            "upstream_addr: http://127.0.0.1:8080\n\
+             registry_path: registry.yaml\n\
+             protected_workload: {INVENTORY}\n\
+             {tls}\
+             {cert_line}\
+             routes:\n\
+             \x20 - path_pattern: /demo\n\
+             \x20   workload_id: {workload}\n\
+             \x20   upstream_addr: {route_upstream}\n\
+             \x20   delegate: true\n"
+        );
+        GatewayConfig::from_yaml_str(&yaml).unwrap()
+    }
+
+    #[test]
+    fn startup_accepts_a_well_formed_delegating_route() {
+        let config = delegation_config("http://127.0.0.1:8080", INVENTORY, "tls:\n  client_auth: required\n", true);
+        assert!(validate_delegation_routes(&config, &INVENTORY.parse().unwrap()).is_ok());
+    }
+
+    #[test]
+    fn startup_refuses_a_delegating_route_to_a_remote_upstream() {
+        let config = delegation_config("http://inventory.zero-trust-demo.svc:8080", INVENTORY, "tls:\n  client_auth: required\n", true);
+        assert!(validate_delegation_routes(&config, &INVENTORY.parse().unwrap()).is_err());
+    }
+
+    #[test]
+    fn startup_refuses_a_delegating_route_for_another_workload() {
+        let config = delegation_config("http://127.0.0.1:8080", ORDERS, "tls:\n  client_auth: required\n", true);
+        assert!(validate_delegation_routes(&config, &INVENTORY.parse().unwrap()).is_err());
+    }
+
+    #[test]
+    fn startup_refuses_delegation_without_mtls() {
+        let config = delegation_config("http://127.0.0.1:8080", INVENTORY, "", true);
+        assert!(validate_delegation_routes(&config, &INVENTORY.parse().unwrap()).is_err());
+    }
+
+    #[test]
+    fn startup_refuses_delegation_without_a_delegation_cert() {
+        let config = delegation_config("http://127.0.0.1:8080", INVENTORY, "tls:\n  client_auth: required\n", false);
+        assert!(validate_delegation_routes(&config, &INVENTORY.parse().unwrap()).is_err());
     }
 
     // --- R4 fix (review 0003): unsafe paths never reach routing or the upstream ---
@@ -2816,7 +3093,9 @@ workloads:
             path_pattern: "/api/inventory/**".to_string(),
             workload_id: INVENTORY.to_string(),
             upstream_addr: routed_upstream,
-        }]));
+        delegate: false,
+        delegated_ttl_seconds: 60,
+    }]));
         let issued = state
             .identity
             .issue_jwt_svid("orders-svc", INVENTORY, "orders-secret")
@@ -2849,7 +3128,9 @@ workloads:
             path_pattern: "/api/inventory/*".to_string(),
             workload_id: INVENTORY.to_string(),
             upstream_addr: routed_upstream,
-        }]));
+        delegate: false,
+        delegated_ttl_seconds: 60,
+    }]));
         let issued = state
             .identity
             .issue_jwt_svid("orders-svc", INVENTORY, "orders-secret")
@@ -2884,7 +3165,9 @@ workloads:
             path_pattern: "/api/*".to_string(),
             workload_id: "spiffe://chakra.internal/ns/missing/sa/missing-svc".to_string(),
             upstream_addr: "http://127.0.0.1:1".to_string(),
-        }]));
+        delegate: false,
+        delegated_ttl_seconds: 60,
+    }]));
         let router = build_router(state);
 
         let request = Request::builder()

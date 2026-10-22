@@ -176,6 +176,23 @@ pub struct Route {
     /// Base URL of the backend this route forwards to, e.g.
     /// `http://127.0.0.1:8081`.
     pub upstream_addr: String,
+
+    /// Design 0002, option A: rebind the inbound token to this gateway's own
+    /// delegation certificate before forwarding it, so the co-located backend
+    /// can exchange it onward. Requires `workload_id` to be this gateway, the
+    /// `upstream_addr` to be loopback, mTLS on the proxy, and
+    /// `delegation_cert_path`. Default: `false`.
+    #[serde(default)]
+    pub delegate: bool,
+
+    /// TTL of the rebound token, in seconds. The rebound token's `exp` is also
+    /// capped at the inbound token's `exp`. Only used when `delegate` is set.
+    #[serde(default = "default_delegated_ttl_secs")]
+    pub delegated_ttl_seconds: u64,
+}
+
+fn default_delegated_ttl_secs() -> u64 {
+    60
 }
 
 /// Ordered collection of [`Route`]s, matched first-match-wins (the
@@ -209,6 +226,14 @@ impl RouteTable {
     /// matched against anything yet — every current `Route` matches any
     /// method. Returns `None` when no configured route matches (including
     /// when the table is empty).
+    /// The first route matching `path` and `host`, with its delegation settings.
+    pub fn matched(&self, _method: &str, path: &str, host: Option<&str>) -> Option<&Route> {
+        let host = host.unwrap_or("");
+        self.routes
+            .iter()
+            .find(|route| wildcard_matches(&route.host_pattern, host) && path_matches(&route.path_pattern, path))
+    }
+
     pub fn resolve(&self, _method: &str, path: &str, host: Option<&str>) -> Option<(String, String)> {
         let host = host.unwrap_or("");
         self.routes
@@ -476,6 +501,13 @@ pub struct GatewayConfig {
     #[serde(default = "default_capability_policy_reload_secs")]
     pub capability_policy_reload_secs: u64,
 
+    /// PEM certificate of this workload's own delegation identity (design 0002).
+    /// The co-located backend holds the matching key and presents this cert
+    /// when it exchanges a rebound token. The gateway binds rebound tokens to
+    /// its thumbprint. Required when any route sets `delegate: true`.
+    #[serde(default)]
+    pub delegation_cert_path: Option<PathBuf>,
+
     /// Issuer identities this gateway trusts (Task 13 / N12), checked
     /// against a token's signed `iss` claim on every proxied request by
     /// [`crate::obo::validate_for_proxy`]. An empty list (the default)
@@ -693,6 +725,7 @@ impl GatewayConfig {
             user_issuers: Vec::new(),
             user_idps: Vec::new(),
             capability_policy_path: None,
+            delegation_cert_path: None,
             capability_policy_reload_secs: default_capability_policy_reload_secs(),
             trusted_issuers: Vec::new(),
             jti_cache_enabled: false,

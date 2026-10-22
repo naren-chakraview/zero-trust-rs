@@ -44,7 +44,7 @@ pub use spire_provider::SpireProvider;
 pub use tls::{build_client_cert_verifier, build_server_config, load_certs, ServerCertificate};
 pub use token_exchange::{
     exchange_token, exchange_token_with_cert_binding, TokenExchangeError, TokenExchangeRequest,
-    TokenExchangeResponse,
+    TokenExchangeResponse, rebind_token,
 };
 
 /// Current time as Unix seconds. A thin wrapper so call sites don't reach

@@ -32,7 +32,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::identity::IdentityProvider;
 use crate::jwt::{ActClaim, CertBinding, JwtVerifier, OboClaims};
-use crate::obo::cert_binding_matches;
+use crate::obo::{cert_binding_matches, current_actor};
 use crate::spiffe_id::SpiffeId;
 
 /// Why [`exchange_token`] refused to re-mint a token.
@@ -212,7 +212,7 @@ pub fn exchange_token(
         sub: inbound_claims.sub.clone(),
         aud: vec![next_aud.to_string()],
         user: inbound_claims.user.clone(),
-        act: append_hop(inbound_claims.act.clone(), gateway_id.to_string()),
+        act: next_act(&inbound_claims, gateway_id),
         iat: now_secs,
         // R3 fix (review 0003): never outlive the token this was derived from.
         exp: (now_secs + ttl_secs as i64).min(inbound_claims.exp),
@@ -340,7 +340,7 @@ pub fn exchange_token_with_cert_binding(
         sub: inbound_claims.sub.clone(),
         aud: vec![next_aud.to_string()],
         user: inbound_claims.user.clone(),
-        act: append_hop(inbound_claims.act.clone(), gateway_id.to_string()),
+        act: next_act(&inbound_claims, gateway_id),
         iat: now_secs,
         // R3 fix (review 0003): never outlive the token this was derived from.
         exp: (now_secs + ttl_secs as i64).min(inbound_claims.exp),
@@ -363,6 +363,18 @@ pub fn exchange_token_with_cert_binding(
 /// actor, so a fresh hop replaces that position rather than burying itself
 /// at the bottom of the chain. With `act` `None` (no prior delegation),
 /// this is simply the first hop.
+/// The `act` for a re-minted token. Normally this gateway is prepended. But when
+/// the inbound token's current actor is already this gateway (an edge-minted
+/// token has `sub` = the gateway that minted it), the hop is already recorded,
+/// so the chain is left alone. This keeps a chain from listing the same hop
+/// twice (review 0003, design 0002).
+fn next_act(inbound: &OboClaims, gateway_id: &SpiffeId) -> Option<Box<ActClaim>> {
+    if current_actor(inbound) == *gateway_id {
+        return inbound.act.clone();
+    }
+    append_hop(inbound.act.clone(), gateway_id.to_string())
+}
+
 fn append_hop(act: Option<Box<ActClaim>>, new_sub: String) -> Option<Box<ActClaim>> {
     Some(Box::new(ActClaim { sub: new_sub, act }))
 }
@@ -409,6 +421,72 @@ pub struct TokenExchangeResponse {
     pub access_token: String,
     pub token_type: String,
     pub expires_in: u64,
+}
+
+/// Rebinds an inbound token to this workload's own certificate, the proxy-side
+/// step of design 0002 (option A). The result differs from exchange in four ways:
+///
+/// - `act` and `sub` are unchanged, so no hop is added. Delegation to the next
+///   hop still happens through [`exchange_token_with_cert_binding`], which the
+///   backend calls.
+/// - `aud` is `workload` (this gateway's own identity), not a next hop.
+/// - `cnf` is the thumbprint of the workload's delegation certificate, which the
+///   co-located backend holds and presents when it exchanges the token.
+/// - `exp` is the earlier of the inbound `exp` and `now + ttl_secs`, so the
+///   rebound token never outlives its source.
+///
+/// The inbound token must verify, be unexpired, and be addressed to `workload`.
+/// If it carries a `cnf`, that must match `peer_cert_thumbprint`, the certificate
+/// the proxy verified on this connection. A mismatch fails with
+/// [`TokenExchangeError::CertificateBindingMismatch`] before anything is signed.
+#[allow(clippy::too_many_arguments)]
+pub fn rebind_token(
+    inbound_token: &str,
+    workload: &SpiffeId,
+    issuer: &dyn IdentityProvider,
+    verifier: &JwtVerifier,
+    delegation_thumbprint: &str,
+    peer_cert_thumbprint: Option<&str>,
+    ttl_secs: u64,
+    now_secs: i64,
+) -> Result<(String, u64), TokenExchangeError> {
+    let inbound = verifier
+        .verify_signature(inbound_token)
+        .map_err(|_| TokenExchangeError::InvalidToken)?;
+    if now_secs >= inbound.exp {
+        return Err(TokenExchangeError::ExpiredToken);
+    }
+    if inbound.nbf.is_some_and(|nbf| nbf > now_secs) {
+        return Err(TokenExchangeError::NotYetValid);
+    }
+    let workload_str = workload.to_string();
+    if !inbound.aud.iter().any(|aud| aud == &workload_str) {
+        return Err(TokenExchangeError::AudienceMismatch);
+    }
+    if !cert_binding_matches(inbound.cnf.as_ref(), peer_cert_thumbprint) {
+        return Err(TokenExchangeError::CertificateBindingMismatch);
+    }
+    let gateway_iss = issuer.issuer_claim().ok_or(TokenExchangeError::InternalError)?;
+
+    let exp = (now_secs + ttl_secs as i64).min(inbound.exp);
+    let claims = OboClaims {
+        user_iss: inbound.user_iss.clone(),
+        sub: inbound.sub.clone(),
+        aud: vec![workload_str],
+        user: inbound.user.clone(),
+        act: inbound.act.clone(),
+        iat: now_secs,
+        exp,
+        nbf: Some(now_secs),
+        jti: Some(generate_jti()),
+        cnf: Some(CertBinding {
+            x5t_s256: delegation_thumbprint.to_string(),
+        }),
+        iss: Some(gateway_iss),
+    };
+    let token = issuer.sign_claims(&claims).map_err(|_| TokenExchangeError::InternalError)?;
+    Ok((token, (exp - now_secs).max(0) as u64))
+
 }
 
 #[cfg(test)]
@@ -820,4 +898,117 @@ workloads:
         assert!(req.resource.is_none());
         assert!(req.scope.is_none());
     }
+    // --- design 0002, option A: proxy-side rebind; duplicate-free act ---
+
+    const GW_ID: &str = "spiffe://chakra.internal/ns/api-gateway/sa/api-gateway";
+    const ORDERS_ID: &str = "spiffe://chakra.internal/ns/orders/sa/orders-svc";
+    const DELEG: &str = "DELEGATION-CERT-THUMB";
+
+    /// A token bound to the client's certificate, addressed to the gateway, as
+    /// the edge or the client would present it.
+    fn bound_token(issuer: &LocalIssuer, now: i64, exp: i64) -> String {
+        let claims = OboClaims {
+            user_iss: None,
+            sub: "spiffe://chakra.internal/ns/client/sa/client".into(),
+            aud: vec![GW_ID.into()],
+            user: None,
+            act: None,
+            iat: now,
+            exp,
+            nbf: Some(now),
+            jti: Some("bound-jti".into()),
+            cnf: Some(CertBinding { x5t_s256: "CLIENT-CERT".into() }),
+            iss: Some("spiffe://chakra.internal/ns/client/sa/client".into()),
+        };
+        issuer.sign_claims(&claims).unwrap()
+    }
+
+    #[test]
+    fn rebind_binds_to_the_delegation_cert_and_keeps_the_chain() {
+        let issuer = LocalIssuer::generate(test_registry(), 300).unwrap();
+        let now = 10_000;
+        let inbound = bound_token(&issuer, now, now + 300);
+        let (rebound, _) = rebind_token(
+            &inbound, &gw(GW_ID), &issuer, issuer.verifier(), DELEG, Some("CLIENT-CERT"), 60, now,
+        )
+        .unwrap();
+        let c = issuer.verifier().verify_signature(&rebound).unwrap();
+        assert_eq!(c.cnf.unwrap().x5t_s256, DELEG, "bound to this workload's delegation cert");
+        assert_eq!(c.sub, "spiffe://chakra.internal/ns/client/sa/client", "originator unchanged");
+        assert!(c.act.is_none(), "rebind adds no chain entry");
+        assert_eq!(c.aud, vec![GW_ID.to_string()]);
+        assert_eq!(c.iss.as_deref(), Some(issuer.gateway_iss().as_str()), "iss names the gateway");
+        assert!(c.jti.is_some());
+    }
+
+    #[test]
+    fn rebind_never_outlives_the_inbound_token() {
+        let issuer = LocalIssuer::generate(test_registry(), 300).unwrap();
+        let now = 10_000;
+        let inbound = bound_token(&issuer, now, now + 10);
+        let (rebound, _) = rebind_token(
+            &inbound, &gw(GW_ID), &issuer, issuer.verifier(), DELEG, Some("CLIENT-CERT"), 300, now,
+        )
+        .unwrap();
+        let c = issuer.verifier().verify_signature(&rebound).unwrap();
+        assert_eq!(c.exp, now + 10, "exp is capped at the inbound exp, not now + ttl");
+    }
+
+    #[test]
+    fn rebind_refuses_a_peer_that_does_not_hold_the_bound_cert() {
+        let issuer = LocalIssuer::generate(test_registry(), 300).unwrap();
+        let now = 10_000;
+        let inbound = bound_token(&issuer, now, now + 300);
+        let err = rebind_token(
+            &inbound, &gw(GW_ID), &issuer, issuer.verifier(), DELEG, Some("SOMEONE-ELSE"), 60, now,
+        )
+        .unwrap_err();
+        assert_eq!(err, TokenExchangeError::CertificateBindingMismatch);
+    }
+
+    #[test]
+    fn rebind_refuses_a_token_addressed_to_another_workload() {
+        let issuer = LocalIssuer::generate(test_registry(), 300).unwrap();
+        let now = 10_000;
+        let inbound = bound_token(&issuer, now, now + 300);
+        let err = rebind_token(
+            &inbound, &gw(ORDERS_ID), &issuer, issuer.verifier(), DELEG, Some("CLIENT-CERT"), 60, now,
+        )
+        .unwrap_err();
+        assert_eq!(err, TokenExchangeError::AudienceMismatch);
+    }
+
+    #[test]
+    fn an_edge_token_exchanged_at_its_own_gateway_does_not_repeat_the_hop() {
+        // The edge token's sub is the gateway that minted it, so that gateway is
+        // already the current actor. Exchanging it there must not add a second entry.
+        let issuer = LocalIssuer::generate(test_registry(), 300).unwrap();
+        // Build an edge-shaped token: sub = this gateway, aud = this gateway, no act.
+        let now = crate::now_unix_secs();
+        let edge = issuer
+            .sign_claims(&OboClaims {
+                user_iss: None,
+                sub: GW_ID.into(),
+                aud: vec![GW_ID.into()],
+                user: Some("alice@corp.internal".into()),
+                act: None,
+                iat: now,
+                exp: now + 300,
+                nbf: Some(now),
+                jti: Some("edge-jti".into()),
+                cnf: None,
+                iss: Some(issuer.gateway_iss()),
+            })
+            .unwrap();
+        let (exchanged, _) = exchange_token(
+            &edge, ORDERS_ID, &gw(GW_ID), 3, &issuer, issuer.verifier(), &gw(GW_ID), 300, now,
+        )
+        .unwrap();
+        let c = issuer.verifier().verify_signature(&exchanged).unwrap();
+        assert!(c.act.is_none(), "the gateway is already the current actor; no duplicate entry");
+        assert_eq!(c.delegation_chain(), vec![GW_ID.to_string()]);
+    }
+
 }
+
+

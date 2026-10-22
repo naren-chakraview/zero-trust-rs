@@ -1,7 +1,7 @@
 # Review 0002: Follow-up Review After the Security-Gap Pass
 
 **Date:** 2026-10-17
-**Reviewed at:** commit `43a4384` (HEAD of `master`, 18 commits after review 0001's baseline `46cd5f5`)
+**Reviewed at:** commit `5d1edff` (HEAD of `master`, 18 commits after review 0001's baseline `46cd5f5`)
 **Inputs:** [Review 0001](0001-security-gap-review.md), `docs/superpowers/plans/2026-10-15-security-gaps-implementation.md`
 **Baseline:** `cargo test` passes all 190 tests (124 lib, 34 bin, 8 gap_probes, 13 obo_tests, 6 routing, 3 spire_provider, 1 registry_fixture).
 
@@ -13,47 +13,47 @@ findings text below is the original review and is not edited.
 
 | ID | Status | Commit(s) | Notes |
 |---|---|---|---|
-| F1 | Fixed | `33a27b4`, `9a618ed`, `9eafb19` | N11 covers the span attribute. |
-| F2 | Fixed | `de4000d` | Human principals come from verified IdP credentials. |
-| F3 | Fixed | `c62625a`, `33a27b4`, `9a618ed` | Exchange checks audience and depth, and the proxy strips delegation headers. |
-| F4 | Fixed (static keys) | `fe0f802`, JWKS commit | The gateway uses a public JWKS and a per-gateway signing key. The K8s manifests and `deploy-all.sh` now deploy them (option 1). Verified locally. Not yet confirmed on a cluster. |
-| F5 | Fixed | `fe0f802`, `769b5fa` | Issuance binds to the caller's cert by default. Exchange re-binds to the exchanging hop. |
-| F6 | Fixed | `fa15537` | Request bodies are capped while buffering. Responses and the TLS handshake are bounded. |
+| F1 | Fixed | `1bbbd40`, `b64276f`, `77ac483` | N11 covers the span attribute. |
+| F2 | Fixed | `deb46b8` | Human principals come from verified IdP credentials. |
+| F3 | Fixed | `4fddfc2`, `1bbbd40`, `b64276f` | Exchange checks audience and depth, and the proxy strips delegation headers. |
+| F4 | Fixed (static keys) | `63e9370`, JWKS commit | The gateway uses a public JWKS and a per-gateway signing key. The K8s manifests and `deploy-all.sh` now deploy them (option 1). Verified locally. Not yet confirmed on a cluster. |
+| F5 | Fixed | `63e9370`, `d1f4103` | Issuance binds to the caller's cert by default. Exchange re-binds to the exchanging hop. |
+| F6 | Fixed | `aa9f07c` | Request bodies are capped while buffering. Responses and the TLS handshake are bounded. |
 | F7 | Fixed | (earlier) | Admin and proxy are separate. |
 | F8 | Fixed | (earlier) | |
 | F9 | Fixed | (earlier) | |
-| F10 | Fixed | `1ef9895` | Admin uses a separate TLS acceptor with no client-cert requirement. Startup refuses a non-loopback admin address. Verified live. |
-| F11 | Fixed | `8a85f75`, `f52367b` | Capability policy with per-user and per-workload grants, a deadline on allow-by-default, and hot reload. There are no explicit deny rules yet. |
-| F12 | Fixed | (earlier), `9a618ed` | |
-| F13 | Partial | `ba182b2`, `34a6ea8` | ES256 verification is in. Under SPIRE, token exchange can't sign (N8). |
+| F10 | Fixed | `eb0cd6a` | Admin uses a separate TLS acceptor with no client-cert requirement. Startup refuses a non-loopback admin address. Verified live. |
+| F11 | Fixed | `901db21`, `9f7c76f` | Capability policy with per-user and per-workload grants, a deadline on allow-by-default, and hot reload. There are no explicit deny rules yet. |
+| F12 | Fixed | (earlier), `b64276f` | |
+| F13 | Partial | `dbeac1d`, `98b56da` | ES256 verification is in. Under SPIRE, token exchange can't sign (N8). |
 | F14 | Fixed | (earlier) | |
-| F15 | Fixed | `9eafb19` | `iss` is checked against `trusted_issuers` and `jti` against the replay cache, on the proxy path. |
-| F16 | Partial | `43a4384` | The demo script still assumes plain HTTP and isn't re-run. See `docs/demo-obo-chain.md`. |
-| F17 | Fixed | `34a6ea8` | Exchange and proxy round-trip benchmarks are in. |
+| F15 | Fixed | `77ac483` | `iss` is checked against `trusted_issuers` and `jti` against the replay cache, on the proxy path. |
+| F16 | Partial | `5d1edff` | The demo script still assumes plain HTTP and isn't re-run. See `docs/demo-obo-chain.md`. |
+| F17 | Fixed | `98b56da` | Exchange and proxy round-trip benchmarks are in. |
 | F18 | Fixed | (earlier) | |
-| N1 | Fixed | `33a27b4` | |
-| N2 | Fixed | `769b5fa` | |
-| N3 | Fixed | `9a618ed` | |
-| N4 | Fixed | `c62625a` | |
-| N5 | Fixed | `de4000d`, `fabd210` | Verified credentials, plus an integration test against a real OIDC IdP. |
-| N6 | Fixed | `fe0f802` | |
-| N7 | Fixed | `fe0f802`, JWKS commit | The public-only set is deployed. The legacy `with_jwks` loader still exists in the library, but the binary doesn't use it. |
-| N8 | Partial | `ba182b2`, `34a6ea8` | ES256 is in. A separate token-signing key for SPIRE delegation isn't built. |
-| N9 | Fixed | `fa15537` | |
-| N10 | Fixed | `9a618ed` | |
-| N11 | Fixed | `9a618ed` | |
-| N12 | Fixed | `26a5819`, `9eafb19` | The library functions existed. The gateway now calls them. |
-| N13 | Fixed | `5a228f6`, JWKS commit | Manifests use `proxy_addr`/`admin_addr`, mTLS, and the JWKS settings. |
-| N14 | Fixed | `34a6ea8` | |
-| N15 | Fixed | `5a228f6`, `3712c69` | Agent files are untracked, but they remain in git history (13 commits). Rewriting history is a separate decision. |
+| N1 | Fixed | `1bbbd40` | |
+| N2 | Fixed | `d1f4103` | |
+| N3 | Fixed | `b64276f` | |
+| N4 | Fixed | `4fddfc2` | |
+| N5 | Fixed | `deb46b8`, `02085cd` | Verified credentials, plus an integration test against a real OIDC IdP. |
+| N6 | Fixed | `63e9370` | |
+| N7 | Fixed | `63e9370`, JWKS commit | The public-only set is deployed. The legacy `with_jwks` loader still exists in the library, but the binary doesn't use it. |
+| N8 | Partial | `dbeac1d`, `98b56da` | ES256 is in. A separate token-signing key for SPIRE delegation isn't built. |
+| N9 | Fixed | `aa9f07c` | |
+| N10 | Fixed | `b64276f` | |
+| N11 | Fixed | `b64276f` | |
+| N12 | Fixed | `6a94e38`, `77ac483` | The library functions existed. The gateway now calls them. |
+| N13 | Fixed | `50ae5b9`, JWKS commit | Manifests use `proxy_addr`/`admin_addr`, mTLS, and the JWKS settings. |
+| N14 | Fixed | `98b56da` | |
+| N15 | Fixed | `50ae5b9`, `0530875` | Agent files are untracked, but they remain in git history (13 commits). Rewriting history is a separate decision. |
 
 Regression tests for the findings are in `tests/review2_regressions.rs` (commit
-`29d6d11`). All pass. The probes in Appendix A ran against the original
+`52c8349`). All pass. The probes in Appendix A ran against the original
 commit.
 
 ## How to use this document
 
-Part 1 is the status of each review 0001 finding. Part 2 lists new findings (N1 to N15), most of them in code added during the fix pass. Appendix A has nine probe tests (`tests/review2_probes.rs`) that reproduce N1 to N7 against `43a4384`. Each probe asserts the **current** behavior and passes today; invert it into a regression test once the finding is fixed.
+Part 1 is the status of each review 0001 finding. Part 2 lists new findings (N1 to N15), most of them in code added during the fix pass. Appendix A has nine probe tests (`tests/review2_probes.rs`) that reproduce N1 to N7 against `5d1edff`. Each probe asserts the **current** behavior and passes today; invert it into a regression test once the finding is fixed.
 
 ## Summary
 
@@ -190,11 +190,11 @@ Add benchmarks for `exchange_token` (one RS256 sign per hop, typically far more 
 
 ## Appendix A: probe tests
 
-Save as `tests/review2_probes.rs`. Mapping: r1 and r2 to N1, r3 to N2, r4 to N3, r5 to N4, r6 and r7 to N5, r8 to N6, r9 to N7. All nine pass at `43a4384`. No new dependencies are needed (`rsa`, `rand` and `serde_json` are already in `Cargo.toml`).
+Save as `tests/review2_probes.rs`. Mapping: r1 and r2 to N1, r3 to N2, r4 to N3, r5 to N4, r6 and r7 to N5, r8 to N6, r9 to N7. All nine pass at `5d1edff`. No new dependencies are needed (`rsa`, `rand` and `serde_json` are already in `Cargo.toml`).
 
 ```rust
 //! Probes from docs/reviews/0002-follow-up-review.md.
-//! Each asserts CURRENT behavior at 43a4384; a passing test means the issue is real.
+//! Each asserts CURRENT behavior at 5d1edff; a passing test means the issue is real.
 //! Invert each one into a regression test as its finding is fixed.
 use zero_trust::*;
 

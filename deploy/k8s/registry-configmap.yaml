@@ -46,7 +46,9 @@ data:
         spiffe_id: spiffe://chakra.internal/ns/api-gateway/sa/api-gateway
         namespace: api-gateway
         service_account: api-gateway
-        max_obo_chain_depth: 1
+        # R5 (review 0003): an exchange refuses a chain past this limit, counting the
+        # hop it adds. api-gateway delegates once (client -> api-gateway), so 2.
+        max_obo_chain_depth: 2
         allowed_callers:
           - spiffe://chakra.internal/ns/client/sa/client
         bootstrap_token: api-gateway-dev-secret

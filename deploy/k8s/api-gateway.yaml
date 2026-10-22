@@ -1,6 +1,7 @@
 # api-gateway: the ingress hop (api-gateway -> orders-svc -> inventory-svc).
-# max_obo_chain_depth: 1 for this workload (see registry-configmap.yaml) --
-# it's the entry point and does not itself delegate further.
+# max_obo_chain_depth: 2 for this workload (see registry-configmap.yaml). It's
+# the entry point, and it delegates once, to orders-svc. A chain that starts
+# at the client and passes through api-gateway is two entries long.
 #
 # Task 14 (N13): `listen_addr` (dead config -- see src/config.rs/F7+F10's
 # admin/proxy listener split) replaced by the real `proxy_addr`/`admin_addr`

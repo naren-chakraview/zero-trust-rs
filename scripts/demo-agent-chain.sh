@@ -90,11 +90,14 @@ login() {
 
 # Mints an edge token for a verified IdP credential (admin, no client cert).
 edge_mint() {
-  local credential="$1"
-  curl -sfk -X POST "https://127.0.0.1:${GW_A_ADMIN_PORT}/v1/svid/jwt-with-user" \
+  local credential="$1" body
+  body="$(curl -sk -X POST "https://127.0.0.1:${GW_A_ADMIN_PORT}/v1/svid/jwt-with-user" \
     -H "content-type: application/json" \
-    -d "{\"user_credential\":\"${credential}\",\"user_issuer\":\"${IDP}\"}" \
-    | python3 -c 'import sys,json; print(json.load(sys.stdin)["token"])'
+    -d "{\"user_credential\":\"${credential}\",\"user_issuer\":\"${IDP}\"}")"
+  # Keep the gateway's own error text if the mint was refused.
+  echo "$body" | python3 -c 'import sys,json
+d=json.load(sys.stdin)
+print(d["token"]) if "token" in d else (print("edge mint refused: "+json.dumps(d), file=sys.stderr))' 2>&1 || true
 }
 
 # Exchanges `subject` for `audience` at the given admin port (RFC 8693).

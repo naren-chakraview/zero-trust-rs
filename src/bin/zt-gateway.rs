@@ -266,19 +266,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 _ => return Err("tls.cert_path and tls.key_path must both be set, or both omitted".into()),
             };
 
-            let client_cert_verifier = match tls_config.client_auth {
-                ClientAuth::None => None,
+            // The proxy applies the configured `client_auth`. Admin always
+            // requests a client certificate but never requires one, so a
+            // presented cert is verified and reaches the handlers, while a
+            // request without one still gets through. Cert-bound issuance and
+            // exchange (N6) need the verified cert on admin. Bootstrap needs
+            // the handshake to succeed without one (F10).
+            let (client_cert_verifier, admin_client_cert_verifier) = match tls_config.client_auth {
+                ClientAuth::None => (None, None),
                 ClientAuth::Optional | ClientAuth::Required => {
                     let trust_root_der = resolve_trust_root_der(&config, &ca)?.ok_or(
                         "tls.client_auth is enabled but no CA trust root could be resolved \
                          (set ca.cert_path or ca.key_path)",
                     )?;
                     let allow_unauthenticated = tls_config.client_auth == ClientAuth::Optional;
-                    Some(build_client_cert_verifier(&trust_root_der, allow_unauthenticated)?)
+                    (
+                        Some(build_client_cert_verifier(&trust_root_der, allow_unauthenticated)?),
+                        Some(build_client_cert_verifier(&trust_root_der, true)?),
+                    )
                 }
             };
 
-            let admin_server_config = build_server_config(server_cert.clone(), None)?;
+            let admin_server_config = build_server_config(server_cert.clone(), admin_client_cert_verifier)?;
             let proxy_server_config = build_server_config(server_cert, client_cert_verifier)?;
             (
                 Some(TlsAcceptor::from(Arc::new(proxy_server_config))),

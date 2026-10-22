@@ -234,6 +234,28 @@ fn wildcard_matches(pattern: &str, value: &str) -> bool {
 /// environment variables — the usual "file for structure, env for
 /// per-deployment values" split, handy when the same config file is reused
 /// across dev/staging/prod containers.
+/// Verification settings for one trusted user identity provider (N5 fix,
+/// review 0002). Its public signing keys are loaded from `jwks_path` (the
+/// same public JWKS format as [`crate::JsonWebKeySet`], so it holds no
+/// private material).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct UserIdpConfig {
+    /// The IdP's `iss` value. Must also appear in `user_issuers`.
+    pub issuer: String,
+    /// Public JWKS document with the IdP's RS256 signing keys.
+    pub jwks_path: PathBuf,
+    /// Required `aud` of every credential from this IdP.
+    pub audience: String,
+    /// Claim whose string value becomes the human principal, e.g. `sub` or
+    /// `email`.
+    #[serde(default = "default_principal_claim")]
+    pub principal_claim: String,
+}
+
+fn default_principal_claim() -> String {
+    "sub".to_string()
+}
+
 #[derive(Debug, Clone, Deserialize)]
 pub struct GatewayConfig {
     #[serde(default = "default_listen_addr")]
@@ -380,6 +402,13 @@ pub struct GatewayConfig {
     /// one issuer is configured.
     #[serde(default)]
     pub user_issuers: Vec<String>,
+
+    /// Verification settings for each trusted user IdP (N5 fix, review 0002).
+    /// Every entry in `user_issuers` must have a matching entry here, since a
+    /// credential from an issuer with no keys can't be checked. The gateway
+    /// refuses to start otherwise.
+    #[serde(default)]
+    pub user_idps: Vec<UserIdpConfig>,
 
     /// Issuer identities this gateway trusts (Task 13 / N12), checked
     /// against a token's signed `iss` claim by
@@ -582,6 +611,7 @@ impl GatewayConfig {
             routes: Vec::new(),
             clock_skew_tolerance_secs: default_clock_skew_secs(),
             user_issuers: Vec::new(),
+            user_idps: Vec::new(),
             trusted_issuers: Vec::new(),
             jti_cache_enabled: false,
             jti_ttl_secs: default_jti_ttl_secs(),

@@ -103,6 +103,22 @@ impl JsonWebKeySet {
         serde_json::from_str(jwks_data).map_err(|source| IdentityError::InvalidJwks(source.to_string()))
     }
 
+    /// The RSA verification key registered under `kid`, for checking a
+    /// third-party token (see `user_auth`). Errors if no key carries that
+    /// `kid` or the key isn't RSA.
+    pub fn decoding_key(&self, kid: &str) -> Result<DecodingKey, IdentityError> {
+        let jwk = self
+            .keys
+            .iter()
+            .find(|jwk| jwk.kid == kid)
+            .ok_or_else(|| IdentityError::InvalidKeyId(kid.to_string()))?;
+        if jwk.kty != "RSA" {
+            return Err(IdentityError::InvalidJwks(format!("unsupported kty {:?} for kid {:?}", jwk.kty, jwk.kid)));
+        }
+        DecodingKey::from_rsa_components(&jwk.n, &jwk.e)
+            .map_err(|source| IdentityError::Jwt(JwtError::InvalidKey(source.to_string())))
+    }
+
     /// Builds a verify-only [`JwtVerifier`] trusting every key in this set.
     pub fn to_verifier(&self) -> Result<JwtVerifier, IdentityError> {
         let mut entries = Vec::with_capacity(self.keys.len());

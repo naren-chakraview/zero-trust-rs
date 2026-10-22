@@ -45,7 +45,7 @@ use zero_trust::{
     build_client_cert_verifier, build_server_config, compute_cert_thumbprint_x5t_s256, current_actor,
     exchange_token_with_cert_binding, load_certs, now_unix_secs, validate_with_cert_binding_and_clock_skew, CaError,
     CertificateAuthority, ClientAuth, Decision, GatewayConfig, IdentityError, IdentityProvider, JsonWebKeySet, LocalCa,
-    LocalIssuer, Registry, RouteTable, ServerCertificate, SpiffeId, SpireProvider, TokenExchangeError, TokenExchangeRequest,
+    LocalIssuer, Registry, UserIdp, RouteTable, ServerCertificate, SpiffeId, SpireProvider, TokenExchangeError, TokenExchangeRequest,
     TokenExchangeResponse, ValidationRequest, DEFAULT_MAX_OBO_CHAIN_DEPTH, HEADER_CALLER_CHAIN, HEADER_OBO_TOKEN,
     HEADER_USER_PRINCIPAL,
 };
@@ -93,6 +93,11 @@ struct AppState {
     /// to `obo::validate_with_user_issuers` to accept this gateway's
     /// human-principal tokens.
     user_issuers: Arc<Vec<String>>,
+    /// Verification keys and checks for each trusted user IdP (N5 fix,
+    /// review 0002), keyed by `iss`. `POST /v1/svid/jwt-with-user` verifies
+    /// the user's credential against the entry for `user_issuer` before it
+    /// trusts any principal from it.
+    user_idps: Arc<std::collections::HashMap<String, UserIdp>>,
     /// Mirrors `GatewayConfig::effective_require_cert_binding()` (N6 fix,
     /// review 0002): whether `POST /v1/svid/jwt` must refuse issuance
     /// outright when the caller presented no mTLS client certificate at
@@ -279,6 +284,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         route_table: Arc::new(RouteTable::new(config.routes.clone())),
         clock_skew_tolerance_secs: config.clock_skew_tolerance_secs as i64,
         user_issuers: Arc::new(config.user_issuers.clone()),
+        user_idps: Arc::new(load_user_idps(&config)?),
         require_cert_binding: config.effective_require_cert_binding(),
     };
 
@@ -741,16 +747,40 @@ async fn issue_svid(
 // gateway's own SPIFFE ID (`sub`), bridging the human-to-service
 // attribution boundary described in review 0002's N5 finding.
 
+/// Loads the verification keys for every configured user IdP (N5 fix,
+/// review 0002). Startup fails if a trusted issuer has no `user_idps` entry,
+/// since its credentials could then never be checked, or if a `user_idps`
+/// entry names an issuer that isn't trusted.
+fn load_user_idps(config: &GatewayConfig) -> Result<std::collections::HashMap<String, UserIdp>, Box<dyn std::error::Error>> {
+    let mut idps = std::collections::HashMap::new();
+    for entry in &config.user_idps {
+        if !config.user_issuers.contains(&entry.issuer) {
+            return Err(format!("user_idps entry {:?} is not listed in user_issuers", entry.issuer).into());
+        }
+        let jwks = JsonWebKeySet::from_json(&std::fs::read_to_string(&entry.jwks_path)?)?;
+        let idp = UserIdp::new(
+            entry.issuer.clone(),
+            jwks,
+            entry.audience.clone(),
+            entry.principal_claim.clone(),
+        );
+        idps.insert(entry.issuer.clone(), idp);
+    }
+    for issuer in &config.user_issuers {
+        if !idps.contains_key(issuer) {
+            return Err(format!("user_issuers lists {issuer:?} but no user_idps entry provides its keys").into());
+        }
+    }
+    Ok(idps)
+}
+
 #[derive(Deserialize)]
 struct IssueJwtWithUserRequest {
-    /// The human user's credential, as presented by the IdP (a bearer
-    /// token or OIDC ID token). Real OIDC/JWT verification of third-party
-    /// IdP tokens (JWKS fetch, signature check) is out of scope here --
-    /// per the N5 fix's brief, this gateway's credential handling is
-    /// deliberately simple: the credential's value *is* the extracted
-    /// human principal (e.g. `user@corp.internal`), and trust is
-    /// established purely by checking `user_issuer` below against
-    /// `GatewayConfig::user_issuers`.
+    /// The human user's credential: an RS256 JWT from the IdP named by
+    /// `user_issuer`. It must carry that IdP's `iss` and this gateway's
+    /// configured `aud`, be unexpired, and be signed by a key in the IdP's
+    /// JWKS. The principal is taken from the claim configured in
+    /// `user_idps`. The credential is never trusted as a bare string.
     user_credential: String,
     /// Which trusted IdP issued `user_credential` (e.g.
     /// `auth.corp.internal`). Checked against `GatewayConfig::user_issuers`
@@ -768,9 +798,22 @@ async fn issue_svid_with_user(
     State(state): State<AppState>,
     Json(req): Json<IssueJwtWithUserRequest>,
 ) -> Response {
+    // N5 fix (review 0002): verify the credential before trusting any
+    // principal from it. The identity provider's own issuer check still runs
+    // below, as a second guard.
+    let principal = match state.user_idps.get(&req.user_issuer) {
+        None => {
+            return error_response(StatusCode::UNAUTHORIZED, format!("untrusted user issuer: {}", req.user_issuer))
+        }
+        Some(idp) => match idp.verify(&req.user_credential) {
+            Ok(principal) => principal,
+            Err(error) => return error_response(StatusCode::UNAUTHORIZED, error.to_string()),
+        },
+    };
+
     match state.identity.issue_jwt_svid_with_user(
         &state.gateway_id,
-        &req.user_credential,
+        &principal,
         &req.user_issuer,
         &state.user_issuers,
     ) {
@@ -1607,6 +1650,7 @@ workloads:
             route_table: Arc::new(RouteTable::default()),
             clock_skew_tolerance_secs: zero_trust::DEFAULT_CLOCK_SKEW_SECS,
             user_issuers: Arc::new(Vec::new()),
+            user_idps: Arc::new(std::collections::HashMap::new()),
             // Most existing tests call `/v1/svid/jwt` with no peer
             // certificate at all and expect the pre-N6 unbound token back
             // -- `false` preserves that. Tests exercising the N6 gate
@@ -1665,6 +1709,114 @@ workloads:
         });
 
         (format!("http://{addr}"), captured)
+    }
+
+    // --- N5 fix (review 0002): verified user credentials on the edge-mint path ---
+
+    const USER_IDP: &str = "auth.corp.internal";
+
+    /// Builds state whose only trusted IdP is `USER_IDP`, with keys from a
+    /// fresh RSA key. Returns the state and that key's PEM so tests can sign
+    /// credentials the IdP would issue.
+    fn user_idp_state() -> (AppState, String) {
+        use rsa::pkcs1::{EncodeRsaPrivateKey, LineEnding};
+        let key = rsa::RsaPrivateKey::new(&mut rand::rngs::OsRng, 2048).unwrap();
+        let pem = key.to_pkcs1_pem(LineEnding::LF).unwrap().to_string();
+        let jwks = JsonWebKeySet::from_rsa_private_pem("idp-1".to_string(), pem.as_bytes()).unwrap();
+        let idp = UserIdp::new(USER_IDP.to_string(), jwks, GATEWAY_SELF.to_string(), "email".to_string());
+
+        let mut state = test_state("http://unused.invalid".to_string());
+        state.user_issuers = Arc::new(vec![USER_IDP.to_string()]);
+        state.user_idps = Arc::new(std::collections::HashMap::from([(USER_IDP.to_string(), idp)]));
+        (state, pem)
+    }
+
+    /// Signs an IdP-style RS256 credential under `kid` with the given claims.
+    fn sign_idp_credential(pem: &str, kid: &str, claims: serde_json::Value) -> String {
+        let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+        header.kid = Some(kid.to_string());
+        let key = jsonwebtoken::EncodingKey::from_rsa_pem(pem.as_bytes()).unwrap();
+        jsonwebtoken::encode(&header, &claims, &key).unwrap()
+    }
+
+    fn user_mint_request(credential: &str, issuer: &str) -> Request<Body> {
+        let body = serde_json::json!({"user_credential": credential, "user_issuer": issuer}).to_string();
+        Request::builder()
+            .method("POST")
+            .uri("/v1/svid/jwt-with-user")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn user_mint_issues_a_token_for_a_verified_credential() {
+        let (state, pem) = user_idp_state();
+        let exp = zero_trust::now_unix_secs() + 300;
+        let credential = sign_idp_credential(
+            &pem,
+            "idp-1",
+            serde_json::json!({"iss": USER_IDP, "aud": GATEWAY_SELF, "exp": exp, "email": "alice@corp.internal"}),
+        );
+        let router = build_router(state);
+
+        let response = router.oneshot(user_mint_request(&credential, USER_IDP)).await.unwrap();
+        assert_eq!(response.status(), SC::OK);
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let token = body["token"].as_str().unwrap();
+        let payload_bytes = base64_decode_url_nopad(token.split('.').nth(1).unwrap()).unwrap();
+        let payload: serde_json::Value = serde_json::from_slice(&payload_bytes).unwrap();
+        assert_eq!(payload["user"], "alice@corp.internal");
+    }
+
+    #[tokio::test]
+    async fn user_mint_rejects_a_credential_signed_by_another_key() {
+        let (state, _pem) = user_idp_state();
+        let attacker = {
+            use rsa::pkcs1::{EncodeRsaPrivateKey, LineEnding};
+            rsa::RsaPrivateKey::new(&mut rand::rngs::OsRng, 2048)
+                .unwrap()
+                .to_pkcs1_pem(LineEnding::LF)
+                .unwrap()
+                .to_string()
+        };
+        let exp = zero_trust::now_unix_secs() + 300;
+        let forged = sign_idp_credential(
+            &attacker,
+            "idp-1",
+            serde_json::json!({"iss": USER_IDP, "aud": GATEWAY_SELF, "exp": exp, "email": "ceo@corp.internal"}),
+        );
+        let router = build_router(state);
+
+        let response = router.oneshot(user_mint_request(&forged, USER_IDP)).await.unwrap();
+        assert_eq!(response.status(), SC::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn user_mint_rejects_an_untrusted_issuer() {
+        let (state, pem) = user_idp_state();
+        let exp = zero_trust::now_unix_secs() + 300;
+        let credential = sign_idp_credential(
+            &pem,
+            "idp-1",
+            serde_json::json!({"iss": "evil.example", "aud": GATEWAY_SELF, "exp": exp, "email": "a@x"}),
+        );
+        let router = build_router(state);
+
+        let response = router.oneshot(user_mint_request(&credential, "evil.example")).await.unwrap();
+        assert_eq!(response.status(), SC::UNAUTHORIZED);
+    }
+
+    #[test]
+    fn startup_rejects_a_trusted_issuer_with_no_keys() {
+        let yaml = format!(
+            "upstream_addr: http://127.0.0.1:8080\nregistry_path: registry.yaml\n\
+             protected_workload: spiffe://chakra.internal/ns/inventory/sa/inventory-svc\n\
+             user_issuers:\n  - {USER_IDP}\n"
+        );
+        let config = GatewayConfig::from_yaml_str(&yaml).unwrap();
+        assert!(load_user_idps(&config).is_err());
     }
 
     // --- N9 fix (review 0002): proxy body limits ---

@@ -52,11 +52,12 @@ The binary serves two listeners, each with its own routes and TLS posture:
   caller must present a valid client certificate.
 - **Admin** (`admin_addr`, default `127.0.0.1:6443`). Serves issuance and
   delegation: `/v1/svid/jwt`, `/v1/svid/x509`, `/v1/svid/jwt-with-user`,
-  `/v1/authorize`, and `/v1/token-exchange`. It never asks for a client
-  certificate, because those endpoints authenticate with bootstrap tokens
-  or signed tokens. That is what lets a workload fetch its first X.509 SVID
-  under `client_auth: required`. The binary refuses to start unless
-  `admin_addr` is a loopback address.
+  `/v1/authorize`, and `/v1/token-exchange`. Admin requests a client
+  certificate but never requires one. A presented certificate is verified
+  against the CA and reaches the handlers, so cert-bound issuance works. A
+  request without one still completes the handshake, and that is what lets a
+  workload fetch its first X.509 SVID under `client_auth: required`. The binary
+  refuses to start unless `admin_addr` is a loopback address.
 
 The CA a gateway **trusts** for verifying client certs is independent of
 whether it can **issue** them itself — see `ca.cert_path`/`ca.key_path`
@@ -254,10 +255,15 @@ These are open. The review trackers in `docs/reviews/` have the detail.
 - **SPIRE token exchange.** Under `spire_socket_path`, the SPIRE provider can
   verify ES256 tokens but cannot sign, so `/v1/token-exchange` is unavailable.
   Delegation under SPIRE needs a separate token-signing key. See N8 in review 0002.
-- **Admin listener has no client authentication.** Admin is loopback-only, so
-  any local process can reach it. Issuance endpoints check bootstrap tokens.
-  Token exchange checks only the signature of the token it's given, not the
-  identity of the caller (N3, partly open).
+- **Admin accepts connections without a client certificate.** Admin is
+  loopback-only, so any local process can reach it. Issuance endpoints check
+  bootstrap tokens, and token exchange checks only the signature of the token
+  it's given, not the identity of the caller (N3, partly open).
+- **Client-bound tokens can't be exchanged by the gateway that receives them.**
+  A token bound to a client's certificate (N6) can only be exchanged by a caller
+  presenting that certificate (N2). The gateway receiving it doesn't hold that
+  key. The demo therefore issues its first token unbound (`require_cert_binding:
+  false` on api-gateway). Designing delegation for bound tokens is open work.
 
 ## Build & test
 

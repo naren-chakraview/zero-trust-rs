@@ -20,6 +20,14 @@ data:
     signing_key_path: /etc/zt-gateway/keys/signing-key.pem
     jwks_path: /etc/zt-gateway/jwks/public-jwks.json
     active_kid: inventory-svc
+    # F14 / demo (docs/demo-obo-chain.md): /demo on this gateway's proxy is
+    # answered by the standalone demo backend, not the embedded sidecar.
+    # The route's workload_id is the authorization destination, so it must
+    # be this gateway's own identity, the audience of the token it receives.
+    routes:
+      - path_pattern: /demo
+        workload_id: spiffe://chakra.internal/ns/inventory/sa/inventory-svc
+        upstream_addr: http://backend-c.zero-trust-demo.svc.cluster.local:8080
     protected_workload: spiffe://chakra.internal/ns/inventory/sa/inventory-svc
     token_ttl_seconds: 300
     tls:

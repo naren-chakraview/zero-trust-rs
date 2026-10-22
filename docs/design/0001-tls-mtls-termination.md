@@ -487,12 +487,17 @@ adopt the *config* gradually:
 
 `client_auth` applies to the proxy listener only. The admin listener
 (`admin_addr`, loopback-only) gets its own TLS acceptor, built from the same
-server certificate with no client-certificate verifier. Admin serves issuance
-and delegation (`/v1/svid/*`, `/v1/token-exchange`, `/v1/authorize`), which
-authenticate with bootstrap tokens or signed tokens. Because it never requires
-a client certificate, a workload can fetch its first X.509 SVID over admin
-before it has one. The binary refuses to start if `admin_addr` is not a
-loopback address.
+server certificate with an *optional* client-certificate verifier. Admin
+requests a client certificate but never requires one. A presented certificate
+is verified against the CA and reaches the handlers, which need it for
+cert-bound issuance (N6). Without a certificate the handshake still succeeds,
+so a workload can fetch its first X.509 SVID over admin before it has one. The
+binary refuses to start if `admin_addr` is not a loopback address.
+
+An earlier version gave admin no verifier at all. That broke cert-bound
+issuance, because the handlers never saw the certificate. The
+`tests/admin_tls.rs` integration test covers both paths, and it fails if admin
+stops seeing a presented certificate.
 
 Bootstrap order for a strict deployment:
 

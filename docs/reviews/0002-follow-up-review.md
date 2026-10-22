@@ -22,7 +22,7 @@ findings text below is the original review and is not edited.
 | F7 | Fixed | (earlier) | Admin and proxy are separate. |
 | F8 | Fixed | (earlier) | |
 | F9 | Fixed | (earlier) | |
-| F10 | Fixed | `eb0cd6a` | Admin uses a separate TLS acceptor with no client-cert requirement. Startup refuses a non-loopback admin address. Verified live. |
+| F10 | Fixed | `eb0cd6a`, plus a follow-up commit | Admin uses a separate TLS acceptor. It requests client certs but doesn't require them, so bootstrap works and cert-bound issuance works. Startup refuses a non-loopback admin address. `tests/admin_tls.rs` covers it. The first version of this fix dropped the verifier and broke N6. |
 | F11 | Fixed | `901db21`, `9f7c76f` | Capability policy with per-user and per-workload grants, a deadline on allow-by-default, and hot reload. There are no explicit deny rules yet. |
 | F12 | Fixed | (earlier), `b64276f` | |
 | F13 | Partial | `dbeac1d`, `98b56da` | ES256 verification is in. Under SPIRE, token exchange can't sign (N8). |

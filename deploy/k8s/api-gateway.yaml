@@ -26,8 +26,24 @@ data:
     signing_key_path: /etc/zt-gateway/keys/signing-key.pem
     jwks_path: /etc/zt-gateway/jwks/public-jwks.json
     active_kid: api-gateway
+    # F14 / demo (docs/demo-obo-chain.md): /demo on this gateway's proxy is
+    # answered by the standalone demo backend, not the embedded sidecar.
+    # The route's workload_id is the authorization destination, so it must
+    # be this gateway's own identity, the audience of the token it receives.
+    routes:
+      - path_pattern: /demo
+        workload_id: spiffe://chakra.internal/ns/api-gateway/sa/api-gateway
+        upstream_addr: http://backend-a.zero-trust-demo.svc.cluster.local:8080
     protected_workload: spiffe://chakra.internal/ns/api-gateway/sa/api-gateway
     token_ttl_seconds: 300
+    # Demo only (docs/demo-obo-chain.md). With mTLS on, issuance binds tokens to
+    # the caller's cert and refuses unbound ones. Each delegation hop then needs
+    # the cert the token is bound to. But the gateway that receives a
+    # client-bound token can't exchange it, because it doesn't hold the client's
+    # key (review 0002, N2). This gateway issues the demo's hop-0 token unbound.
+    # Hops are still checked: every proxy call must come from the current actor
+    # (N1), and the token's audience and depth are checked at each exchange.
+    require_cert_binding: false
     tls:
       client_auth: required
     ca:

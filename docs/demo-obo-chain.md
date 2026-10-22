@@ -158,12 +158,18 @@ listed here rather than worked around silently.
    prerequisites means the SPIRE server and agent are up, for example for
    `spire-debug-client`'s SVID. It does not mean the gateways' identities are
    backed by SPIRE.
-3. **`backend-a`/`backend-b`/`backend-c` aren't routed to.** They're deployed and
-   the script curls them directly, in a clearly labeled step. None of the three
-   gateway ConfigMaps has a `routes:` entry (F14) for them, so each gateway's
-   proxy fallback still forwards to its own `upstream_addr`.
-4. **TLS is now handled by the script, but not yet verified against the
-   cluster.** The gateways require mTLS on the proxy listener
+3. **Backend routes are wired.** Each gateway's ConfigMap has a `/demo` route
+   (`routes:`, F14) to its standalone backend: api-gateway to `backend-a`,
+   orders-svc to `backend-b`, inventory-svc to `backend-c`. The route's
+   `workload_id` is the authorization destination, and it's the token audience
+   that gateway receives. The chain's three responses are therefore each
+   backend's own text. The embedded `backend` sidecar still answers other paths.
+4. **The first token is unbound, by design.** The gateway that receives a
+   client-bound token can't exchange it (N2), so api-gateway sets
+   `require_cert_binding: false` for the demo. Each hop still checks the mTLS
+   peer against the current actor (N1), and the audience and depth at each
+   exchange. Delegation for bound tokens is open work.
+5. **TLS is handled by the script, and the whole chain was verified locally.** The gateways require mTLS on the proxy listener
    (`client_auth: required`), and admin serves HTTPS without client certs. The
    script calls admin over HTTPS with `-k`, because the gateways present an
    ephemeral self-signed server certificate. Before each proxy hop, it issues an
@@ -173,4 +179,4 @@ listed here rather than worked around silently.
    checked against a local gateway with the same TLS posture. It has not been
    run against the kind cluster.
 
-Until item 3 (the backend routes) is fixed, the script will print a clear status per hop but will not get to a fully passing, every-hop-`allow=true` run, even with the JWKS wiring in place.
+The full chain passed locally, with the demo script's own functions and mTLS on: three 200 responses, each from the expected backend. The cluster run is the remaining check. It still depends on item 1, the JWKS wiring, being confirmed on a real cluster.

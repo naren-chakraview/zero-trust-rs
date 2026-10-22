@@ -46,7 +46,7 @@ use zero_trust::{
     exchange_token_with_cert_binding, load_certs, now_unix_secs, validate_with_cert_binding_and_clock_skew,
     validate_with_cert_binding_user_issuers_and_clock_skew, CaError,
     CertificateAuthority, ClientAuth, Decision, GatewayConfig, IdentityError, IdentityProvider, JsonWebKeySet, LocalCa,
-    LocalIssuer, Registry, UserIdp, CapabilityDecision, CapabilityPolicy, CapabilityRequest, RouteTable, ServerCertificate, SpiffeId, SpireProvider, TokenExchangeError, TokenExchangeRequest,
+    LocalIssuer, Registry, UserIdp, CapabilityDecision, CapabilityPolicy, CapabilityPolicyHandle, CapabilityRequest, RouteTable, watch_capability_policy, ServerCertificate, SpiffeId, SpireProvider, TokenExchangeError, TokenExchangeRequest,
     TokenExchangeResponse, ValidationRequest, DEFAULT_MAX_OBO_CHAIN_DEPTH, HEADER_CALLER_CHAIN, HEADER_OBO_TOKEN,
     HEADER_USER_PRINCIPAL,
 };
@@ -101,7 +101,7 @@ struct AppState {
     user_idps: Arc<std::collections::HashMap<String, UserIdp>>,
     /// F11 capability policy (review 0002), or `None` when no policy file is
     /// configured. Checked after the OBO decision on every proxied request.
-    capability_policy: Option<Arc<CapabilityPolicy>>,
+    capability_policy: Option<Arc<CapabilityPolicyHandle>>,
     /// Mirrors `GatewayConfig::effective_require_cert_binding()` (N6 fix,
     /// review 0002): whether `POST /v1/svid/jwt` must refuse issuance
     /// outright when the caller presented no mTLS client certificate at
@@ -783,13 +783,23 @@ fn load_user_idps(config: &GatewayConfig) -> Result<std::collections::HashMap<St
 /// `None` when no policy is configured. An unconfigured policy disables
 /// capability checks, and the gateway logs that at startup so the choice is
 /// visible.
-fn load_capability_policy(config: &GatewayConfig) -> Result<Option<Arc<CapabilityPolicy>>, Box<dyn std::error::Error>> {
+fn load_capability_policy(
+    config: &GatewayConfig,
+) -> Result<Option<Arc<CapabilityPolicyHandle>>, Box<dyn std::error::Error>> {
     let Some(path) = &config.capability_policy_path else {
         tracing::warn!("no capability_policy_path configured -- capability checks are disabled");
         return Ok(None);
     };
     let policy = CapabilityPolicy::from_file(path, now_unix_secs())?;
-    Ok(Some(Arc::new(policy)))
+    let handle = Arc::new(CapabilityPolicyHandle::new(policy));
+    // The watcher runs for the life of the process. It is spawned here because
+    // this runs inside the tokio runtime, from `main`.
+    tokio::spawn(watch_capability_policy(
+        handle.clone(),
+        path.clone(),
+        std::time::Duration::from_secs(config.capability_policy_reload_secs.max(1)),
+    ));
+    Ok(Some(handle))
 }
 
 #[derive(Deserialize)]
@@ -1430,7 +1440,7 @@ async fn proxy_handler(
     // claim and the caller from the verified peer or OBO chain, never from
     // client headers.
     let capability = match &state.capability_policy {
-        Some(policy) => policy.check(
+        Some(handle) => handle.current().check(
             &CapabilityRequest {
                 method: parts.method.as_str(),
                 path: parts.uri.path(),
@@ -1885,7 +1895,7 @@ workloads:
     fn policy_state(upstream_addr: String, yaml: &str) -> AppState {
         let mut state = test_state(upstream_addr);
         let policy = CapabilityPolicy::from_yaml_str(yaml, zero_trust::now_unix_secs()).unwrap();
-        state.capability_policy = Some(Arc::new(policy));
+        state.capability_policy = Some(Arc::new(CapabilityPolicyHandle::new(policy)));
         state
     }
 

@@ -252,6 +252,10 @@ pub struct UserIdpConfig {
     pub principal_claim: String,
 }
 
+fn default_capability_policy_reload_secs() -> u64 {
+    5
+}
+
 fn default_principal_claim() -> String {
     "sub".to_string()
 }
@@ -415,6 +419,12 @@ pub struct GatewayConfig {
     /// on the protected upstream. When unset, no capability checks run.
     #[serde(default)]
     pub capability_policy_path: Option<PathBuf>,
+
+    /// How often, in seconds, the capability policy file is checked for
+    /// changes. A changed file that parses and validates is applied without a
+    /// restart.
+    #[serde(default = "default_capability_policy_reload_secs")]
+    pub capability_policy_reload_secs: u64,
 
     /// Issuer identities this gateway trusts (Task 13 / N12), checked
     /// against a token's signed `iss` claim by
@@ -619,6 +629,7 @@ impl GatewayConfig {
             user_issuers: Vec::new(),
             user_idps: Vec::new(),
             capability_policy_path: None,
+            capability_policy_reload_secs: default_capability_policy_reload_secs(),
             trusted_issuers: Vec::new(),
             jti_cache_enabled: false,
             jti_ttl_secs: default_jti_ttl_secs(),

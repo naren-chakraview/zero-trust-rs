@@ -15,7 +15,9 @@
 //! denies. Startup refuses an expired allow default, so operators must
 //! eventually move to `default: deny`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use serde::Deserialize;
 
@@ -197,6 +199,73 @@ impl CapabilityPolicy {
     }
 }
 
+/// The live policy, shared between request handlers and the reload task.
+///
+/// Requests take a snapshot with [`Self::current`], so a reload never changes a
+/// decision that is already being made. A reload swaps the whole policy at
+/// once.
+#[derive(Debug)]
+pub struct CapabilityPolicyHandle {
+    current: RwLock<Arc<CapabilityPolicy>>,
+}
+
+impl CapabilityPolicyHandle {
+    pub fn new(policy: CapabilityPolicy) -> Self {
+        Self {
+            current: RwLock::new(Arc::new(policy)),
+        }
+    }
+
+    pub fn current(&self) -> Arc<CapabilityPolicy> {
+        self.current.read().unwrap_or_else(|poisoned| poisoned.into_inner()).clone()
+    }
+
+    fn replace(&self, policy: CapabilityPolicy) {
+        *self.current.write().unwrap_or_else(|poisoned| poisoned.into_inner()) = Arc::new(policy);
+    }
+}
+
+/// Reloads the policy at `path` if its contents differ from `last_seen`.
+///
+/// Returns `Ok(true)` after swapping in a new policy and `Ok(false)` when the
+/// file is unchanged. A file that fails to read, parse, or validate returns an
+/// error and leaves the live policy unchanged. Comparing contents rather than
+/// mtime also catches Kubernetes ConfigMap updates, which replace the file.
+pub fn reload_if_changed(
+    handle: &CapabilityPolicyHandle,
+    path: &Path,
+    last_seen: &mut Option<String>,
+    now: i64,
+) -> Result<bool, CapabilityPolicyError> {
+    let contents = std::fs::read_to_string(path)?;
+    if last_seen.as_deref() == Some(contents.as_str()) {
+        return Ok(false);
+    }
+    let policy = CapabilityPolicy::from_yaml_str(&contents, now)?;
+    handle.replace(policy);
+    *last_seen = Some(contents);
+    Ok(true)
+}
+
+/// Polls `path` every `interval` and reloads it on change, for the life of the
+/// process. A rejected reload is logged and the previous policy keeps running.
+pub async fn watch_capability_policy(handle: Arc<CapabilityPolicyHandle>, path: PathBuf, interval: Duration) {
+    let mut last_seen = std::fs::read_to_string(&path).ok();
+    let mut ticker = tokio::time::interval(interval);
+    loop {
+        ticker.tick().await;
+        match reload_if_changed(&handle, &path, &mut last_seen, crate::now_unix_secs()) {
+            Ok(true) => tracing::info!(path = %path.display(), "capability policy reloaded"),
+            Ok(false) => {}
+            Err(error) => tracing::warn!(
+                path = %path.display(),
+                %error,
+                "capability policy reload rejected; keeping the previous policy"
+            ),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -323,5 +392,49 @@ rules:
         let err = CapabilityPolicy::from_yaml_str("default: deny\nrules:\n  - path: /x\n    user: [alice]\n", NOW)
             .unwrap_err();
         assert!(matches!(err, CapabilityPolicyError::Parse(_)));
+    }
+
+    #[test]
+    fn reload_swaps_in_an_edited_policy_and_ignores_an_unchanged_file() {
+        let dir = std::env::temp_dir().join(format!("zt-f11-reload-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("capability-policy.yaml");
+        std::fs::write(&path, "default: deny\n").unwrap();
+
+        let handle = CapabilityPolicyHandle::new(CapabilityPolicy::from_file(&path, NOW).unwrap());
+        let mut last_seen = Some(std::fs::read_to_string(&path).unwrap());
+        let probe = request("GET", "/x", Some(ALICE), None);
+        assert!(!handle.current().check(&probe, NOW).is_allow());
+
+        std::fs::write(&path, "default: deny\nrules:\n  - path: /x\n    users: [alice@corp.internal]\n").unwrap();
+        assert_eq!(reload_if_changed(&handle, &path, &mut last_seen, NOW).unwrap(), true);
+        assert!(handle.current().check(&probe, NOW).is_allow());
+
+        assert_eq!(reload_if_changed(&handle, &path, &mut last_seen, NOW).unwrap(), false);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_rejected_reload_keeps_the_previous_policy_live() {
+        let dir = std::env::temp_dir().join(format!("zt-f11-bad-reload-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("capability-policy.yaml");
+        std::fs::write(&path, "default: deny\nrules:\n  - path: /x\n    users: [alice@corp.internal]\n").unwrap();
+
+        let handle = CapabilityPolicyHandle::new(CapabilityPolicy::from_file(&path, NOW).unwrap());
+        let mut last_seen = Some(std::fs::read_to_string(&path).unwrap());
+
+        // A typo'd field must be rejected, and the allow rule must keep working.
+        std::fs::write(&path, "default: deny\nrules:\n  - path: /x\n    user: [alice@corp.internal]\n").unwrap();
+        assert!(reload_if_changed(&handle, &path, &mut last_seen, NOW).is_err());
+        assert!(handle.current().check(&request("GET", "/x", Some(ALICE), None), NOW).is_allow());
+
+        // An allow default whose deadline has passed is refused the same way.
+        std::fs::write(&path, format!("default: allow\ndefault_allow_until: {NOW}\n")).unwrap();
+        assert!(reload_if_changed(&handle, &path, &mut last_seen, NOW).is_err());
+        assert!(handle.current().check(&request("GET", "/x", Some(ALICE), None), NOW).is_allow());
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

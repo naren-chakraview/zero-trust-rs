@@ -26,7 +26,10 @@ pub use headers::{
     HEADER_USER_PRINCIPAL,
 };
 pub use identity::{IdentityProvider, IssuedToken, JsonWebKeySet, LocalIssuer};
-pub use capability::{CapabilityDecision, CapabilityPolicy, CapabilityPolicyError, CapabilityRequest};
+pub use capability::{
+    watch_capability_policy, CapabilityDecision, CapabilityPolicy, CapabilityPolicyError, CapabilityPolicyHandle,
+    CapabilityRequest,
+};
 pub use user_auth::{UserAuthError, UserIdp};
 pub use jwt::{compute_cert_thumbprint_x5t_s256, ActClaim, CertBinding, JwtSigner, JwtVerifier, OboClaims};
 pub use obo::{

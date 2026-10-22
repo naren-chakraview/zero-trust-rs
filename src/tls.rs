@@ -22,6 +22,17 @@ pub struct ServerCertificate {
     pub private_key: PrivateKeyDer<'static>,
 }
 
+impl Clone for ServerCertificate {
+    // `PrivateKeyDer` isn't `Clone`, so copy the key via `clone_key`. The F10
+    // fix needs one certificate for both the proxy and admin acceptors.
+    fn clone(&self) -> Self {
+        Self {
+            cert_chain: self.cert_chain.clone(),
+            private_key: self.private_key.clone_key(),
+        }
+    }
+}
+
 impl ServerCertificate {
     /// Loads a PEM certificate chain and private key from disk.
     pub fn load(cert_path: &Path, key_path: &Path) -> Result<Self, TlsError> {

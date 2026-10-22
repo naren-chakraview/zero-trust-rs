@@ -243,7 +243,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let ca = resolve_ca(&config, &registry)?;
 
-    let tls_acceptor = match &config.tls {
+    // F10 fix (review 0002): the proxy and admin listeners get separate TLS
+    // acceptors. The proxy keeps the configured `client_auth`. Admin never
+    // demands a client certificate, because it's loopback-only and its
+    // endpoints authenticate with bootstrap tokens. Requiring mTLS there would
+    // block a workload from fetching its first X.509 SVID.
+    let (tls_acceptor, admin_tls_acceptor) = match &config.tls {
         Some(tls_config) => {
             let server_cert = match (&tls_config.cert_path, &tls_config.key_path) {
                 (Some(cert_path), Some(key_path)) => ServerCertificate::load(cert_path, key_path)?,
@@ -273,10 +278,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 }
             };
 
-            let server_config = build_server_config(server_cert, client_cert_verifier)?;
-            Some(TlsAcceptor::from(Arc::new(server_config)))
+            let admin_server_config = build_server_config(server_cert.clone(), None)?;
+            let proxy_server_config = build_server_config(server_cert, client_cert_verifier)?;
+            (
+                Some(TlsAcceptor::from(Arc::new(proxy_server_config))),
+                Some(TlsAcceptor::from(Arc::new(admin_server_config))),
+            )
         }
-        None => None,
+        None => (None, None),
     };
 
     let upstream_client = reqwest::Client::builder()
@@ -305,6 +314,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         require_cert_binding: config.effective_require_cert_binding(),
     };
 
+    require_loopback_admin(config.admin_addr)?;
+
     let listener_config = ListenerConfig {
         proxy_addr: config.proxy_addr,
         admin_addr: config.admin_addr,
@@ -314,7 +325,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_concurrent_connections: config.max_concurrent_connections,
     };
 
-    let handles = setup_listeners(&listener_config, state, tls_acceptor).await?;
+    let handles = setup_listeners(&listener_config, state, tls_acceptor, admin_tls_acceptor).await?;
     tracing::info!(
         admin_addr = %handles.admin_addr,
         proxy_addr = %handles.proxy_addr,
@@ -371,6 +382,7 @@ async fn setup_listeners(
     config: &ListenerConfig,
     state: AppState,
     tls_acceptor: Option<TlsAcceptor>,
+    admin_tls_acceptor: Option<TlsAcceptor>,
 ) -> Result<ListenerHandles, Box<dyn std::error::Error>> {
     let admin_router = build_admin_router(state.clone(), config.admin_rate_limit_rps, config.max_body_mb, config.request_timeout_secs, config.max_concurrent_connections);
     let proxy_router = build_proxy_router(state, config.max_body_mb, config.request_timeout_secs, config.max_concurrent_connections);
@@ -380,9 +392,8 @@ async fn setup_listeners(
     let proxy_listener = TcpListener::bind(config.proxy_addr).await?;
     let proxy_addr = proxy_listener.local_addr()?;
 
-    let admin_tls = tls_acceptor.clone();
     let admin = tokio::spawn(async move {
-        serve(admin_listener, admin_router, admin_tls).await;
+        serve(admin_listener, admin_router, admin_tls_acceptor).await;
     });
 
     let proxy = tokio::spawn(async move {
@@ -789,6 +800,20 @@ fn load_user_idps(config: &GatewayConfig) -> Result<std::collections::HashMap<St
         }
     }
     Ok(idps)
+}
+
+/// Refuses to start unless the admin listener binds a loopback address (F10
+/// fix, review 0002). Admin serves issuance and token exchange with no
+/// client-certificate check, so it must not be reachable from the network.
+fn require_loopback_admin(admin_addr: SocketAddr) -> Result<(), Box<dyn std::error::Error>> {
+    if admin_addr.ip().is_loopback() {
+        return Ok(());
+    }
+    Err(format!(
+        "admin_addr {admin_addr} is not a loopback address; the admin listener authenticates with \
+         bootstrap tokens only, so it must bind 127.0.0.1 or ::1"
+    )
+    .into())
 }
 
 /// Loads the F11 capability policy from `capability_policy_path`, or returns
@@ -1952,6 +1977,16 @@ workloads:
         let second = router.oneshot(send(issued.token)).await.unwrap();
         assert_eq!(second.status(), SC::FORBIDDEN, "a replayed jti must be refused");
         assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    // --- F10 fix (review 0002): admin is loopback-only ---
+
+    #[test]
+    fn admin_must_bind_a_loopback_address() {
+        assert!(require_loopback_admin("127.0.0.1:6443".parse().unwrap()).is_ok());
+        assert!(require_loopback_admin("[::1]:6443".parse().unwrap()).is_ok());
+        assert!(require_loopback_admin("0.0.0.0:6443".parse().unwrap()).is_err());
+        assert!(require_loopback_admin("10.0.0.5:6443".parse().unwrap()).is_err());
     }
 
     // --- F11 fix (review 0002): capability policy on the proxy path ---
@@ -3152,7 +3187,7 @@ workloads:
         };
         let state = test_state("http://unused.invalid".to_string());
 
-        let handles = setup_listeners(&listener_config, state, None).await.unwrap();
+        let handles = setup_listeners(&listener_config, state, None, None).await.unwrap();
 
         let client = reqwest::Client::new();
 

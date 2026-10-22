@@ -156,7 +156,7 @@ log "4. the agent exchanges it for inventory-svc"
 INVENTORY_TOKEN="$(exchange "$GW_B_ADMIN_PORT" "$AGENT_TOKEN" "$GW_C_ID")"
 
 log "the agent's X.509 SVID (its TLS identity on the next hop)"
-issue_svid_cert "orders-svc" "$GW_B_ID" "$GW_B_ADMIN_PORT" "orders-dev-secret"
+issue_svid_cert "orders-svc" "$GW_B_ID" "$GW_A_ADMIN_PORT" "orders-dev-secret"
 
 echo
 call_proxy "5. the agent reads /demo for alice" GET "$INVENTORY_TOKEN" orders-svc

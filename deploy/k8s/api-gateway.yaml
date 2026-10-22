@@ -56,6 +56,9 @@ data:
     require_cert_binding: false
     tls:
       client_auth: required
+    # R7 fix (review 0003): the only gateway holding the CA private key. It issues
+    # X.509 SVIDs for the demo workloads (POST /v1/svid/x509). The others verify
+    # only.
     ca:
       cert_path: /etc/zt-gateway/ca/ca-cert.pem
       key_path: /etc/zt-gateway/ca/ca-key.pem

@@ -43,9 +43,11 @@ data:
     token_ttl_seconds: 300
     tls:
       client_auth: required
+    # R7 fix (review 0003): verify-only. Only api-gateway holds the CA private
+    # key, so a compromise here can't mint X.509 SVIDs. Workloads get their SVIDs
+    # from api-gateway's /v1/svid/x509.
     ca:
       cert_path: /etc/zt-gateway/ca/ca-cert.pem
-      key_path: /etc/zt-gateway/ca/ca-key.pem
       ttl_seconds: 3600
 ---
 apiVersion: apps/v1
@@ -127,9 +129,13 @@ spec:
         - name: gateway-config
           configMap:
             name: zt-gateway-config-inventory-svc
+        # R7 fix: this pod gets the CA certificate only, never the private key.
         - name: ca-material
           secret:
             secretName: zt-ca
+            items:
+              - key: ca-cert.pem
+                path: ca-cert.pem
         # Created by scripts/deploy-all.sh from deploy/k8s/keys/ (git-ignored).
         - name: signing-key
           secret:

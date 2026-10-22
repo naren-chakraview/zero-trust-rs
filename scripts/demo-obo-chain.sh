@@ -226,7 +226,7 @@ echo
 log "=== issuing X.509 SVIDs for the three calling workloads ==="
 issue_svid_cert "client" "$CLIENT_ID" "$GW_A_ADMIN_PORT" "$CLIENT_BOOTSTRAP_TOKEN"
 issue_svid_cert "api-gateway" "$GW_A_ID" "$GW_A_ADMIN_PORT" "${API_GATEWAY_BOOTSTRAP_TOKEN:-api-gateway-dev-secret}"
-issue_svid_cert "orders-svc" "$GW_B_ID" "$GW_B_ADMIN_PORT" "${ORDERS_BOOTSTRAP_TOKEN:-orders-dev-secret}"
+issue_svid_cert "orders-svc" "$GW_B_ID" "$GW_A_ADMIN_PORT" "${ORDERS_BOOTSTRAP_TOKEN:-orders-dev-secret}"
 
 echo
 log "=== hop 0: mint the initial token for '$CLIENT_ID' (audience: api-gateway) ==="

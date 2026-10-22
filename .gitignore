@@ -8,3 +8,7 @@
 # Task 14 (N15): the local demo CA secret carries a PRIVATE KEY. It is
 # generated on the operator's machine (see its header), never committed.
 deploy/k8s/zt-ca-secret.yaml
+
+# Review 0002 / N15: superpowers plans and agent workspace files are local
+# working notes, not repository content.
+docs/superpowers/

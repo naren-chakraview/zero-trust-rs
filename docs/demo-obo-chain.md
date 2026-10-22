@@ -164,14 +164,15 @@ listed here rather than worked around silently.
    the script curls them directly, in a clearly labeled step. None of the three
    gateway ConfigMaps has a `routes:` entry (F14) for them, so each gateway's
    proxy fallback still forwards to its own `upstream_addr`.
-4. **The script assumes plain HTTP, but the gateways now serve TLS.** The
-   manifests set `tls.client_auth: required` on each gateway. The proxy listener
-   therefore requires a client certificate, and the admin listener serves HTTPS
-   without requiring one. The script's `http://` calls to admin will fail, and
-   its proxy calls will be refused without a client certificate. Switching the
-   script to `https://` and presenting a client certificate for proxy calls is
-   needed. See "Admin listener under `client_auth: required`" in
-   `docs/design/0001-tls-mtls-termination.md` for the bootstrap order.
+4. **TLS is now handled by the script, but not yet verified against the
+   cluster.** The gateways require mTLS on the proxy listener
+   (`client_auth: required`), and admin serves HTTPS without client certs. The
+   script calls admin over HTTPS with `-k`, because the gateways present an
+   ephemeral self-signed server certificate. Before each proxy hop, it issues an
+   X.509 SVID for the calling workload through `/v1/svid/x509` and presents that
+   cert. The three SVIDs are `client`, then `api-gateway`, then `orders-svc`,
+   since each hop's TLS peer must be the current actor. The issuance flow was
+   checked against a local gateway with the same TLS posture. It has not been
+   run against the kind cluster.
 
-Until items 1 and 4 are fixed, the script will print a clear status per hop but
-will not get to a fully passing, every-hop-`allow=true` run.
+Until item 1 (and item 3, for the backend routes) is fixed, the script will print a clear status per hop but will not get to a fully passing, every-hop-`allow=true` run.

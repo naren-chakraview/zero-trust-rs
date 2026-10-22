@@ -69,10 +69,13 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 K8S_DIR="$(cd "$SCRIPT_DIR/../deploy/k8s" && pwd)"
 
 PF_PIDS=()
+# Holds the X.509 SVIDs and keys this run issues, one set per calling workload.
+CERT_DIR="$(mktemp -d)"
 cleanup() {
   for pid in "${PF_PIDS[@]:-}"; do
     kill "$pid" >/dev/null 2>&1 || true
   done
+  rm -rf "$CERT_DIR"
 }
 trap cleanup EXIT
 
@@ -113,12 +116,10 @@ port_forward_svc() {
 wait_for_local_port() {
   local port="$1" label="$2"
   local deadline=$((SECONDS + 30))
-  until curl -s -o /dev/null "http://127.0.0.1:${port}/" 2>/dev/null; do
-    # curl succeeding OR failing-with-a-real-HTTP-response both mean the
-    # port forward is up; only a connection refusal means "not yet" — but
-    # plain `curl -s` swallows that distinction, so just retry on any
-    # failure until the deadline, same as the rest of this project's
-    # scripts (see setup-spire-kind.sh's wait_for_pod_then_ready).
+  # A TCP connect is enough to show the port-forward is up. An HTTP request is
+  # not: the proxy listener requires a client certificate, so it refuses a
+  # plain HTTPS request, and an HTTP check would never succeed on it.
+  until (exec 3<>"/dev/tcp/127.0.0.1/${port}") 2>/dev/null; do
     if [ "$SECONDS" -ge "$deadline" ]; then
       echo "ERROR: port-forward for $label never came up on 127.0.0.1:$port" >&2
       exit 1
@@ -137,10 +138,28 @@ wait_for_local_port() {
 # any of this script's later `/v1/token-exchange` calls can act on).
 get_initial_token() {
   local admin_port="$1" workload_name="$2" audience="$3" bootstrap_token="$4"
-  curl -sf -X POST "http://127.0.0.1:${admin_port}/v1/svid/jwt" \
+  curl -sfk -X POST "https://127.0.0.1:${admin_port}/v1/svid/jwt" \
     -H "content-type: application/json" \
     -d "{\"workload_name\":\"${workload_name}\",\"audience\":\"${audience}\",\"bootstrap_token\":\"${bootstrap_token}\"}" \
     | python3 -c "import sys, json; print(json.load(sys.stdin)['token'])"
+}
+
+# POST /v1/svid/x509 — issues the calling workload's own X.509 SVID. Under
+# `client_auth: required` the proxy listener only accepts a client cert from
+# the shared CA, so each hop presents its caller's SVID. The CSR's single URI
+# SAN must equal the workload's registered SPIFFE ID, or the CA refuses it.
+# Writes $CERT_DIR/<name>.{key,crt}.
+issue_svid_cert() {
+  local name="$1" spiffe_id="$2" admin_port="$3" bootstrap_token="$4"
+  local dir="$CERT_DIR"
+  openssl req -new -newkey rsa:2048 -nodes -keyout "$dir/$name.key" -out "$dir/$name.csr" \
+    -subj "/CN=$name" -addext "subjectAltName=URI:${spiffe_id}" 2>/dev/null
+  local csr_json
+  csr_json="$(python3 -c "import json,sys; print(json.dumps(open(sys.argv[1]).read()))" "$dir/$name.csr")"
+  curl -sfk -X POST "https://127.0.0.1:${admin_port}/v1/svid/x509" \
+    -H "content-type: application/json" \
+    -d "{\"workload_name\":\"${name}\",\"csr_pem\":${csr_json},\"bootstrap_token\":\"${bootstrap_token}\"}" \
+    | python3 -c "import sys, json; print(json.load(sys.stdin)['cert_pem'])" > "$dir/$name.crt"
 }
 
 # POST /v1/token-exchange — the real RFC 8693 exchange this task is about:
@@ -148,7 +167,7 @@ get_initial_token() {
 # call appended to the signed `act` chain server-side.
 exchange_token() {
   local admin_port="$1" subject_token="$2" audience="$3"
-  curl -sf -X POST "http://127.0.0.1:${admin_port}/v1/token-exchange" \
+  curl -sfk -X POST "https://127.0.0.1:${admin_port}/v1/token-exchange" \
     -H "content-type: application/json" \
     -d "{\"subject_token\":\"${subject_token}\",\"audience\":\"${audience}\"}" \
     | python3 -c "import sys, json; print(json.load(sys.stdin)['access_token'])"
@@ -161,9 +180,12 @@ exchange_token() {
 # still runs and the final diagnostics can point at exactly which hop
 # failed and why.
 call_proxy() {
-  local label="$1" proxy_port="$2" token="$3" traceparent="$4"
+  local label="$1" proxy_port="$2" token="$3" traceparent="$4" caller="$5"
   local status body
-  body="$(curl -s -w '\n%{http_code}' "http://127.0.0.1:${proxy_port}/demo" \
+  # The TLS peer on each hop is the current actor, so present that caller's
+  # SVID. -k: the server certificate is the gateway's ephemeral self-signed one.
+  body="$(curl -sk -w '\n%{http_code}' "https://127.0.0.1:${proxy_port}/demo" \
+    --cert "$CERT_DIR/$caller.crt" --key "$CERT_DIR/$caller.key" \
     -H "X-SPIFFE-OBO-Token: ${token}" \
     -H "traceparent: ${traceparent}")"
   status="${body##*$'\n'}"
@@ -207,13 +229,19 @@ TRACEPARENT="00-${TRACE_ID}-${PARENT_SPAN_ID}-01"
 log "Shared trace ID for this run's three gateway hops: $TRACE_ID"
 
 echo
+log "=== issuing X.509 SVIDs for the three calling workloads ==="
+issue_svid_cert "client" "$CLIENT_ID" "$GW_A_ADMIN_PORT" "$CLIENT_BOOTSTRAP_TOKEN"
+issue_svid_cert "api-gateway" "$GW_A_ID" "$GW_A_ADMIN_PORT" "${API_GATEWAY_BOOTSTRAP_TOKEN:-api-gateway-dev-secret}"
+issue_svid_cert "orders-svc" "$GW_B_ID" "$GW_B_ADMIN_PORT" "${ORDERS_BOOTSTRAP_TOKEN:-orders-dev-secret}"
+
+echo
 log "=== hop 0: mint the initial token for '$CLIENT_ID' (audience: api-gateway) ==="
 TOKEN_0=$(get_initial_token "$GW_A_ADMIN_PORT" "client" "$GW_A_ID" "$CLIENT_BOOTSTRAP_TOKEN")
 echo "token_0 (for api-gateway): ${TOKEN_0:0:40}..."
 
 echo
 log "=== hop 1: client -> Gateway A (api-gateway) ==="
-call_proxy "Gateway A (api-gateway)" "$GW_A_PROXY_PORT" "$TOKEN_0" "$TRACEPARENT"
+call_proxy "Gateway A (api-gateway)" "$GW_A_PROXY_PORT" "$TOKEN_0" "$TRACEPARENT" "client"
 
 echo
 log "=== exchange at Gateway A: re-mint for orders-svc, api-gateway appended to act chain ==="
@@ -222,7 +250,7 @@ echo "token_1 (for orders-svc): ${TOKEN_1:0:40}..."
 
 echo
 log "=== hop 2: (on client's behalf) -> Gateway B (orders-svc) ==="
-call_proxy "Gateway B (orders-svc)" "$GW_B_PROXY_PORT" "$TOKEN_1" "$TRACEPARENT"
+call_proxy "Gateway B (orders-svc)" "$GW_B_PROXY_PORT" "$TOKEN_1" "$TRACEPARENT" "api-gateway"
 
 echo
 log "=== exchange at Gateway B: re-mint for inventory-svc, orders-svc appended to act chain ==="
@@ -231,7 +259,7 @@ echo "token_2 (for inventory-svc): ${TOKEN_2:0:40}..."
 
 echo
 log "=== hop 3: (on client's behalf) -> Gateway C (inventory-svc) ==="
-call_proxy "Gateway C (inventory-svc)" "$GW_C_PROXY_PORT" "$TOKEN_2" "$TRACEPARENT"
+call_proxy "Gateway C (inventory-svc)" "$GW_C_PROXY_PORT" "$TOKEN_2" "$TRACEPARENT" "orders-svc"
 
 echo
 log "=== demo backends (standalone; curled directly — see demo-backends.yaml's" \

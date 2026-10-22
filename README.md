@@ -225,7 +225,7 @@ rules:
   - method: POST                   # optional; omit to match any method
     path: /tools/search            # `*` matches one segment, `**` matches many
     users: [alice@corp.internal]   # the verified user claim
-    workloads: [spiffe://chakra.internal/ns/agents/sa/research-agent]   # the verified caller
+    workloads: [spiffe://chakra.internal/ns/agents/sa/research-agent]   # the verified caller (an agent workload)
   - path: /inventory/*
     workloads: [spiffe://chakra.internal/ns/orders/sa/orders-svc]   # a machine-only grant
 ```
@@ -235,8 +235,12 @@ rules:
 - A request that acts for a user is allowed only when one rule lists both that
   user and the acting workload. The user's grant doesn't extend to an agent that
   wasn't granted it, and the agent's grant doesn't extend to a user who wasn't
-  granted it (review 0003 R1). Only the current actor is checked, not the whole
-  chain.
+  granted it (review 0003 R1).
+- The check runs at each hop against the workload calling that hop, which is the
+  current actor. An agent is therefore bounded at every hop where it is the
+  caller. A hop further down the chain doesn't re-check an earlier actor; it
+  trusts the workload that called it. The policy doesn't require every actor in
+  the chain to hold the grant.
 - A request with no user is allowed only by a rule with no `users`. Those rules
   match only verified machine callers, so an agent acting for someone can't use
   them.

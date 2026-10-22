@@ -2,7 +2,8 @@
 # scripts/deploy-all.sh as the zt-capability-policy ConfigMap.
 #
 # default: deny, so anything not listed is refused. The rules are:
-#   - alice, acting through the research agent (orders-svc), may GET /demo.
+#   - alice, acting through the agent workload (orders-svc, which plays the agent
+#     in the demo; no LLM is involved), may GET /demo.
 #     Both must be granted in the same rule (R1).
 #   - orders-svc acting alone (no user) may GET /demo. This keeps the
 #     three-hop demo working.

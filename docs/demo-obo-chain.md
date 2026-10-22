@@ -170,9 +170,11 @@ These are real limits of the current design, not failures of this run.
 
 ## Agent variant
 
-`scripts/demo-agent-chain.sh` shows what a user-driven agent may and may not do
-(review 0003, R8). It runs on the same cluster, and `scripts/deploy-all.sh`
-deploys what it needs.
+`scripts/demo-agent-chain.sh` shows what a user-driven agent workload may and may
+not do (review 0003, R8). It runs on the same cluster, and `scripts/deploy-all.sh`
+deploys what it needs. The demo's "agent" is the orders-svc workload, playing that
+role. No LLM runs in the demo. The policy checks the workload that calls each hop.
+It doesn't check earlier actors in the chain.
 
 - A mock OIDC IdP (`deploy/k8s/mock-idp.yaml`) stands in for a real provider. The
   demo reaches it through a port-forward pinned to `http://localhost:18500/default`,

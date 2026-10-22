@@ -14,8 +14,10 @@
 //!
 //! A request acting for a user is therefore allowed only when the user and
 //! the acting workload both hold a grant in the same rule (review 0003 R1). An
-//! agent's rights never exceed its own grant, and a user's rights never reach
-//! data through an agent that wasn't granted them.
+//! agent's rights never exceed its own grant at any hop where it is the calling
+//! workload, and a user's rights never reach data through an agent that wasn't
+//! granted them. The check is per hop, against the current actor. It doesn't
+//! re-check earlier actors in the chain.
 //!
 //! A request with no matching rule falls through to the policy's default.
 //! `default: allow` is only valid until `default_allow_until`, after which it

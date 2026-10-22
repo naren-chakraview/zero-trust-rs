@@ -31,8 +31,9 @@ are fixed.
 Regression probes are in `tests/review3_regressions.rs`, with the gateway tests
 for q8 and q9 in `src/bin/zt-gateway.rs`. Every probe is inverted and passes.
 
-The design item from Design 0002 (option A, the proxy-side rebind) is not
-implemented in this batch. See `docs/design/0002-delegation-with-bound-tokens.md`.
+Design 0002 (option A, the proxy-side rebind) is implemented in `98964f7` and
+`4dca2c1`. See `docs/design/0002-delegation-with-bound-tokens.md`, which has
+implementation notes.
 
 ## How to use this document
 

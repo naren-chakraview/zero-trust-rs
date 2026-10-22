@@ -1,6 +1,6 @@
 # 0002: Delegation with certificate-bound tokens
 
-**Status:** Proposed
+**Status:** Accepted with changes (review 0003, 2026-10-22). See "Changes from review 0003" below.
 **Date:** 2026-10-22
 **Relates to:** review 0002 findings N2 and N6; `docs/design/0001-tls-mtls-termination.md`;
 `docs/demo-obo-chain.md` (known limitation 4)
@@ -43,14 +43,18 @@ token is bound to.
 
 When a gateway's proxy receives a request whose token is bound to the TLS peer's
 certificate, the gateway has already verified that peer (cert binding passed in
-`validate`). It can therefore mint the next-hop token itself. The minted token is
-addressed to the route's `workload_id` and bound to this gateway's own
-certificate. The gateway appends itself to `act`, and the originator stays in
-`sub`.
+`validate`). It can therefore **rebind** the token: mint a copy addressed to
+this workload (the route's `workload_id`) and bound to this gateway's own
+certificate. The rebind changes who holds the token's key; it is not a
+delegation, so `act` is left unchanged and the originator stays in `sub`.
+Delegation to the next hop still happens through `POST /v1/token-exchange`,
+exactly as today, now starting from a token this workload can prove it holds.
 
 - The gateway holds its own key, so the binding is valid.
-- The route table already names the next audience (`workload_id`).
-- It needs no new admin call, and no client-held key.
+- The route table names the rebind audience (`workload_id`, this workload). It
+  does **not** name the next hop; the backend chooses that when it calls
+  exchange.
+- It needs no new admin call for the rebind, and no client-held key.
 
 Costs:
 - Re-minting happens on the request path, so the signing cost of ~0.4–1.4 ms per
@@ -97,6 +101,26 @@ holds it. It also fits the route table (`workload_id` is the next audience) and
 doesn't need a new client protocol. D stays as the demo's explicit setting. It
 should not be a silent default.
 
+## Changes from review 0003
+
+Accepted, with four changes from review 0003. They are already folded into the
+sections below; this list is the summary.
+
+1. **Rebind, not next-hop delegation.** The route's `workload_id` is this
+   workload's own identity (the destination being protected), not the next hop.
+   The proxy rebinds the client-bound token to this workload's certificate,
+   addressed to this workload. Delegation to the next hop stays in
+   `POST /v1/token-exchange`, driven by the backend.
+2. **No duplicate chain entry.** The rebind leaves `act` unchanged; only the
+   exchange appends this workload. A chain never lists the same hop twice.
+3. **Limits on the minted token.** `exp` is capped at the inbound token's `exp`
+   (review 0003 R3), `iss` is the signing gateway (R6), and with the replay cache
+   on the inbound `jti` is recorded as consumed.
+4. **Exact acceptance tests.** Replay from another certificate fails with
+   `certificate_binding_mismatch` specifically, and new criteria cover the chain
+   length, the lifetime cap, replay, the demo with binding at its default, and the
+   startup checks (including the loopback-upstream rule).
+
 ## Design for A
 
 ### Config
@@ -108,8 +132,8 @@ routes:
   - path_pattern: /demo
     workload_id: spiffe://chakra.internal/ns/backend-a/sa/backend-a
     upstream_addr: http://backend-a.zero-trust-demo.svc.cluster.local:8080
-    delegate: true               # re-mint the token for workload_id, bound to this gateway's cert
-    delegated_ttl_seconds: 60    # TTL of the minted token; capped by token_ttl_seconds
+    delegate: true               # rebind the token to this gateway's cert (aud = workload_id)
+    delegated_ttl_seconds: 60    # TTL of the rebound token; capped by token_ttl_seconds and the inbound exp
 ```
 
 `delegate` defaults to `false`, so existing routes behave as they do now.
@@ -118,20 +142,40 @@ routes:
 
 1. The proxy validates the inbound token as it does today (cert binding, N1
    peer check, audience, depth, issuer, JTI).
-2. If the matched route has `delegate: true`, the gateway calls the same
-   exchange logic as `POST /v1/token-exchange`. The inputs are:
-   - `inbound_token`: the validated token;
-   - `next_audience`: the route's `workload_id`;
-   - `caller_cert_thumbprint`: this gateway's own certificate thumbprint.
-     The gateway knows its own certificate, so it never needs the client's.
-3. The minted token replaces `X-SPIFFE-OBO-Token` on the upstream request. The
+2. If the matched route has `delegate: true`, the gateway rebinds the token with
+   a new `rebind_token` function (not `exchange_token`, which appends to `act`
+   and copies `iss`). The rebound token has:
+   - `sub`, `user` and `act`: copied unchanged (no new chain entry);
+   - `aud`: the route's `workload_id`;
+   - `cnf`: this gateway's own certificate thumbprint. The gateway knows its own
+     certificate, so it never needs the client's;
+   - `exp`: `min(inbound.exp, now + delegated_ttl_seconds)`, never later than the
+     token it came from;
+   - `iss`: this gateway (the signer), per review 0003 R6;
+   - `jti`: new.
+3. When the `jti` replay cache is on, the inbound `jti` is recorded as consumed
+   at this gateway.
+4. The rebound token replaces `X-SPIFFE-OBO-Token` on the upstream request. The
    inbound token is removed, as N10 already requires.
-4. Audit: the span records `obo.delegated_from` (the inbound `iss`/`jti`) and
-   `obo.delegated_jti` (the minted `jti`).
+5. The backend delegates onward as today: it calls this gateway's
+   `POST /v1/token-exchange` with the rebound token, presenting the workload
+   certificate, and gets a token for the next audience with this workload
+   appended to `act`.
+6. Audit: the span records `obo.rebound_from` (the inbound `iss`/`jti`) and
+   `obo.rebound_jti` (the minted `jti`).
+
+Because the rebound token's current actor is still the previous hop while its
+`cnf` names this workload, it cannot be used at a proxy: the peer that matches
+the current actor never holds the bound certificate. Its only use is exchange
+at this workload's admin listener, which is the intent.
 
 ### Binding rules
 
-- The minted token's `cnf` is this gateway's certificate thumbprint.
+- The rebound token's `cnf` is this gateway's certificate thumbprint.
+- `delegate: true` requires the route's `upstream_addr` to be loopback (the
+  sidecar topology). The rebound token is only useful to a process holding this
+  workload's certificate; a remote upstream with its own identity could not
+  exchange it. Startup refuses a delegating route to a non-loopback upstream.
 - The inbound token's `cnf`, if present, must match the peer certificate that the
   proxy verified. A mismatch is refused before re-minting.
 - The route's `delegate` flag is the only way a gateway re-mints. There's no
@@ -149,8 +193,9 @@ routes:
 - `src/bin/zt-gateway.rs`: proxy path, after the decision and before forwarding.
 - `src/config.rs`: `Route.delegate`, `Route.delegated_ttl_seconds`, and the
   startup check.
-- `src/token_exchange.rs`: no change. The existing function already takes the
-  caller's certificate thumbprint.
+- `src/token_exchange.rs`: add `rebind_token` (shares the verification and
+  binding checks with `exchange_token_with_cert_binding`, but leaves `act`
+  unchanged and sets `iss` to the signer).
 - Demo: `require_cert_binding` goes back to the default on api-gateway. Its
   `/demo` route sets `delegate: true`.
 
@@ -159,14 +204,24 @@ routes:
 1. The demo chain passes with a bound first token: client token bound to the
    client's certificate, api-gateway re-mints with its own certificate, and each
    hop returns 200 from its backend.
-2. Replaying the minted token from another certificate fails with
-   `obo_token_subject_mismatch` or `certificate_binding_mismatch`.
+2. Replaying the rebound token at a proxy from any other certificate fails with
+   `certificate_binding_mismatch` (the binding check runs first).
 3. Review 0002's N2 probe, `n2_exchange_binds_the_new_token_to_the_exchanging_hops_cert`,
-   still passes. The re-minted token's `cnf` is the minting gateway's thumbprint.
+   still passes. The rebound token's `cnf` is the minting gateway's thumbprint.
 4. A route without `delegate: true` behaves as before (no re-minting).
 5. `tests/admin_tls.rs`-style integration test: a bound token presented over the
-   proxy with the matching cert is re-minted, and the new token verifies at the
-   next gateway.
+   proxy with the matching cert is rebound, exchanged by the backend, and the
+   exchanged token verifies at the next gateway.
+6. The demo's three hops pass with `require_cert_binding` back at its default on
+   api-gateway.
+7. The rebind adds no chain entry: after rebind and one exchange, the chain is
+   `[originator, this workload]`, not `[originator, this workload, this workload]`.
+8. The rebound token's `exp` is never later than the inbound token's `exp`, and its
+   `iss` names the minting gateway.
+9. With the replay cache on, presenting the inbound token a second time at the same
+   gateway after a rebind fails with `token_replayed`.
+10. Startup refuses `delegate: true` on a route whose `upstream_addr` is not
+    loopback, and on a proxy without mTLS.
 
 ## Open questions
 
@@ -175,9 +230,11 @@ routes:
 - **Caching.** A gateway could cache minted tokens per (inbound `jti`,
   audience) to avoid re-signing on every request. Caching adds state to the
   request path, so it should wait for measurements.
-- **Replay of the inbound token.** Once re-minted, the inbound token has no further
-  use at that gateway. Whether the gateway should also record the inbound `jti`
-  as consumed is open.
+- **Replay of the inbound token.** Resolved: when the replay cache is on, the
+  inbound `jti` is recorded as consumed at rebind (request path step 3).
+- **Marking rebound tokens.** Optionally add a type claim (for example
+  `"zt_typ": "rebind"`) so `validate` can name the reason when one reaches a
+  proxy, instead of relying on the binding mismatch.
 
 ## Out of scope
 

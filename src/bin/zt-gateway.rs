@@ -1477,7 +1477,10 @@ async fn proxy_handler(
         destination = %destination,
         source_principal = source_principal.as_ref().map(|id| id.to_string()),
         obo_present = obo_token.is_some(),
-        obo_chain = caller_chain.as_deref().unwrap_or(""),
+        // R9 fix (review 0003): the log carries the verified chain, as the span
+        // does. The raw header is kept only as obo_chain_unverified, for debugging.
+        obo_chain = verified_chain.as_ref().map(|chain| chain.join(",")).unwrap_or_default(),
+        obo_chain_unverified = caller_chain.as_deref().unwrap_or(""),
         deny_reason = decision.deny_reason_str(),
         "authorization decision"
     );

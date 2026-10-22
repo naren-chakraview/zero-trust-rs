@@ -489,11 +489,23 @@ pub struct GatewayConfig {
     pub trusted_issuers: Vec<String>,
 
     /// Whether to enforce JTI (JWT ID) replay detection (Task 13 / N12) via
-    /// [`crate::registry::Registry::check_jti`]. Default: `false` — opt-in,
+    /// [`crate::registry::Registry::check_jti`]. Default: `false`: opt-in,
     /// since the replay cache is in-memory and per-process (see
-    /// `Registry`'s doc comment): a deployment running multiple gateway
-    /// instances behind a load balancer would need a shared store instead
-    /// of this one, so it isn't enabled unconditionally.
+    /// `Registry`'s doc comment). A deployment running multiple gateway
+    /// instances behind a load balancer would need a shared store instead.
+    ///
+    /// **Single-use tokens (R11, review 0003).** With the cache on, each token's
+    /// `jti` is accepted once per gateway, so a client must mint a fresh token for
+    /// each request. This pairs with per-hop exchange, which already mints a new
+    /// token per hop. A client that reuses a token gets `token_replayed` on the
+    /// second use.
+    ///
+    /// **Memory (R11).** The cache holds one entry per distinct `jti` that
+    /// passed validation during the last `jti_ttl_secs`, at roughly 100 bytes
+    /// each. Only valid tokens reach it, since the check runs after the decision
+    /// allows a request. Growth is therefore bounded by the rate of valid token
+    /// issuance times the TTL, not by request volume. Entries are removed lazily,
+    /// on the next check.
     #[serde(default)]
     pub jti_cache_enabled: bool,
 

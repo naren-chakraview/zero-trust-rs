@@ -327,6 +327,11 @@ impl LocalIssuer {
         Ok(Self::new(registry, signer, verifier, ttl_seconds))
     }
 
+    /// **Deprecated (R10, review 0003).** Builds a `LocalIssuer` from a JWKS
+    /// document that holds a private key for every `kid`, so every gateway that
+    /// loads it can sign as any of them. The binary doesn't use it. Use
+    /// [`Self::with_separated_keys`] with a public [`JsonWebKeySet`].
+    ///
     /// Builds a `LocalIssuer` from a JWKS document (see [`JwksKeyEntry`] for
     /// its shape) shared across every gateway in a trust domain: this
     /// instance signs with the key named `active_kid`, but its verifier
@@ -343,6 +348,12 @@ impl LocalIssuer {
         active_kid: String,
         ttl_seconds: i64,
     ) -> Result<Self, IdentityError> {
+        // R10 fix (review 0003): this document carries a private key for every kid, so
+        // any gateway that loads it can mint as any other. The binary no longer uses it.
+        // Use LocalIssuer::with_separated_keys with a public JsonWebKeySet.
+        tracing::warn!(
+            "LocalIssuer::with_jwks loads a private key for every kid; use with_separated_keys and a public JsonWebKeySet"
+        );
         let entries = parse_jwks(jwks_data)?;
         if !entries.iter().any(|entry| entry.kid == active_kid) {
             return Err(IdentityError::InvalidKeyId(active_kid));

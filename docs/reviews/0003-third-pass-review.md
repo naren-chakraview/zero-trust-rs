@@ -5,6 +5,35 @@
 **Inputs:** [Review 0001](0001-security-gap-review.md), [Review 0002](0002-follow-up-review.md), [Design 0002](../design/0002-delegation-with-bound-tokens.md)
 **Baseline:** `cargo test` passes 302 tests (183 lib, 55 bin, 34 obo_tests, 12 review2_regressions, 8 gap_probes, 6 routing, 3 spire_provider, 1 registry_fixture). The 2 ignored `admin_tls` tests also pass with `--ignored`; the Docker-based IdP test was not run.
 
+## Resolution status (as of 2026-10-22)
+
+Work on the findings was done in the suggested order. Each row names the commit
+and how it was checked. "Cluster" means the kind demo was run on the change.
+
+| ID | Status | Commit(s) | How it's checked |
+|---|---|---|---|
+| R1 | Fixed | `1a4f725` | A rule matches only when the user and the acting workload are both listed. Probes q5 and q6 are inverted. Unit tests cover the agent, intern, and admin cases. |
+| R2 | Fixed | `3d66f73` | Every `x-zt-verified-*` header a client sends is stripped. The caller has its own header. The user header carries the signed user claim. Probes q8 and q9 are gateway tests. |
+| R3 | Fixed | `3d66f73` | Exchange caps `exp` at the inbound token's `exp`. Probe q1 is inverted. |
+| R4 | Fixed | `1a4f725` | `*` matches one segment and `**` matches many, for routes and capabilities. Dot-segments, empty segments, and encoded dots and slashes return 400. Probe q7 is inverted. |
+| R5 | Fixed | `3f7ab25`, `cf6ac36` | Exchange refuses a hop that would exceed the limit. Probe q2 is inverted. api-gateway's limit is now 2, since it delegates once. Cluster. |
+| R6 | Fixed | `37cea9b` | `iss` is the signing gateway, `spiffe://<td>/ns/zt-gateway/sa/<kid>`. The IdP is in `user_iss`. Probes q3 and q4 are inverted. Cluster. |
+| R7 | Fixed | `c0a5a4a` | Only api-gateway holds the CA key. orders-svc returns 501 for SVID issuance and mounts only the CA certificate. Cluster. |
+| R8 | Fixed | `5ecad05`, `ba022d9` | `scripts/demo-agent-chain.sh`: alice's GET through the agent returns 200, and the agent's DELETE returns 403 `capability_denied`. Cluster. |
+| R9 | Fixed | `5398e67` | The decision log records the verified chain as `obo_chain`, and the raw header as `obo_chain_unverified`. No test covers the log line. |
+| R10 | Mitigated | `5398e67` | `LocalIssuer::with_jwks` is deprecated and warns at runtime. It's still in the library, and the binary doesn't use it. |
+| R11 | Documented | `5398e67` | The `jti_cache_enabled` doc covers single-use tokens and the memory bound. |
+
+Part 1 changes: N5's residual (R6) is fixed. N10's residual (R2) is fixed. N11's
+residual (R9) is fixed. N13's residual (R7) is fixed. F11's semantics (R1 and R4)
+are fixed.
+
+Regression probes are in `tests/review3_regressions.rs`, with the gateway tests
+for q8 and q9 in `src/bin/zt-gateway.rs`. Every probe is inverted and passes.
+
+The design item from Design 0002 (option A, the proxy-side rebind) is not
+implemented in this batch. See `docs/design/0002-delegation-with-bound-tokens.md`.
+
 ## How to use this document
 
 Part 1 is the status of each review 0002 finding. Part 2 lists new findings (R1 to R11). Appendix A has seven library probes (`tests/review3_probes.rs`) and Appendix B has two gateway-binary probes, to be added to the `tests` module in `src/bin/zt-gateway.rs`. Every probe asserts the **current** behavior at `b3ba6b8` and passes today; invert each one into a regression test once its finding is fixed.

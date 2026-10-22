@@ -1,6 +1,17 @@
 # api-gateway: the ingress hop (api-gateway -> orders-svc -> inventory-svc).
 # max_obo_chain_depth: 1 for this workload (see registry-configmap.yaml) --
 # it's the entry point and does not itself delegate further.
+#
+# Task 14 (N13): `listen_addr` (dead config -- see src/config.rs/F7+F10's
+# admin/proxy listener split) replaced by the real `proxy_addr`/`admin_addr`
+# pair the binary actually binds: `admin_addr` (issuance/authorize/
+# token-exchange) stays loopback-only (127.0.0.1:6443), `proxy_addr`
+# (protected-traffic forwarding) is the only one reachable off-pod
+# (0.0.0.0:443). `tls.client_auth: required` + `ca.cert_path`/`key_path`
+# (loaded from the zt-ca Secret, deploy/k8s/zt-ca-secret.yaml, shared by all
+# three gateways so a cert issued by one is trusted by the others) enforce
+# mTLS on both listeners -- see src/bin/zt-gateway.rs's single
+# `tls_acceptor` shared across `build_admin_router`/`build_proxy_router`.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -8,11 +19,18 @@ metadata:
   namespace: zero-trust-demo
 data:
   gateway.config.yaml: |
-    listen_addr: 0.0.0.0:8443
+    proxy_addr: 0.0.0.0:443
+    admin_addr: 127.0.0.1:6443
     upstream_addr: http://127.0.0.1:8080
     registry_path: /etc/zt-gateway/registry.yaml
     protected_workload: spiffe://chakra.internal/ns/api-gateway/sa/api-gateway
     token_ttl_seconds: 300
+    tls:
+      client_auth: required
+    ca:
+      cert_path: /etc/zt-gateway/ca/ca-cert.pem
+      key_path: /etc/zt-gateway/ca/ca-key.pem
+      ttl_seconds: 3600
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -60,7 +78,13 @@ spec:
           args:
             - /etc/zt-gateway/gateway.config.yaml
           ports:
-            - containerPort: 8443
+            # proxy_addr (0.0.0.0:443): the only listener meant to be
+            # reachable off-pod -- see the Service below. admin_addr
+            # (127.0.0.1:6443) binds loopback-only inside the pod's network
+            # namespace, so it's deliberately NOT declared here (declaring
+            # it wouldn't make it reachable via the pod IP anyway, since
+            # the process itself only binds 127.0.0.1) and has no Service.
+            - containerPort: 443
           volumeMounts:
             - name: registry
               mountPath: /etc/zt-gateway/registry.yaml
@@ -68,6 +92,9 @@ spec:
             - name: gateway-config
               mountPath: /etc/zt-gateway/gateway.config.yaml
               subPath: gateway.config.yaml
+            - name: ca-material
+              mountPath: /etc/zt-gateway/ca
+              readOnly: true
             - name: spire-agent-socket
               mountPath: /tmp/spire-agent
               readOnly: true
@@ -78,6 +105,12 @@ spec:
         - name: gateway-config
           configMap:
             name: zt-gateway-config-api-gateway
+        # Task 14 (N13): shared mTLS trust root (deploy/k8s/zt-ca-secret.yaml)
+        # -- same Secret mounted by orders-svc.yaml/inventory-svc.yaml, so
+        # `ca.cert_path`/`ca.key_path` resolve to the same CA everywhere.
+        - name: ca-material
+          secret:
+            secretName: zt-ca
         # From deploy/k8s/spire-agent.yaml's DaemonSet: that agent mounts
         # its Workload API socket at this same fixed hostPath, so any pod
         # on the same node (any namespace) can reach it this way.
@@ -95,6 +128,8 @@ spec:
   selector:
     app: api-gateway
   ports:
+    # Matches proxy_addr above -- admin_addr is loopback-only and has no
+    # Service (see the containerPort comment above).
     - name: https
-      port: 8443
-      targetPort: 8443
+      port: 443
+      targetPort: 443

@@ -3,21 +3,27 @@
 # local kind demo; not for anything real (see README's v0.1 identity
 # limitations).
 #
-# Task 7 (F16) addition: the `client` workload entry and the `client`
-# SPIFFE ID in each of the other three entries' `allowed_callers`. This is
-# required for scripts/demo-obo-chain.sh's *real* `/v1/token-exchange`
-# chain to authorize at all: `token_exchange::exchange_token` preserves
-# `sub` unchanged across every hop (see its doc comment), so
-# `obo::validate`'s final "is the caller allowed" check at every one of
-# api-gateway / orders-svc / inventory-svc is always evaluated against the
-# *originating* `client` identity, never the immediate calling gateway's
-# own identity. Without `client` registered here (and allow-listed
-# everywhere), the real chain is denied at hop 1 (api-gateway's
-# `allowed_callers` was empty) -- see docs/demo-obo-chain.md's "Known
-# limitations" section. The pre-existing `api-gateway`/`orders-svc`
-# entries in `inventory-svc`/`orders-svc`'s `allowed_callers` are left in
-# place (harmless; only load-bearing for the old synthetic-header-chain
-# demo this task replaces).
+# Task 7 (F16) added the `client` workload entry below, needed so
+# scripts/demo-obo-chain.sh can mint `client` its hop-0 bootstrap token.
+#
+# Task 14 (N13) fix: each OTHER workload's `allowed_callers` now lists only
+# its own immediate caller, not the chain's originator. Before Task 2 (N1),
+# `obo::validate` authorized `claims.sub`, which `token_exchange::
+# exchange_token` never changes across hops -- so every hop's allow-list
+# had to (wrongly) name the originating `client` identity, letting any hop
+# borrow the originator's standing. Task 2 (N1, commit 33a27b4) changed
+# `obo::validate` to authorize `obo::current_actor` (the outermost `act.sub`
+# -- see obo.rs's module doc comment) instead, so each destination's
+# `allowed_callers` must now name whoever calls *it* directly:
+#   - api-gateway is called directly by `client` (hop 0, no `act` yet, so
+#     current_actor == sub == client) -- unchanged.
+#   - orders-svc is called by api-gateway (current_actor == api-gateway
+#     after api-gateway's token-exchange) -- `client` removed; it would
+#     never match current_actor on the real exchanged-token path and its
+#     presence here was only ever a workaround for the pre-N1-fix bug.
+#   - inventory-svc is called by orders-svc (current_actor == orders-svc
+#     after orders-svc's token-exchange) -- `client` and `api-gateway`
+#     removed, same reasoning.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -51,7 +57,6 @@ data:
         service_account: orders-svc
         max_obo_chain_depth: 3
         allowed_callers:
-          - spiffe://chakra.internal/ns/client/sa/client
           - spiffe://chakra.internal/ns/api-gateway/sa/api-gateway
         bootstrap_token: orders-dev-secret
 
@@ -61,7 +66,5 @@ data:
         service_account: inventory-svc
         max_obo_chain_depth: 3
         allowed_callers:
-          - spiffe://chakra.internal/ns/client/sa/client
           - spiffe://chakra.internal/ns/orders/sa/orders-svc
-          - spiffe://chakra.internal/ns/api-gateway/sa/api-gateway
         bootstrap_token: inventory-dev-secret

@@ -1,2 +1,10 @@
 /target
 /graphify-out
+
+# Task 14 (N15): local SDD workspace artifacts (plan execution ledgers,
+# per-task reports) -- never meant to be tracked in git.
+.superpowers/
+
+# Task 14 (N15): the local demo CA secret carries a PRIVATE KEY. It is
+# generated on the operator's machine (see its header), never committed.
+deploy/k8s/zt-ca-secret.yaml

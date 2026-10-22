@@ -1,5 +1,9 @@
 # orders-svc: the middle hop (api-gateway -> orders-svc -> inventory-svc).
 # Same same-pod topology as inventory-svc.yaml.
+#
+# Task 14 (N13): see api-gateway.yaml's comment for the `listen_addr` ->
+# `proxy_addr`/`admin_addr` split rationale and the shared `zt-ca` mTLS
+# trust root -- identical here.
 apiVersion: v1
 kind: ConfigMap
 metadata:
@@ -7,11 +11,18 @@ metadata:
   namespace: zero-trust-demo
 data:
   gateway.config.yaml: |
-    listen_addr: 0.0.0.0:8443
+    proxy_addr: 0.0.0.0:443
+    admin_addr: 127.0.0.1:6443
     upstream_addr: http://127.0.0.1:8080
     registry_path: /etc/zt-gateway/registry.yaml
     protected_workload: spiffe://chakra.internal/ns/orders/sa/orders-svc
     token_ttl_seconds: 300
+    tls:
+      client_auth: required
+    ca:
+      cert_path: /etc/zt-gateway/ca/ca-cert.pem
+      key_path: /etc/zt-gateway/ca/ca-key.pem
+      ttl_seconds: 3600
 ---
 apiVersion: apps/v1
 kind: Deployment
@@ -53,7 +64,9 @@ spec:
           args:
             - /etc/zt-gateway/gateway.config.yaml
           ports:
-            - containerPort: 8443
+            # See api-gateway.yaml's comment: only proxy_addr is declared
+            # (admin_addr is loopback-only and has no Service).
+            - containerPort: 443
           volumeMounts:
             - name: registry
               mountPath: /etc/zt-gateway/registry.yaml
@@ -61,6 +74,9 @@ spec:
             - name: gateway-config
               mountPath: /etc/zt-gateway/gateway.config.yaml
               subPath: gateway.config.yaml
+            - name: ca-material
+              mountPath: /etc/zt-gateway/ca
+              readOnly: true
             - name: spire-agent-socket
               mountPath: /tmp/spire-agent
               readOnly: true
@@ -71,6 +87,9 @@ spec:
         - name: gateway-config
           configMap:
             name: zt-gateway-config-orders-svc
+        - name: ca-material
+          secret:
+            secretName: zt-ca
         - name: spire-agent-socket
           hostPath:
             path: /tmp/spire-agent
@@ -86,5 +105,5 @@ spec:
     app: orders-svc
   ports:
     - name: https
-      port: 8443
-      targetPort: 8443
+      port: 443
+      targetPort: 443

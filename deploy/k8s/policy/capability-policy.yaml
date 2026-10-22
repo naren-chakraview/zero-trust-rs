@@ -1,0 +1,19 @@
+# Capability policy for inventory-svc (F11, review 0003 R1/R4/R8). Mounted by
+# scripts/deploy-all.sh as the zt-capability-policy ConfigMap.
+#
+# default: deny, so anything not listed is refused. The rules are:
+#   - alice, acting through the research agent (orders-svc), may GET /demo.
+#     Both must be granted in the same rule (R1).
+#   - orders-svc acting alone (no user) may GET /demo. This keeps the
+#     three-hop demo working.
+# No rule grants DELETE, so a DELETE on behalf of alice is refused whatever
+# the agent holds.
+default: deny
+rules:
+  - method: GET
+    path: /demo
+    users: [alice@corp.internal]
+    workloads: [spiffe://chakra.internal/ns/orders/sa/orders-svc]
+  - method: GET
+    path: /demo
+    workloads: [spiffe://chakra.internal/ns/orders/sa/orders-svc]

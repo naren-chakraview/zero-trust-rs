@@ -26,6 +26,14 @@ data:
       - path_pattern: /demo
         workload_id: spiffe://chakra.internal/ns/orders/sa/orders-svc
         upstream_addr: http://backend-b.zero-trust-demo.svc.cluster.local:8080
+    # Agent demo (review 0003 R8): trust the mock IdP for edge-minted user tokens.
+    user_issuers:
+      - http://localhost:18500/default
+    user_idps:
+      - issuer: http://localhost:18500/default
+        jwks_path: /etc/zt-gateway/idp/idp-jwks.json
+        audience: zt-gateway
+        principal_claim: email
     protected_workload: spiffe://chakra.internal/ns/orders/sa/orders-svc
     token_ttl_seconds: 300
     tls:
@@ -96,6 +104,9 @@ spec:
             - name: jwks
               mountPath: /etc/zt-gateway/jwks
               readOnly: true
+            - name: idp-jwks
+              mountPath: /etc/zt-gateway/idp
+              readOnly: true
             - name: spire-agent-socket
               mountPath: /tmp/spire-agent
               readOnly: true
@@ -117,6 +128,10 @@ spec:
         - name: jwks
           configMap:
             name: zt-jwks
+        # Agent demo: the mock IdP's public keys, created by scripts/deploy-all.sh.
+        - name: idp-jwks
+          configMap:
+            name: zt-user-idp-jwks
         - name: spire-agent-socket
           hostPath:
             path: /tmp/spire-agent

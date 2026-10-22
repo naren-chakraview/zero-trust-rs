@@ -166,3 +166,39 @@ These are real limits of the current design, not failures of this run.
    decision fields. I haven't yet checked whether the gateway fails to record them
    on the span or the script reads them wrong. The decisions themselves were
    correct: every hop returned 200.
+
+## Agent variant
+
+`scripts/demo-agent-chain.sh` shows what a user-driven agent may and may not do
+(review 0003, R8). It runs on the same cluster, and `scripts/deploy-all.sh`
+deploys what it needs.
+
+- A mock OIDC IdP (`deploy/k8s/mock-idp.yaml`) stands in for a real provider. The
+  demo reaches it through a port-forward pinned to `http://localhost:18500/default`,
+  because the mock builds its issuer from the request host.
+- api-gateway, orders-svc, and inventory-svc trust that IdP for user credentials
+  (`user_idps`, with its public keys in the `zt-user-idp-jwks` ConfigMap).
+- inventory-svc runs a capability policy (`deploy/k8s/policy/capability-policy.yaml`,
+  `default: deny`). It lets alice act through the agent for `GET /demo`, in a rule
+  that names both. It also lets the agent act alone for `GET /demo`. No rule grants
+  `DELETE`.
+
+The flow:
+
+1. alice logs in through the IdP and gets an RS256 id_token.
+2. api-gateway verifies it and mints an edge token with alice as `user`.
+3. api-gateway exchanges that token for the agent, orders-svc.
+4. The agent exchanges it for inventory-svc, so the chain is
+   `[orders-svc, api-gateway]` with alice as `user`.
+5. The agent GETs `/demo` for alice. Both hold the grant, so inventory answers
+   200 from backend-c.
+6. The agent DELETEs `/demo` for alice. No rule covers that, so inventory answers
+   403 `capability_denied`.
+
+The script exits non-zero unless step 5 is 200 and step 6 is 403
+`capability_denied`. It passed on the kind cluster on 2026-10-22.
+
+Two things it deliberately does not show. An intern with no grant, and an admin
+with a grant on a workload that doesn't hold it, are covered by the unit tests in
+`src/capability.rs`. The chain also still relies on `iss` from the exchange
+copying the IdP's issuer (review 0003, R6), which changes when R6 lands.

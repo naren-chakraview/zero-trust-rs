@@ -1,0 +1,49 @@
+# A mock OIDC identity provider for the agent demo (review 0003 R8,
+# docs/demo-obo-chain.md "Agent variant"). It stands in for a real IdP so the
+# edge mint path (POST /v1/svid/jwt-with-user) can be exercised end to end.
+#
+# The mock builds its `iss` from the request's host, so the demo reaches it
+# through `kubectl port-forward svc/mock-idp 18500:8080` and its issuer is
+# `http://localhost:18500/default`. The gateways' `user_idps` entries use that
+# value. Not for production: it signs with a key it generates at startup.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mock-idp
+  namespace: zero-trust-demo
+  labels:
+    app: mock-idp
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mock-idp
+  template:
+    metadata:
+      labels:
+        app: mock-idp
+    spec:
+      containers:
+        - name: mock-oauth2-server
+          image: ghcr.io/navikt/mock-oauth2-server:2.1.10
+          ports:
+            - containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /default/jwks
+              port: 8080
+            initialDelaySeconds: 2
+            periodSeconds: 2
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mock-idp
+  namespace: zero-trust-demo
+spec:
+  selector:
+    app: mock-idp
+  ports:
+    - name: http
+      port: 8080
+      targetPort: 8080

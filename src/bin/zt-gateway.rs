@@ -598,6 +598,10 @@ fn extract_spiffe_id_from_der(der: &[u8]) -> Option<SpiffeId> {
 /// `axum::serve`) specifically so this extraction has direct access to the
 /// TLS connection object right after the handshake, instead of going
 /// through axum's `Connected`/`ConnectInfo` machinery for `MakeService`.
+/// How long a peer may take to finish the TLS handshake before its
+/// connection is dropped (N9 fix, review 0002).
+const TLS_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
 async fn serve(listener: TcpListener, router: Router, tls_acceptor: Option<TlsAcceptor>) {
     loop {
         let (stream, remote_addr) = match listener.accept().await {
@@ -613,16 +617,23 @@ async fn serve(listener: TcpListener, router: Router, tls_acceptor: Option<TlsAc
 
         tokio::spawn(async move {
             let result = match tls_acceptor {
-                Some(acceptor) => match acceptor.accept(stream).await {
-                    Ok(tls_stream) => {
+                // N9 fix (review 0002): bound the handshake. A peer that
+                // connects and then stalls would otherwise hold this task
+                // open indefinitely.
+                Some(acceptor) => match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, acceptor.accept(stream)).await {
+                    Ok(Ok(tls_stream)) => {
                         let peer_identity = extract_peer_identity(&tls_stream);
                         let hyper_service = TowerToHyperService::new(router.layer(Extension(peer_identity)));
                         hyper::server::conn::http1::Builder::new()
                             .serve_connection(TokioIo::new(tls_stream), hyper_service)
                             .await
                     }
-                    Err(error) => {
+                    Ok(Err(error)) => {
                         tracing::debug!(%error, %remote_addr, "TLS handshake failed");
+                        return;
+                    }
+                    Err(_) => {
+                        tracing::debug!(%remote_addr, "TLS handshake timed out");
                         return;
                     }
                 },
@@ -1169,9 +1180,18 @@ async fn proxy_handler(
 ) -> Response {
     let (parts, body) = req.into_parts();
 
-    let body_bytes = match axum::body::to_bytes(body, usize::MAX).await {
+    // N9 fix (review 0002): enforce the limit while buffering, not after. An
+    // unbounded read lets one request exhaust memory before the size check
+    // in `forward_to_upstream` ever runs. `to_bytes` stops at the limit and
+    // errors, so an oversized body never gets fully buffered.
+    let body_bytes = match axum::body::to_bytes(body, state.max_body_bytes).await {
         Ok(bytes) => bytes,
-        Err(_) => return error_response(StatusCode::BAD_REQUEST, "failed to read request body"),
+        Err(_) => {
+            return error_response(
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "request body exceeds the configured limit or could not be read",
+            )
+        }
     };
 
     // F12 fix: extract whatever W3C TraceContext the caller sent (absent or
@@ -1402,6 +1422,31 @@ const HEADER_VERIFIED_USER: &str = "x-zt-verified-user";
 /// [`HEADER_VERIFIED_USER`].
 const HEADER_VERIFIED_CHAIN: &str = "x-zt-verified-chain";
 
+/// Why [`read_upstream_body_limited`] gave up on an upstream response body.
+enum UpstreamBodyError {
+    /// The body grew past the configured limit.
+    TooLarge,
+    /// The upstream connection failed mid-body.
+    Read,
+}
+
+/// Reads an upstream response body chunk by chunk, stopping as soon as it
+/// would exceed `limit` (N9 fix, review 0002). A misbehaving or hostile
+/// upstream therefore can't make this gateway buffer an unbounded body.
+async fn read_upstream_body_limited(
+    mut response: reqwest::Response,
+    limit: usize,
+) -> Result<axum::body::Bytes, UpstreamBodyError> {
+    let mut buffer = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|_| UpstreamBodyError::Read)? {
+        if buffer.len() + chunk.len() > limit {
+            return Err(UpstreamBodyError::TooLarge);
+        }
+        buffer.extend_from_slice(&chunk);
+    }
+    Ok(buffer.into())
+}
+
 async fn forward_to_upstream(
     state: &AppState,
     parts: axum::http::request::Parts,
@@ -1483,9 +1528,14 @@ async fn forward_to_upstream(
 
     let status = upstream_response.status();
     let response_headers = upstream_response.headers().clone();
-    let response_body = match upstream_response.bytes().await {
+    let response_body = match read_upstream_body_limited(upstream_response, state.max_body_bytes).await {
         Ok(bytes) => bytes,
-        Err(_) => return error_response(StatusCode::BAD_GATEWAY, "failed to read upstream response"),
+        Err(UpstreamBodyError::TooLarge) => {
+            return error_response(StatusCode::BAD_GATEWAY, "upstream response exceeds the configured limit")
+        }
+        Err(UpstreamBodyError::Read) => {
+            return error_response(StatusCode::BAD_GATEWAY, "failed to read upstream response")
+        }
     };
 
     let mut builder = Response::builder().status(status);
@@ -1615,6 +1665,53 @@ workloads:
         });
 
         (format!("http://{addr}"), captured)
+    }
+
+    // --- N9 fix (review 0002): proxy body limits ---
+
+    #[tokio::test]
+    async fn oversized_request_body_is_rejected_before_reaching_upstream() {
+        let (upstream_addr, hits) = spawn_test_upstream("ok").await;
+        let mut state = test_state(upstream_addr);
+        state.max_body_bytes = 16;
+        let issued = state
+            .identity
+            .issue_jwt_svid("orders-svc", INVENTORY, "orders-secret")
+            .unwrap();
+        let router = build_router(state);
+
+        let request = Request::builder()
+            .method("POST")
+            .uri("/some/path")
+            .header(HEADER_OBO_TOKEN, issued.token)
+            .body(Body::from(vec![b'x'; 64]))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), SC::PAYLOAD_TOO_LARGE);
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "an oversized body must never be forwarded");
+    }
+
+    #[tokio::test]
+    async fn oversized_upstream_response_is_rejected() {
+        let (upstream_addr, _hits) = spawn_test_upstream("this upstream body is longer than sixteen bytes").await;
+        let mut state = test_state(upstream_addr);
+        state.max_body_bytes = 16;
+        let issued = state
+            .identity
+            .issue_jwt_svid("orders-svc", INVENTORY, "orders-secret")
+            .unwrap();
+        let router = build_router(state);
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/some/path")
+            .header(HEADER_OBO_TOKEN, issued.token)
+            .body(Body::empty())
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), SC::BAD_GATEWAY);
     }
 
     #[tokio::test]

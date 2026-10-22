@@ -372,12 +372,12 @@ struct ListenerHandles {
 
 /// Binds and spawns the admin and proxy listeners as two independent
 /// background tasks, each running the same hand-rolled `serve()` accept
-/// loop (see its doc comment) -- same TLS configuration on both (Task 6
-/// doesn't change TLS setup, only which routes live on which listener; see
-/// `docs/design/` for the planned per-listener `client_auth` split), but
-/// completely disjoint route tables: issuance/`authorize`/`token-exchange`
-/// only ever reach `build_admin_router`'s routes, and protected traffic
-/// only ever reaches `build_proxy_router`'s fallback (F7, F10 fixes).
+/// loop (see its doc comment). They use different TLS acceptors: the proxy
+/// applies the configured `client_auth`, while admin never requires a client
+/// certificate (F10 fix, see `main`). Their route tables are disjoint:
+/// issuance, `authorize`, and `token-exchange` only reach
+/// `build_admin_router`'s routes, and protected traffic only reaches
+/// `build_proxy_router`'s fallback (F7, F10 fixes).
 async fn setup_listeners(
     config: &ListenerConfig,
     state: AppState,

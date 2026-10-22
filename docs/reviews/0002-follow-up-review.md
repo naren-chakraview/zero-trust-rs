@@ -5,6 +5,52 @@
 **Inputs:** [Review 0001](0001-security-gap-review.md), `docs/superpowers/plans/2026-10-15-security-gaps-implementation.md`
 **Baseline:** `cargo test` passes all 190 tests (124 lib, 34 bin, 8 gap_probes, 13 obo_tests, 6 routing, 3 spire_provider, 1 registry_fixture).
 
+## Resolution status (as of 2026-10-21)
+
+Each finding below was checked against the code and the tests on `master`.
+Items marked **Partial** or **Open** are still not fully resolved. The
+findings text below is the original review and is not edited.
+
+| ID | Status | Commit(s) | Notes |
+|---|---|---|---|
+| F1 | Fixed | `33a27b4`, `9a618ed`, `9eafb19` | N11 covers the span attribute. |
+| F2 | Fixed | `de4000d` | Human principals come from verified IdP credentials. |
+| F3 | Fixed | `c62625a`, `33a27b4`, `9a618ed` | Exchange checks audience and depth, and the proxy strips delegation headers. |
+| F4 | Partial | `fe0f802` | The gateway uses a public JWKS and a per-gateway signing key. The K8s manifests don't set `jwks_path`/`signing_key_path`, so cross-gateway verification isn't deployed. See the README's Known gaps. |
+| F5 | Fixed | `fe0f802`, `769b5fa` | Issuance binds to the caller's cert by default. Exchange re-binds to the exchanging hop. |
+| F6 | Fixed | `fa15537` | Request bodies are capped while buffering. Responses and the TLS handshake are bounded. |
+| F7 | Fixed | (earlier) | Admin and proxy are separate. |
+| F8 | Fixed | (earlier) | |
+| F9 | Fixed | (earlier) | |
+| F10 | Fixed | `1ef9895` | Admin uses a separate TLS acceptor with no client-cert requirement. Startup refuses a non-loopback admin address. Verified live. |
+| F11 | Fixed | `8a85f75`, `f52367b` | Capability policy with per-user and per-workload grants, a deadline on allow-by-default, and hot reload. There are no explicit deny rules yet. |
+| F12 | Fixed | (earlier), `9a618ed` | |
+| F13 | Partial | `ba182b2`, `34a6ea8` | ES256 verification is in. Under SPIRE, token exchange can't sign (N8). |
+| F14 | Fixed | (earlier) | |
+| F15 | Fixed | `9eafb19` | `iss` is checked against `trusted_issuers` and `jti` against the replay cache, on the proxy path. |
+| F16 | Partial | `43a4384` | The demo script still assumes plain HTTP and isn't re-run. See `docs/demo-obo-chain.md`. |
+| F17 | Fixed | `34a6ea8` | Exchange and proxy round-trip benchmarks are in. |
+| F18 | Fixed | (earlier) | |
+| N1 | Fixed | `33a27b4` | |
+| N2 | Fixed | `769b5fa` | |
+| N3 | Fixed | `9a618ed` | |
+| N4 | Fixed | `c62625a` | |
+| N5 | Fixed | `de4000d`, `fabd210` | Verified credentials, plus an integration test against a real OIDC IdP. |
+| N6 | Fixed | `fe0f802` | |
+| N7 | Fixed (code) | `fe0f802` | The legacy `with_jwks` loader still exists in the library. Deployment is Partial, as in F4. |
+| N8 | Partial | `ba182b2`, `34a6ea8` | ES256 is in. A separate token-signing key for SPIRE delegation isn't built. |
+| N9 | Fixed | `fa15537` | |
+| N10 | Fixed | `9a618ed` | |
+| N11 | Fixed | `9a618ed` | |
+| N12 | Fixed | `26a5819`, `9eafb19` | The library functions existed. The gateway now calls them. |
+| N13 | Fixed | `5a228f6` | Manifests use `proxy_addr`/`admin_addr` and mTLS. They still lack the JWKS settings noted under F4. |
+| N14 | Fixed | `34a6ea8` | |
+| N15 | Fixed | `5a228f6`, `3712c69` | Agent files are untracked, but they remain in git history (13 commits). Rewriting history is a separate decision. |
+
+Regression tests for the findings are in `tests/review2_regressions.rs` (commit
+`29d6d11`). All pass. The probes in Appendix A ran against the original
+commit.
+
 ## How to use this document
 
 Part 1 is the status of each review 0001 finding. Part 2 lists new findings (N1 to N15), most of them in code added during the fix pass. Appendix A has nine probe tests (`tests/review2_probes.rs`) that reproduce N1 to N7 against `43a4384`. Each probe asserts the **current** behavior and passes today; invert it into a regression test once the finding is fixed.

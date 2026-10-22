@@ -43,6 +43,21 @@ move through them:
   itself for anyone without a valid client cert — parity with the
   blueprint's `PeerAuthentication: STRICT`.
 
+### Listeners: admin and proxy
+
+The binary serves two listeners, each with its own routes and TLS posture:
+
+- **Proxy** (`proxy_addr`, default `0.0.0.0:443`). Serves protected traffic
+  only. It uses the configured `tls.client_auth`, so with `required` every
+  caller must present a valid client certificate.
+- **Admin** (`admin_addr`, default `127.0.0.1:6443`). Serves issuance and
+  delegation: `/v1/svid/jwt`, `/v1/svid/x509`, `/v1/svid/jwt-with-user`,
+  `/v1/authorize`, and `/v1/token-exchange`. It never asks for a client
+  certificate, because those endpoints authenticate with bootstrap tokens
+  or signed tokens. That is what lets a workload fetch its first X.509 SVID
+  under `client_auth: required`. The binary refuses to start unless
+  `admin_addr` is a loopback address.
+
 The CA a gateway **trusts** for verifying client certs is independent of
 whether it can **issue** them itself — see `ca.cert_path`/`ca.key_path`
 below. A gateway can verify against a CA it doesn't hold the key for.
@@ -56,16 +71,53 @@ touching the validation logic or the HTTP layer.
 
 ### Config reference
 
+The main settings. Every key is optional unless marked required. The
+defaults are in `src/config.rs`.
+
 ```yaml
+# Listeners (both required in practice)
+proxy_addr: 0.0.0.0:443                 # protected traffic; default 0.0.0.0:443
+admin_addr: 127.0.0.1:6443              # issuance + delegation; must be loopback
+upstream_addr: http://127.0.0.1:8080    # required: the backend app to forward to
+registry_path: registry.yaml            # required: workload registry (see tests/fixtures/)
+protected_workload: spiffe://chakra.internal/ns/inventory/sa/inventory-svc   # required
+
+token_ttl_seconds: 300
+max_body_mb: 100                        # request and upstream-response cap (N9)
+
 tls:
   cert_path: /path/to/server-cert.pem   # omit both to generate an ephemeral dev cert
   key_path: /path/to/server-key.pem
-  client_auth: optional                 # none | optional | required
+  client_auth: optional                 # none | optional | required; applies to the proxy only
 
 ca:
   cert_path: /path/to/ca-cert.pem       # trust root for verifying client certs
-  key_path: /path/to/ca-key.pem         # optional — set only if THIS gateway issues X.509 SVIDs
+  key_path: /path/to/ca-key.pem         # optional; set only if THIS gateway issues X.509 SVIDs
   ttl_seconds: 3600                     # X.509 SVID TTL when this gateway is the issuer
+
+# Token signing (see "Signing keys and JWKS" below)
+signing_key_path: /path/to/private-key.pem   # this gateway's own private key (PKCS#1 PEM)
+jwks_path: /path/to/public-jwks.json         # public verification set; holds no private keys
+active_kid: key-1                            # which kid in jwks_path this gateway signs with
+
+# Delegation and claim checks
+require_cert_binding: true            # refuse unbound issuance when a cert is missing; defaults to true with mTLS
+trusted_issuers: [spiffe://chakra.internal]  # empty disables the iss check (N12)
+jti_cache_enabled: true               # refuse a replayed jti (N12)
+jti_ttl_secs: 300
+clock_skew_tolerance_secs: 60
+
+# Human (edge-minted) principals (N5)
+user_issuers: [auth.corp.internal]    # every entry must also appear in user_idps
+user_idps:
+  - issuer: auth.corp.internal
+    jwks_path: /path/to/idp-public-jwks.json   # the IdP's public RS256 keys
+    audience: zt-gateway                       # required aud on the IdP credential
+    principal_claim: email                     # claim that becomes the user principal
+
+# Capability policy (F11)
+capability_policy_path: /path/to/capability-policy.yaml
+capability_policy_reload_secs: 5      # how often the file is checked for changes
 ```
 
 Omit `ca.key_path` to run verify-only (trusting a CA this gateway doesn't
@@ -90,7 +142,8 @@ that path against a real socket.
 cargo run --bin zt-gateway -- examples/gateway.config.yaml
 ```
 
-By default this listens on `127.0.0.1:8443` and forwards allowed requests to
+With the example config, the proxy listens on `127.0.0.1:8443` and the admin
+listener on `127.0.0.1:6443`. Allowed proxy requests are forwarded to
 `http://127.0.0.1:8080` (see `examples/gateway.config.yaml` — point
 `upstream_addr` at whatever backend app you're fronting).
 
@@ -99,18 +152,18 @@ By default this listens on `127.0.0.1:8443` and forwards allowed requests to
 ```powershell
 # 1. Ask for a token as orders-svc, scoped to call inventory-svc
 #    (see tests/fixtures/registry.yaml for the bootstrap tokens / allow-lists)
-curl -s -X POST http://127.0.0.1:8443/v1/svid/jwt `
+curl -s -X POST http://127.0.0.1:6443/v1/svid/jwt `
   -H "content-type: application/json" `
   -d '{"workload_name":"orders-svc","audience":"spiffe://chakra.internal/ns/inventory/sa/inventory-svc","bootstrap_token":"orders-dev-secret"}'
 
-# 2. Call the proxy without a token -> 403, upstream never sees it
+# 2. Call the proxy without a token -> 403, upstream never sees it (the proxy is on 8443)
 curl -i http://127.0.0.1:8443/anything
 
 # 3. Call the proxy with the issued token -> 200, forwarded to upstream_addr
 curl -i http://127.0.0.1:8443/anything -H "X-SPIFFE-OBO-Token: <token from step 1>"
 
 # Ask "would this be allowed?" directly, without going through the proxy path
-curl -s -X POST http://127.0.0.1:8443/v1/authorize `
+curl -s -X POST http://127.0.0.1:6443/v1/authorize `
   -H "content-type: application/json" `
   -d '{"destination":"spiffe://chakra.internal/ns/inventory/sa/inventory-svc","obo_token":"<token>"}'
 ```
@@ -119,16 +172,102 @@ curl -s -X POST http://127.0.0.1:8443/v1/authorize `
 
 | Endpoint | Purpose |
 |---|---|
-| `POST /v1/svid/jwt` | Issue a JWT SVID: `{workload_name, audience, bootstrap_token}` -> `{token, expires_at}`. |
-| `POST /v1/svid/x509` | Issue an X.509 SVID from a CSR: `{workload_name, csr_pem, bootstrap_token}` -> `{cert_pem, expires_at}`. `501` if this gateway holds no CA signing key (verify-only mode). |
-| `POST /v1/authorize` | Ask "is this allowed?" directly (ext_authz-style): `{destination, obo_token?, caller_chain?}` -> `{allow, deny_reason}`. |
-| `ANY /*` | The reverse proxy. Requires `X-SPIFFE-OBO-Token` (or, with mTLS, an allow-listed client cert); forwards to `upstream_addr` on allow, `403` with `{deny_reason}` on deny. |
+| Listener | Endpoint | Purpose |
+|---|---|---|
+| admin | `POST /v1/svid/jwt` | Issue a JWT SVID: `{workload_name, audience, bootstrap_token}` -> `{token, expires_at}`. The token carries the caller's cert thumbprint (`cnf`) when the caller presented one. |
+| admin | `POST /v1/svid/x509` | Issue an X.509 SVID from a CSR: `{workload_name, csr_pem, bootstrap_token}` -> `{cert_pem, expires_at}`. `501` if this gateway holds no CA signing key (verify-only mode). |
+| admin | `POST /v1/svid/jwt-with-user` | Edge mint: `{user_credential, user_issuer}` -> a token whose `user` claim is the principal from a verified IdP credential. `401` if the credential doesn't verify. |
+| admin | `POST /v1/token-exchange` | RFC 8693 exchange: re-mints the inbound token for a new audience with this gateway appended to `act`. |
+| admin | `POST /v1/authorize` | Ask "is this allowed?" directly (ext_authz-style): `{destination, obo_token?, caller_chain?}` -> `{allow, deny_reason}`. |
+| proxy | `ANY /*` | The reverse proxy. Requires `X-SPIFFE-OBO-Token` (or, with mTLS, an allow-listed client cert). Forwards to `upstream_addr` on allow. Returns `403` with `{deny_reason}` on an OBO deny, and `403` with `deny_reason: capability_denied` when the capability policy refuses. Gateway-owned `X-ZT-Verified-*` headers carry the verified identity to the backend. Delegation headers from the caller are stripped. |
+
+## Signing keys and JWKS
+
+Each gateway signs with its own private key, loaded from `signing_key_path`.
+Verifiers load only a **public** JWKS (`jwks_path`: `kty`, `kid`, `n`, `e`).
+A JWKS file that carries `private_key_pem` fields instead of `n`/`e` fails to
+parse. The library's `with_jwks` loader still reads that legacy format, but the
+binary never uses it. Set `active_kid` to the `kid` this gateway
+signs with. Startup checks that the private key matches its published public key.
+
+Generate a public set from a private key with `JsonWebKeySet::from_rsa_private_pem`
+(see `src/identity.rs`), or with any JWKS tool that emits `n`/`e` only.
+
+## Capability policy (F11)
+
+`capability_policy_path` points at a YAML file that says which verified users
+and workloads may call which method and path on the protected upstream:
+
+```yaml
+default: allow                     # allow | deny
+default_allow_until: 1798761600    # unix seconds; required when default is allow
+rules:
+  - method: POST                   # optional; omit to match any method
+    path: /tools/search            # wildcard pattern, same syntax as routes
+    users: [alice@corp.internal]   # matched against the verified user claim
+  - path: /inventory/*
+    workloads: [spiffe://chakra.internal/ns/orders/sa/orders-svc]   # matched against the verified caller
+```
+
+- A request matches a rule when its method and path match and either the
+  verified user or the verified caller is listed. Rules are checked in order,
+  and the first match allows.
+- Workload grants match only identities the gateway has authenticated (mTLS
+  peer or signed OBO chain). A bare header never matches.
+- A request no rule covers gets the default. `default: allow` stops allowing
+  at `default_allow_until`, and startup refuses an allow default whose deadline
+  is missing or already past. Moving to `default: deny` is therefore required
+  eventually.
+- The file is reloaded every `capability_policy_reload_secs`. A file that fails
+  to parse or validate is logged, and the previous policy stays in effect.
+- Unknown keys are rejected, so a typo cannot silently open access.
+- With no `capability_policy_path`, capability checks are off and a warning is logged.
+
+There are no explicit deny rules yet. A broad grant cannot be narrowed by a
+later exception.
+
+## Edge user principals (N5)
+
+`POST /v1/svid/jwt-with-user` takes a credential from an IdP. The credential must
+be an RS256 JWT with the configured `iss` and `aud`, unexpired, and signed by a
+key in that IdP's public JWKS (`user_idps`). The principal comes from the
+configured claim. The algorithm is pinned to RS256, so `alg: none` and
+key-confusion tokens are refused. The IdP keys come from a file, not a live
+fetch. Rotating them means updating the file and restarting the gateway.
+
+Credentials are not single-use. A stolen credential works until its `exp`.
+
+## Known gaps
+
+These are open. The review trackers in `docs/reviews/` have the detail.
+
+- **Cross-gateway JWKS is not wired in the Kubernetes manifests.** The
+  manifests enable mTLS but set neither `jwks_path` nor `signing_key_path`. Each
+  gateway therefore generates an ephemeral key, and tokens minted by one gateway
+  cannot be verified by another. The three-hop demo is blocked on this.
+- **SPIRE token exchange.** Under `spire_socket_path`, the SPIRE provider can
+  verify ES256 tokens but cannot sign, so `/v1/token-exchange` is unavailable.
+  Delegation under SPIRE needs a separate token-signing key. See N8 in review 0002.
+- **Admin listener has no client authentication.** Admin is loopback-only, so
+  any local process can reach it. Issuance endpoints check bootstrap tokens.
+  Token exchange checks only the signature of the token it's given, not the
+  identity of the caller (N3, partly open).
 
 ## Build & test
 
 ```powershell
 cargo build
 cargo test
+```
+
+`cargo test` runs the unit and integration tests, and the review 0002
+regression tests in `tests/review2_regressions.rs`. One integration test needs
+Docker: `tests/user_idp_integration.rs` starts a mock OIDC provider, logs in
+through it, and calls the edge-mint endpoint of the real binary. It is
+`#[ignore]` by default, so run it with:
+
+```powershell
+cargo test --test user_idp_integration -- --ignored
 ```
 
 ## Running the full ecosystem in Kubernetes (local `kind` cluster)
@@ -216,8 +355,10 @@ and search for a trace containing the originator's ID. You should see:
   the exchanged JWTs.
 
 ### Troubleshooting
-- Ensure all three gateways load the same JWKS (F4) so each can verify
-  tokens minted by the others.
+- Each gateway needs the same public JWKS (`jwks_path`) and its own
+  `signing_key_path` and `active_kid` (see "Signing keys and JWKS"). Without
+  these, the gateways cannot verify each other's tokens. The Kubernetes
+  manifests do not set them yet (see "Known gaps").
 - Check that token TTLs (`token_ttl_seconds` / `token_exchange_ttl_secs`)
   are long enough to cover the full three-hop round trip.
 - A `403` with `deny_reason` at any hop means the chain depth or

@@ -137,60 +137,41 @@ service `zt-gateway`, directly:
 
 ## Known limitations
 
-This script exercises the real `/v1/token-exchange` endpoint and real
-signed delegation chains, but two pre-existing gaps in how the gateway
-trio is currently deployed mean it is **not guaranteed to pass end to
-end** without further infrastructure changes that are out of this task's
-scope (this task was scoped to the demo script, a new backends manifest,
-and this document — not to re-provisioning the already-deployed gateway
-trio). Both are flagged loudly here rather than silently worked around:
+This script exercises the real `/v1/token-exchange` endpoint and real signed
+delegation chains. It has not been re-run against the current manifests, and
+it is **expected to fail** until the gaps below are closed. Each one is
+listed here rather than worked around silently.
 
-1. **Cross-gateway JWKS sharing isn't wired up yet.** `exchange_token`'s
-   output is only verifiable by whoever holds the matching public key.
-   Today, none of `deploy/k8s/{api-gateway,orders-svc,inventory-svc}.yaml`
-   set `jwks_path`/`active_kid` in their `gateway.config.yaml` — each
-   instance falls back to its own ephemeral `LocalIssuer` keypair, so
-   **orders-svc cannot verify a token api-gateway exchanged**, and the
-   demo will fail at hop 2 with `obo_token_signature_invalid`. The
-   project's own `README.md` ("Three-Hop Delegation Demo" /
-   "Troubleshooting") already calls this out: *"Ensure all three gateways
-   load the same JWKS (F4) so each can verify tokens minted by the
-   others."* Fixing this means generating one shared JWKS document and
-   pointing all three gateways' ConfigMaps at it with distinct
-   `active_kid`s — a change to those three files, deliberately left for
-   a follow-up task rather than made silently here.
+1. **Cross-gateway JWKS sharing isn't wired up.** `exchange_token`'s output
+   is only verifiable by a gateway that holds the matching public key. None
+   of `deploy/k8s/{api-gateway,orders-svc,inventory-svc}.yaml` set
+   `jwks_path`, `signing_key_path`, or `active_kid`, so each instance uses its
+   own ephemeral keypair. **orders-svc cannot verify a token api-gateway
+   exchanged**, and the demo fails at hop 2 with `obo_token_signature_invalid`.
+   The fix is one public JWKS shared by all three gateways, each with its own
+   `signing_key_path` and `active_kid` (see the README's "Signing keys and
+   JWKS" section). This is a change to the three ConfigMaps.
 2. **SPIRE identity issuance and `/v1/token-exchange` are mutually
-   exclusive today.** `src/spire_provider.rs`'s `SpireProvider::sign_claims`
-   always returns `Err` (no SPIRE equivalent exists for re-signing
-   already-built claims — see that module's doc comment and Task 5's
-   report), so a gateway running with `spire_socket_path` configured
-   cannot serve `/v1/token-exchange` at all. None of the three gateways'
-   ConfigMaps actually set `spire_socket_path` today anyway (the
-   `ZT_SPIRE_SOCKET_PATH` env var they do set is explicitly inert — see
-   the comment in `deploy/k8s/api-gateway.yaml`), so in practice they all
-   still run on `LocalIssuer`, which is what makes step 2 above even
-   possible to fix without an architecture change. "SPIRE running" in
-   this demo's prerequisites means the SPIRE server/agent infrastructure
-   from Task 6 is up (useful on its own, e.g. for `spire-debug-client`'s
-   real X.509 SVID), not that any of the three gateways' identities or
-   token-exchange calls are actually backed by it.
-3. **`backend-a`/`backend-b`/`backend-c` aren't routed to by the gateway
-   trio yet.** They're deployed and reachable (the script curls them
-   directly, in their own clearly-labeled step), but none of the three
-   gateways' `routes:` config (F14) points at them — each gateway's proxy
-   fallback still forwards to its own existing `upstream_addr` sidecar.
-   Wiring `routes:` entries for `backend-a`/`b`/`c` into
-   `api-gateway.yaml`/`orders-svc.yaml`/`inventory-svc.yaml` would close
-   this gap but, again, means editing those three files, which this task
-   intentionally left untouched.
-4. **No TLS configured.** None of the three gateways' ConfigMaps set a
-   `tls:` block, so `admin_addr`/`proxy_addr` both currently serve plain
-   HTTP, not HTTPS. The script therefore uses `http://` throughout. See
-   `docs/design/0001-tls-mtls-termination.md` for how to turn TLS on
-   (`tls: {}` is enough to get an ephemeral self-signed cert) if a
-   stricter demo is wanted.
+   exclusive.** `SpireProvider::sign_claims` always returns `Err`, so a gateway
+   with `spire_socket_path` set cannot serve `/v1/token-exchange`. None of the
+   three ConfigMaps set `spire_socket_path` (the `ZT_SPIRE_SOCKET_PATH` env var
+   they do set is inert, see the comment in `deploy/k8s/api-gateway.yaml`), so
+   all three still run on `LocalIssuer`. "SPIRE running" in this demo's
+   prerequisites means the SPIRE server and agent are up, for example for
+   `spire-debug-client`'s SVID. It does not mean the gateways' identities are
+   backed by SPIRE.
+3. **`backend-a`/`backend-b`/`backend-c` aren't routed to.** They're deployed and
+   the script curls them directly, in a clearly labeled step. None of the three
+   gateway ConfigMaps has a `routes:` entry (F14) for them, so each gateway's
+   proxy fallback still forwards to its own `upstream_addr`.
+4. **The script assumes plain HTTP, but the gateways now serve TLS.** The
+   manifests set `tls.client_auth: required` on each gateway. The proxy listener
+   therefore requires a client certificate, and the admin listener serves HTTPS
+   without requiring one. The script's `http://` calls to admin will fail, and
+   its proxy calls will be refused without a client certificate. Switching the
+   script to `https://` and presenting a client certificate for proxy calls is
+   needed. See "Admin listener under `client_auth: required`" in
+   `docs/design/0001-tls-mtls-termination.md` for the bootstrap order.
 
-None of the above block *running the script* — every step still executes
-and prints a clear status/diagnostic per hop — they block a **fully
-passing, every-hop-`allow=true`** run until the JWKS-sharing and
-route-wiring follow-ups land.
+Until items 1 and 4 are fixed, the script will print a clear status per hop but
+will not get to a fully passing, every-hop-`allow=true` run.

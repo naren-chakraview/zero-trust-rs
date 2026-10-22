@@ -483,6 +483,24 @@ adopt the *config* gradually:
 
 `tls:` omitted entirely at any point = exact v0.1 behavior, unchanged.
 
+### Admin listener under `client_auth: required` (F10)
+
+`client_auth` applies to the proxy listener only. The admin listener
+(`admin_addr`, loopback-only) gets its own TLS acceptor, built from the same
+server certificate with no client-certificate verifier. Admin serves issuance
+and delegation (`/v1/svid/*`, `/v1/token-exchange`, `/v1/authorize`), which
+authenticate with bootstrap tokens or signed tokens. Because it never requires
+a client certificate, a workload can fetch its first X.509 SVID over admin
+before it has one. The binary refuses to start if `admin_addr` is not a
+loopback address.
+
+Bootstrap order for a strict deployment:
+
+1. Workload calls `POST /v1/svid/x509` on admin with its bootstrap token and a
+   CSR, over TLS but without a client certificate.
+2. It then connects to the proxy with the issued X.509 SVID, which
+   `client_auth: required` checks.
+
 ## Decisions
 
 Resolved before implementation:

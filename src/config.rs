@@ -219,7 +219,7 @@ impl RouteTable {
 /// (possibly empty) run of characters. Plain recursive glob matching —
 /// route tables are small and operator-authored, so the worst-case
 /// backtracking cost here is never a practical concern.
-fn wildcard_matches(pattern: &str, value: &str) -> bool {
+pub(crate) fn wildcard_matches(pattern: &str, value: &str) -> bool {
     fn do_match(pattern: &[u8], value: &[u8]) -> bool {
         match pattern.first() {
             None => value.is_empty(),
@@ -409,6 +409,12 @@ pub struct GatewayConfig {
     /// refuses to start otherwise.
     #[serde(default)]
     pub user_idps: Vec<UserIdpConfig>,
+
+    /// Path to the F11 capability policy (see [`crate::CapabilityPolicy`]).
+    /// Maps which verified users and workloads may call which method and path
+    /// on the protected upstream. When unset, no capability checks run.
+    #[serde(default)]
+    pub capability_policy_path: Option<PathBuf>,
 
     /// Issuer identities this gateway trusts (Task 13 / N12), checked
     /// against a token's signed `iss` claim by
@@ -612,6 +618,7 @@ impl GatewayConfig {
             clock_skew_tolerance_secs: default_clock_skew_secs(),
             user_issuers: Vec::new(),
             user_idps: Vec::new(),
+            capability_policy_path: None,
             trusted_issuers: Vec::new(),
             jti_cache_enabled: false,
             jti_ttl_secs: default_jti_ttl_secs(),

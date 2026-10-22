@@ -43,9 +43,10 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 use zero_trust::{
     build_client_cert_verifier, build_server_config, compute_cert_thumbprint_x5t_s256, current_actor,
-    exchange_token_with_cert_binding, load_certs, now_unix_secs, validate_with_cert_binding_and_clock_skew, CaError,
+    exchange_token_with_cert_binding, load_certs, now_unix_secs, validate_with_cert_binding_and_clock_skew,
+    validate_with_cert_binding_user_issuers_and_clock_skew, CaError,
     CertificateAuthority, ClientAuth, Decision, GatewayConfig, IdentityError, IdentityProvider, JsonWebKeySet, LocalCa,
-    LocalIssuer, Registry, UserIdp, RouteTable, ServerCertificate, SpiffeId, SpireProvider, TokenExchangeError, TokenExchangeRequest,
+    LocalIssuer, Registry, UserIdp, CapabilityDecision, CapabilityPolicy, CapabilityRequest, RouteTable, ServerCertificate, SpiffeId, SpireProvider, TokenExchangeError, TokenExchangeRequest,
     TokenExchangeResponse, ValidationRequest, DEFAULT_MAX_OBO_CHAIN_DEPTH, HEADER_CALLER_CHAIN, HEADER_OBO_TOKEN,
     HEADER_USER_PRINCIPAL,
 };
@@ -98,6 +99,9 @@ struct AppState {
     /// the user's credential against the entry for `user_issuer` before it
     /// trusts any principal from it.
     user_idps: Arc<std::collections::HashMap<String, UserIdp>>,
+    /// F11 capability policy (review 0002), or `None` when no policy file is
+    /// configured. Checked after the OBO decision on every proxied request.
+    capability_policy: Option<Arc<CapabilityPolicy>>,
     /// Mirrors `GatewayConfig::effective_require_cert_binding()` (N6 fix,
     /// review 0002): whether `POST /v1/svid/jwt` must refuse issuance
     /// outright when the caller presented no mTLS client certificate at
@@ -285,6 +289,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         clock_skew_tolerance_secs: config.clock_skew_tolerance_secs as i64,
         user_issuers: Arc::new(config.user_issuers.clone()),
         user_idps: Arc::new(load_user_idps(&config)?),
+        capability_policy: load_capability_policy(&config)?,
         require_cert_binding: config.effective_require_cert_binding(),
     };
 
@@ -772,6 +777,19 @@ fn load_user_idps(config: &GatewayConfig) -> Result<std::collections::HashMap<St
         }
     }
     Ok(idps)
+}
+
+/// Loads the F11 capability policy from `capability_policy_path`, or returns
+/// `None` when no policy is configured. An unconfigured policy disables
+/// capability checks, and the gateway logs that at startup so the choice is
+/// visible.
+fn load_capability_policy(config: &GatewayConfig) -> Result<Option<Arc<CapabilityPolicy>>, Box<dyn std::error::Error>> {
+    let Some(path) = &config.capability_policy_path else {
+        tracing::warn!("no capability_policy_path configured -- capability checks are disabled");
+        return Ok(None);
+    };
+    let policy = CapabilityPolicy::from_file(path, now_unix_secs())?;
+    Ok(Some(Arc::new(policy)))
 }
 
 #[derive(Deserialize)]
@@ -1297,11 +1315,15 @@ async fn proxy_handler(
     // signed `cnf.x5t#S256` claim is rejected outright unless this exact
     // connection's client certificate thumbprint matches it. Tokens with
     // no `cnf` claim (the backward-compatible default) are unaffected.
-    let decision = validate_with_cert_binding_and_clock_skew(
+    // N5 fix (review 0002): pass the trusted user issuers so an edge-minted
+    // token's human `user` claim is accepted, instead of being denied as an
+    // invalid principal before the capability policy below runs.
+    let decision = validate_with_cert_binding_user_issuers_and_clock_skew(
         &state.registry,
         state.identity.verifier(),
         &request,
         peer_cert_thumbprint.as_deref(),
+        &state.user_issuers,
         now_unix_secs(),
         state.clock_skew_tolerance_secs,
     );
@@ -1341,6 +1363,7 @@ async fn proxy_handler(
     // `DELEGATION_HEADERS_TO_STRIP`'s doc comment.
     let mut verified_caller: Option<SpiffeId> = None;
     let mut verified_chain: Option<Vec<String>> = None;
+    let mut verified_user: Option<String> = None;
     if decision.is_allow() {
         if let Some(token) = obo_token.as_deref() {
             if let Ok(claims) = state.identity.verifier().verify_signature(token) {
@@ -1364,6 +1387,9 @@ async fn proxy_handler(
                 let chain = claims.delegation_chain();
                 span.record("obo.chain", chain.join(" -> ").as_str());
                 verified_chain = Some(chain);
+                // F11: the signed `user` claim is the verified user principal
+                // the capability policy grants against.
+                verified_user = claims.user.clone();
                 verified_caller = Some(actor);
             }
         } else if let Some(sp) = &source_principal {
@@ -1399,7 +1425,41 @@ async fn proxy_handler(
         source_principal.as_ref(),
     );
 
+    // F11 fix (review 0002): capability policy, applied only after the OBO
+    // decision allowed the request. The user comes from the signed `user`
+    // claim and the caller from the verified peer or OBO chain, never from
+    // client headers.
+    let capability = match &state.capability_policy {
+        Some(policy) => policy.check(
+            &CapabilityRequest {
+                method: parts.method.as_str(),
+                path: parts.uri.path(),
+                user: verified_user.as_deref(),
+                caller: verified_caller.as_ref(),
+            },
+            now_unix_secs(),
+        ),
+        None => CapabilityDecision::Allow("no_policy"),
+    };
+    if decision.is_allow() && !capability.is_allow() {
+        tracing::info!(
+            reason = capability.reason(),
+            method = %parts.method,
+            path = %parts.uri.path(),
+            user = verified_user.as_deref().unwrap_or(""),
+            caller = verified_caller.as_ref().map(|id| id.to_string()).unwrap_or_default(),
+            "capability denied"
+        );
+    }
+
     let response = match decision {
+        Decision::Allow if !capability.is_allow() => (
+            StatusCode::FORBIDDEN,
+            Json(DenyBody {
+                deny_reason: "capability_denied".to_string(),
+            }),
+        )
+            .into_response(),
         Decision::Allow => {
             forward_to_upstream(
                 &state,
@@ -1651,6 +1711,7 @@ workloads:
             clock_skew_tolerance_secs: zero_trust::DEFAULT_CLOCK_SKEW_SECS,
             user_issuers: Arc::new(Vec::new()),
             user_idps: Arc::new(std::collections::HashMap::new()),
+            capability_policy: None,
             // Most existing tests call `/v1/svid/jwt` with no peer
             // certificate at all and expect the pre-N6 unbound token back
             // -- `false` preserves that. Tests exercising the N6 gate
@@ -1817,6 +1878,55 @@ workloads:
         );
         let config = GatewayConfig::from_yaml_str(&yaml).unwrap();
         assert!(load_user_idps(&config).is_err());
+    }
+
+    // --- F11 fix (review 0002): capability policy on the proxy path ---
+
+    fn policy_state(upstream_addr: String, yaml: &str) -> AppState {
+        let mut state = test_state(upstream_addr);
+        let policy = CapabilityPolicy::from_yaml_str(yaml, zero_trust::now_unix_secs()).unwrap();
+        state.capability_policy = Some(Arc::new(policy));
+        state
+    }
+
+    #[tokio::test]
+    async fn capability_grant_for_the_verified_caller_reaches_upstream() {
+        let (upstream_addr, hits) = spawn_test_upstream("ok").await;
+        let yaml = format!("default: deny\nrules:\n  - path: /some/path\n    workloads: [{ORDERS}]\n");
+        let state = policy_state(upstream_addr, &yaml);
+        let issued = state.identity.issue_jwt_svid("orders-svc", INVENTORY, "orders-secret").unwrap();
+        let router = build_router(state);
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/some/path")
+            .header(HEADER_OBO_TOKEN, issued.token)
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), SC::OK);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn capability_denial_is_403_and_never_reaches_upstream() {
+        let (upstream_addr, hits) = spawn_test_upstream("ok").await;
+        // Grants only a different workload, so the verified orders-svc caller
+        // matches no rule and the default deny applies.
+        let yaml = "default: deny\nrules:\n  - path: /some/path\n    workloads: [spiffe://chakra.internal/ns/billing/sa/billing-svc]\n";
+        let state = policy_state(upstream_addr, yaml);
+        let issued = state.identity.issue_jwt_svid("orders-svc", INVENTORY, "orders-secret").unwrap();
+        let router = build_router(state);
+
+        let request = Request::builder()
+            .method("GET")
+            .uri("/some/path")
+            .header(HEADER_OBO_TOKEN, issued.token)
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), SC::FORBIDDEN);
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "a capability-denied request must not be forwarded");
     }
 
     // --- N9 fix (review 0002): proxy body limits ---

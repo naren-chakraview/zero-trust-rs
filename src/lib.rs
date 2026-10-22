@@ -3,6 +3,7 @@
 //! chakraview-zero-trust-blueprint's Rego policies, minus the OPA/Envoy/K8s
 //! infrastructure they normally run inside.
 
+mod capability;
 mod ca;
 mod config;
 mod error;
@@ -25,11 +26,13 @@ pub use headers::{
     HEADER_USER_PRINCIPAL,
 };
 pub use identity::{IdentityProvider, IssuedToken, JsonWebKeySet, LocalIssuer};
+pub use capability::{CapabilityDecision, CapabilityPolicy, CapabilityPolicyError, CapabilityRequest};
 pub use user_auth::{UserAuthError, UserIdp};
 pub use jwt::{compute_cert_thumbprint_x5t_s256, ActClaim, CertBinding, JwtSigner, JwtVerifier, OboClaims};
 pub use obo::{
     cert_binding_matches, current_actor, validate, validate_with_cert_binding,
-    validate_with_cert_binding_and_clock_skew, validate_with_clock_skew, validate_with_issuer_and_replay_policy,
+    validate_with_cert_binding_and_clock_skew, validate_with_cert_binding_user_issuers_and_clock_skew,
+    validate_with_clock_skew, validate_with_issuer_and_replay_policy,
     validate_with_user_issuers, Decision, DenyReason, ValidationRequest, Validator, DEFAULT_CLOCK_SKEW_SECS,
 };
 pub use registry::{CredentialCheck, JtiReplayed, Registry, WorkloadEntry, DEFAULT_MAX_OBO_CHAIN_DEPTH};

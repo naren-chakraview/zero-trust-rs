@@ -545,6 +545,30 @@ pub fn validate_with_cert_binding_and_clock_skew(
     validate_with_clock_skew(registry, verifier, request, now_unix_secs, clock_skew_secs)
 }
 
+/// Like [`validate_with_cert_binding_and_clock_skew`], but also accepts
+/// human user principals from `user_issuers` (N5 fix, review 0002). The
+/// proxy path needs this so an edge-minted token's email `user` claim is
+/// accepted. Without it the token would be denied as an invalid principal
+/// before any capability policy runs.
+pub fn validate_with_cert_binding_user_issuers_and_clock_skew(
+    registry: &Registry,
+    verifier: &JwtVerifier,
+    request: &ValidationRequest<'_>,
+    peer_cert_thumbprint: Option<&str>,
+    user_issuers: &[String],
+    now_unix_secs: i64,
+    clock_skew_secs: i64,
+) -> Decision {
+    if let Some(token) = request.obo_token {
+        if let Ok(claims) = verifier.verify_signature(token) {
+            if !cert_binding_matches(claims.cnf.as_ref(), peer_cert_thumbprint) {
+                return Decision::Deny(DenyReason::CertificateBindingMismatch);
+            }
+        }
+    }
+    validate_core(registry, verifier, request, now_unix_secs, clock_skew_secs, Some(user_issuers))
+}
+
 /// Like [`validate_with_clock_skew`], but additionally enforces a
 /// trusted-issuer allow-list and, optionally, JTI (JWT ID) replay detection
 /// (Task 13 / N12 fix, review 0002).

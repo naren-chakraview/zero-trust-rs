@@ -297,13 +297,14 @@ pub fn validate_with_clock_skew(
 
 /// Like [`validate_with_clock_skew`], but additionally treats the token's
 /// `user` claim as a trusted human principal -- not required to parse as a
-/// SPIFFE ID -- when the token's signed `iss` claim is named in
-/// `user_issuers`.
+/// SPIFFE ID -- when the token's signed `user_iss` claim (the IdP that vouched
+/// for the user, R6 fix) is named in `user_issuers`.
 ///
 /// This is the N5 fix (review 0002): edge gateways mint tokens whose
 /// `user` claim carries a human principal string (e.g. `user@corp.internal`,
-/// see [`crate::LocalIssuer::issue_jwt_svid_with_user`]) with `iss` set to
-/// the trusted IdP that vouched for it. Without this entry point, such a
+/// see [`crate::LocalIssuer::issue_jwt_svid_with_user`]) with `user_iss` set
+/// to the trusted IdP that vouched for it. `iss` names the gateway that signed
+/// the token (R6 fix, review 0003). Without this entry point, such a
 /// token would be denied with [`DenyReason::InvalidUserPrincipal`] by
 /// [`validate`]/[`validate_with_clock_skew`], which still require every
 /// `user` claim to parse as a well-formed [`SpiffeId`].
@@ -385,17 +386,19 @@ fn validate_core(
     // check immediately below, since the N5 edge-mint token's `iss` is
     // deliberately *not* `spiffe://`-shaped (it's the human's IdP, e.g.
     // `auth.corp.internal`).
-    let iss_is_trusted_user_issuer = claims
-        .iss
+    // R6 fix (review 0003): the IdP that vouched for the user is `user_iss`.
+    // `iss` names the signing gateway, so it no longer carries the user's IdP.
+    let user_idp_trusted = claims
+        .user_iss
         .as_deref()
         .zip(user_issuers)
-        .is_some_and(|(iss, trusted)| trusted.iter().any(|t| t == iss));
+        .is_some_and(|(user_iss, trusted)| trusted.iter().any(|t| t == user_iss));
 
     // --- F2 fix: signed user principal, not the header -------------------
     // `request.caller_chain`'s unsigned sibling header
     // (`X-SPIFFE-User-Principal`) is never consulted here at all — only
     // the signed `user` claim, if the token carries one.
-    if !iss_is_trusted_user_issuer {
+    if !user_idp_trusted {
         if let Some(user) = claims.extract_user_principal() {
             if user.parse::<SpiffeId>().is_err() {
                 return Decision::Deny(DenyReason::InvalidUserPrincipal);
@@ -415,7 +418,7 @@ fn validate_core(
     // `DenyReason::IssuerNotTrusted` is reserved for) is left to a future
     // task.
     if let Some(iss) = &claims.iss {
-        if !iss.starts_with("spiffe://") && !iss_is_trusted_user_issuer {
+        if !iss.starts_with("spiffe://") {
             return Decision::Deny(DenyReason::IssuerInvalid);
         }
     }
@@ -764,6 +767,7 @@ workloads:
 
     fn mint_token(signer: &JwtSigner, sub: &str, aud: &[&str], now: i64, ttl: i64) -> String {
         let claims = OboClaims {
+            user_iss: None,
             sub: sub.to_string(),
             aud: aud.iter().map(|s| s.to_string()).collect(),
             user: None,
@@ -833,6 +837,7 @@ workloads:
         let (signer, verifier) = test_keys();
         let destination = id(INVENTORY);
         let claims = OboClaims {
+            user_iss: None,
             sub: ORDERS.to_string(),
             aud: vec![INVENTORY.to_string()],
             user: None,
@@ -883,6 +888,7 @@ workloads:
 
         // 4-deep signed chain (sub + 3 act hops) exceeds max depth 3.
         let claims = OboClaims {
+            user_iss: None,
             sub: ORDERS.to_string(),
             aud: vec![INVENTORY.to_string()],
             user: Some(ALICE.to_string()),
@@ -925,6 +931,7 @@ workloads:
         let destination = id(INVENTORY);
 
         let claims = OboClaims {
+            user_iss: None,
             sub: ORDERS.to_string(),
             aud: vec![INVENTORY.to_string()],
             user: Some(ALICE.to_string()),
@@ -961,6 +968,7 @@ workloads:
         let destination = id(INVENTORY);
 
         let claims = OboClaims {
+            user_iss: None,
             sub: ORDERS.to_string(),
             aud: vec![INVENTORY.to_string()],
             user: Some("not-a-user-id".to_string()), // invalid user principal
@@ -994,6 +1002,7 @@ workloads:
         let destination = id(INVENTORY);
 
         let claims = OboClaims {
+            user_iss: None,
             sub: ORDERS.to_string(),
             aud: vec![INVENTORY.to_string()],
             user: Some(ALICE.to_string()), // valid SPIFFE ID
@@ -1025,6 +1034,7 @@ workloads:
 
         // 3-deep signed chain (sub + 2 act hops) exceeds max depth 2.
         let claims = OboClaims {
+            user_iss: None,
             sub: ORDERS.to_string(),
             aud: vec![INVENTORY.to_string()],
             user: Some(ALICE.to_string()),
@@ -1075,6 +1085,7 @@ workloads:
         let (signer, verifier) = test_keys();
         let destination = id(INVENTORY);
         let mut claims = OboClaims {
+            user_iss: None,
             sub: ORDERS.to_string(),
             aud: vec![INVENTORY.to_string()],
             user: None,
@@ -1108,6 +1119,7 @@ workloads:
         let (signer, verifier) = test_keys();
         let destination = id(INVENTORY);
         let claims = OboClaims {
+            user_iss: None,
             sub: ORDERS.to_string(),
             aud: vec![INVENTORY.to_string()],
             user: None,
@@ -1289,6 +1301,7 @@ workloads:
 
     fn mint_token_with_cnf(signer: &JwtSigner, sub: &str, aud: &[&str], cert_thumbprint: &str) -> String {
         let claims = OboClaims {
+            user_iss: None,
             sub: sub.to_string(),
             aud: aud.iter().map(|s| s.to_string()).collect(),
             user: None,
@@ -1403,6 +1416,7 @@ workloads:
         let (signer, verifier) = test_keys();
         let destination = id(INVENTORY);
         let claims = OboClaims {
+            user_iss: None,
             sub: ORDERS.to_string(),
             aud: vec![INVENTORY.to_string()],
             user: None,
@@ -1447,6 +1461,7 @@ workloads:
 
     fn mint_token_with_iss_and_jti(signer: &JwtSigner, sub: &str, aud: &[&str], iss: Option<&str>, jti: Option<&str>) -> String {
         let claims = OboClaims {
+            user_iss: None,
             sub: sub.to_string(),
             aud: aud.iter().map(|s| s.to_string()).collect(),
             user: None,

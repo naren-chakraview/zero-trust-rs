@@ -200,5 +200,5 @@ The script exits non-zero unless step 5 is 200 and step 6 is 403
 
 Two things it deliberately does not show. An intern with no grant, and an admin
 with a grant on a workload that doesn't hold it, are covered by the unit tests in
-`src/capability.rs`. The chain also still relies on `iss` from the exchange
-copying the IdP's issuer (review 0003, R6), which changes when R6 lands.
+`src/capability.rs`. The IdP's identity rides in the `user_iss` claim, and `iss`
+names the gateway that signed each token (review 0003, R6).

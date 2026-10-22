@@ -204,7 +204,11 @@ pub fn exchange_token(
     // act.act.sub, ...]` but internally un-reverses this nesting so its
     // *output* order stays chronological (`[originator, hop_1, hop_2]`)
     // even though the signed `act` nesting itself is newest-first.
+    // R6 fix (review 0003): `iss` names the gateway that signs the new token,
+    // not the originator. The IdP that vouched for `user` is carried in `user_iss`.
+    let gateway_iss = issuer.issuer_claim().ok_or(TokenExchangeError::InternalError)?;
     let new_claims = OboClaims {
+        user_iss: inbound_claims.user_iss.clone(),
         sub: inbound_claims.sub.clone(),
         aud: vec![next_aud.to_string()],
         user: inbound_claims.user.clone(),
@@ -215,7 +219,7 @@ pub fn exchange_token(
         nbf: Some(now_secs),
         jti: Some(generate_jti()),
         cnf: inbound_claims.cnf.clone(),
-        iss: inbound_claims.iss.clone(),
+        iss: Some(gateway_iss),
     };
 
     let new_token = issuer
@@ -328,7 +332,11 @@ pub fn exchange_token_with_cert_binding(
         x5t_s256: thumbprint.to_string(),
     });
 
+    // R6 fix (review 0003): `iss` names the gateway that signs the new token,
+    // not the originator. The IdP that vouched for `user` is carried in `user_iss`.
+    let gateway_iss = issuer.issuer_claim().ok_or(TokenExchangeError::InternalError)?;
     let new_claims = OboClaims {
+        user_iss: inbound_claims.user_iss.clone(),
         sub: inbound_claims.sub.clone(),
         aud: vec![next_aud.to_string()],
         user: inbound_claims.user.clone(),
@@ -339,7 +347,7 @@ pub fn exchange_token_with_cert_binding(
         nbf: Some(now_secs),
         jti: Some(generate_jti()),
         cnf: new_cnf,
-        iss: inbound_claims.iss.clone(),
+        iss: Some(gateway_iss),
     };
 
     let new_token = issuer
@@ -434,6 +442,7 @@ workloads:
 
         // Step 1: Issuer creates initial token (originator -> backend A).
         let initial_claims = OboClaims {
+            user_iss: None,
             sub: "spiffe://chakra.internal/ns/originator/sa/originator".into(),
             aud: vec!["spiffe://chakra.internal/ns/backend-a/sa/backend-a".into()],
             user: Some("spiffe://chakra.internal/ns/alice/sa/alice".into()),
@@ -520,6 +529,7 @@ workloads:
 
         // Step 1: user originates a call to gateway A.
         let initial_claims = OboClaims {
+            user_iss: None,
             sub: "spiffe://chakra.internal/ns/originator/sa/originator".into(),
             aud: vec!["spiffe://chakra.internal/ns/gateway-a/sa/gateway-a".into()],
             user: Some("spiffe://chakra.internal/ns/alice/sa/alice".into()),
@@ -592,6 +602,7 @@ workloads:
 
         let issuer = LocalIssuer::generate(test_registry(), 300).unwrap();
         let claims = OboClaims {
+            user_iss: None,
             sub: "spiffe://chakra.internal/ns/originator/sa/originator".into(),
             aud: vec!["spiffe://chakra.internal/ns/backend/sa/backend".into()],
             user: None,
@@ -634,6 +645,7 @@ workloads:
         let issuer = LocalIssuer::generate(test_registry(), 300).unwrap();
 
         let expired_claims = OboClaims {
+            user_iss: None,
             sub: "spiffe://chakra.internal/ns/originator/sa/originator".into(),
             aud: vec!["spiffe://chakra.internal/ns/backend/sa/backend".into()],
             user: None,
@@ -667,6 +679,7 @@ workloads:
         let issuer = LocalIssuer::generate(test_registry(), 300).unwrap();
 
         let claims = OboClaims {
+            user_iss: None,
             sub: "spiffe://chakra.internal/ns/originator/sa/originator".into(),
             aud: vec!["spiffe://chakra.internal/ns/backend/sa/backend".into()],
             user: None,
@@ -701,6 +714,7 @@ workloads:
         let other_issuer = LocalIssuer::generate(test_registry(), 300).unwrap();
 
         let claims = OboClaims {
+            user_iss: None,
             sub: "spiffe://chakra.internal/ns/originator/sa/originator".into(),
             aud: vec!["spiffe://chakra.internal/ns/backend/sa/backend".into()],
             user: None,
@@ -754,6 +768,7 @@ workloads:
     fn exchanged_jti_is_unique_per_call() {
         let issuer = LocalIssuer::generate(test_registry(), 300).unwrap();
         let claims = OboClaims {
+            user_iss: None,
             sub: "spiffe://chakra.internal/ns/originator/sa/originator".into(),
             aud: vec!["spiffe://chakra.internal/ns/backend/sa/backend".into()],
             user: None,

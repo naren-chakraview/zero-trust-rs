@@ -103,7 +103,7 @@ active_kid: key-1                            # which kid in jwks_path this gatew
 
 # Delegation and claim checks
 require_cert_binding: true            # refuse unbound issuance when a cert is missing; defaults to true with mTLS
-trusted_issuers: [spiffe://chakra.internal]  # empty disables the iss check (N12)
+trusted_issuers: [spiffe://chakra.internal/ns/zt-gateway/sa/api-gateway]  # the signing gateways' iss values; empty disables the check (N12, R6)
 jti_cache_enabled: true               # refuse a replayed jti (N12)
 jti_ttl_secs: 300
 clock_skew_tolerance_secs: 60

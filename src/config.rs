@@ -481,8 +481,10 @@ pub struct GatewayConfig {
     /// [`crate::obo::validate_for_proxy`]. An empty list (the default)
     /// disables this check, so existing deployments are unchanged. Once any
     /// issuer is listed, a token whose `iss` is missing or not listed is
-    /// refused. Gateway-issued tokens carry `iss = spiffe://<trust_domain>`,
-    /// so list that value to keep internal traffic working.
+    /// refused. A gateway's tokens carry `iss` set to the gateway that signed
+    /// them, `spiffe://<trust_domain>/ns/zt-gateway/sa/<kid>` (R6 fix, review
+    /// 0003). List each signing gateway's value to keep internal traffic
+    /// working.
     #[serde(default)]
     pub trusted_issuers: Vec<String>,
 

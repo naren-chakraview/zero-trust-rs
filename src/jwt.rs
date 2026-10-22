@@ -84,6 +84,11 @@ pub struct OboClaims {
     /// `iss` as backward-compatible, not as a deny.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub iss: Option<String>,
+    /// The identity provider that vouched for `user` (R6 fix, review 0003).
+    /// `iss` now names the gateway that signed the token, and this claim
+    /// holds the user's IdP. Only edge-minted tokens set it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_iss: Option<String>,
 }
 
 impl OboClaims {
@@ -170,6 +175,11 @@ pub struct JwtSigner {
 }
 
 impl JwtSigner {
+    /// The `kid` this signer stamps into tokens, if it has one.
+    pub fn kid(&self) -> Option<&str> {
+        self.kid.as_deref()
+    }
+
     pub fn from_rsa_pem(private_key_pem: &[u8]) -> Result<Self, JwtError> {
         let encoding_key = EncodingKey::from_rsa_pem(private_key_pem)
             .map_err(|source| JwtError::InvalidKey(source.to_string()))?;
@@ -401,6 +411,7 @@ mod tests {
 
     fn sample_claims(exp: i64) -> OboClaims {
         OboClaims {
+            user_iss: None,
             sub: "spiffe://chakra.internal/ns/orders/sa/orders-svc".to_string(),
             aud: vec!["spiffe://chakra.internal/ns/inventory/sa/inventory-svc".to_string()],
             user: None,

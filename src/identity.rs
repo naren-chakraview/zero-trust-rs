@@ -181,6 +181,13 @@ pub trait IdentityProvider {
     /// check because nothing new is being authenticated, only re-signed.
     fn sign_claims(&self, claims: &OboClaims) -> Result<String, IdentityError>;
 
+    /// The `iss` value this provider stamps into the tokens it signs (R6 fix,
+    /// review 0003): the identity of the signing gateway. `None` when the provider
+    /// can't sign, so exchange has nothing to stamp.
+    fn issuer_claim(&self) -> Option<String> {
+        None
+    }
+
     /// Like [`Self::issue_jwt_svid`], but the issued token also carries a
     /// signed `cnf.x5t#S256` claim (RFC 8705) binding it to
     /// `cert_thumbprint` (N6 fix, review 0002): this is what
@@ -422,6 +429,14 @@ impl LocalIssuer {
         &self.registry
     }
 
+    /// The SPIFFE ID of the gateway that signs with this issuer's key:
+    /// `spiffe://<trust_domain>/ns/zt-gateway/sa/<kid>`. Every token this issuer
+    /// mints carries it as `iss`, so an operator can see which key signed it.
+    pub fn gateway_iss(&self) -> String {
+        let kid = self.signer.kid().unwrap_or("default");
+        format!("spiffe://{}/ns/zt-gateway/sa/{}", self.registry.trust_domain(), kid)
+    }
+
     /// Like [`IdentityProvider::issue_jwt_svid`], but the issued token also
     /// carries a signed `cnf.x5t#S256` claim (RFC 8705, Task 8) binding it
     /// to `cert_thumbprint` — the thumbprint of the TLS client certificate
@@ -451,6 +466,7 @@ impl LocalIssuer {
 
         let now = crate::now_unix_secs();
         let claims = OboClaims {
+            user_iss: None,
             sub: requester.spiffe_id.to_string(),
             aud: vec![audience_id.to_string()],
             user: None,
@@ -462,7 +478,7 @@ impl LocalIssuer {
             cnf: Some(CertBinding {
                 x5t_s256: cert_thumbprint.to_string(),
             }),
-            iss: Some(format!("spiffe://{}", self.registry.trust_domain())),
+            iss: Some(self.gateway_iss()),
         };
 
         let token = self.signer.sign(&claims)?;
@@ -513,7 +529,10 @@ impl LocalIssuer {
             // `obo::validate_with_user_issuers`, which checks exactly this
             // claim against `GatewayConfig::user_issuers` to decide
             // whether to accept the non-SPIFFE-ID `user` claim above.
-            iss: Some(user_issuer.to_string()),
+            // R6 fix (review 0003): the gateway signs this token, so `iss` names it.
+            // The IdP that vouched for the user is recorded in `user_iss`.
+            iss: Some(self.gateway_iss()),
+            user_iss: Some(user_issuer.to_string()),
         };
 
         let token = self.signer.sign(&claims)?;
@@ -543,6 +562,7 @@ impl IdentityProvider for LocalIssuer {
 
         let now = crate::now_unix_secs();
         let claims = OboClaims {
+            user_iss: None,
             sub: requester.spiffe_id.to_string(),
             aud: vec![audience_id.to_string()],
             user: None,
@@ -552,7 +572,7 @@ impl IdentityProvider for LocalIssuer {
             nbf: Some(now),
             jti: Some(generate_jti()),
             cnf: None,
-            iss: Some(format!("spiffe://{}", self.registry.trust_domain())),
+            iss: Some(self.gateway_iss()),
         };
 
         let token = self.signer.sign(&claims)?;
@@ -564,6 +584,10 @@ impl IdentityProvider for LocalIssuer {
 
     fn verifier(&self) -> &JwtVerifier {
         &self.verifier
+    }
+
+    fn issuer_claim(&self) -> Option<String> {
+        Some(self.gateway_iss())
     }
 
     fn sign_claims(&self, claims: &OboClaims) -> Result<String, IdentityError> {
@@ -843,6 +867,7 @@ workloads:
         let rogue_signer =
             crate::jwt::JwtSigner::from_rsa_pem_with_kid(rogue_pem.as_bytes(), "unregistered".to_string()).unwrap();
         let claims = crate::jwt::OboClaims {
+            user_iss: None,
             sub: "spiffe://chakra.internal/ns/orders/sa/orders-svc".to_string(),
             aud: vec!["spiffe://chakra.internal/ns/inventory/sa/inventory-svc".to_string()],
             user: None,

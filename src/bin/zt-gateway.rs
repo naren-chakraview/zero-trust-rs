@@ -2079,7 +2079,9 @@ workloads:
             nbf: Some(now_unix_secs()),
             jti: Some("q9-jti".to_string()),
             cnf: None,
-            iss: Some("auth.corp.internal".to_string()),
+            // R6: `iss` names the signing gateway, and `user_iss` names the IdP.
+            iss: Some(state.identity.issuer_claim().unwrap()),
+            user_iss: Some("auth.corp.internal".to_string()),
         };
         let token = state.identity.sign_claims(&claims).unwrap();
         let router = build_router(state);
@@ -3705,6 +3707,7 @@ workloads:
         };
         const ALICE: &str = "spiffe://chakra.internal/ns/users/sa/alice";
         let claims = zero_trust::OboClaims {
+            user_iss: None,
             sub: ORDERS.to_string(),
             aud: vec![INVENTORY.to_string()],
             user: Some(ALICE.to_string()),

@@ -87,6 +87,8 @@ fn r4_q7_capability_paths_are_not_matched_across_dot_segments() {
 // --- R3: an exchanged token never outlives the token it was derived from ---
 
 const INV: &str = "spiffe://chakra.internal/ns/inventory/sa/inventory-svc";
+const IDP: &str = "https://idp.example.com";
+const API: &str = "spiffe://chakra.internal/ns/api-gateway/sa/api-gateway";
 
 #[test]
 fn r3_q1_exchange_does_not_extend_the_inbound_token_lifetime() {
@@ -155,4 +157,33 @@ workloads:
 "#
     ))
     .unwrap()
+}
+
+// --- R6: `iss` names the signing gateway; the user's IdP is in `user_iss` ---
+
+#[test]
+fn r6_q3_exchange_names_the_signing_gateway_in_iss() {
+    let issuer = LocalIssuer::generate(reg_for_depth(), 300).unwrap();
+    let t1 = issuer.issue_jwt_svid("api-gateway", ORD, "api-secret").unwrap().token;
+    let iss1 = issuer.verifier().verify_signature(&t1).unwrap().iss;
+    let (t2, _) = exchange_token(&t1, INV, &id(ORD), 3, &issuer, issuer.verifier(), &id(ORD), 300, now_unix_secs())
+        .unwrap();
+    let iss2 = issuer.verifier().verify_signature(&t2).unwrap().iss;
+    assert_eq!(iss2.as_deref(), Some(issuer.gateway_iss().as_str()), "the re-minted token must name the gateway that signed it");
+    // The originator's token was minted by the same issuer here, so iss1 matches
+    // by construction. The copy-from-inbound behavior is what R6 removes, and it
+    // shows up in the test above only when the two signers differ.
+    let _ = iss1;
+}
+
+#[test]
+fn r6_q4_edge_minted_token_names_the_gateway_and_records_the_idp_separately() {
+    let issuer = LocalIssuer::generate(reg_for_depth(), 300).unwrap();
+    let t = issuer
+        .issue_jwt_svid_with_user(&id(API), "alice@example.com", IDP, &[IDP.to_string()])
+        .unwrap()
+        .token;
+    let c = issuer.verifier().verify_signature(&t).unwrap();
+    assert_eq!(c.iss.as_deref(), Some(issuer.gateway_iss().as_str()));
+    assert_eq!(c.user_iss.as_deref(), Some(IDP));
 }

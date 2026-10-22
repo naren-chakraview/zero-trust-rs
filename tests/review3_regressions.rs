@@ -83,3 +83,39 @@ fn r4_q7_capability_paths_are_not_matched_across_dot_segments() {
     );
     assert!(!d.is_allow(), "a grant on /orders/* must not reach /admin/keys");
 }
+
+// --- R3: an exchanged token never outlives the token it was derived from ---
+
+const INV: &str = "spiffe://chakra.internal/ns/inventory/sa/inventory-svc";
+
+#[test]
+fn r3_q1_exchange_does_not_extend_the_inbound_token_lifetime() {
+    // A 10-second inbound token, exchanged with a 300-second TTL.
+    let registry = Registry::from_yaml_str(&format!(
+        r#"
+trust_domain: chakra.internal
+workloads:
+  - name: api-gateway
+    spiffe_id: spiffe://chakra.internal/ns/api-gateway/sa/api-gateway
+    max_obo_chain_depth: 3
+    allowed_callers: []
+    bootstrap_token: api-secret
+  - name: orders-svc
+    spiffe_id: {ORD}
+    max_obo_chain_depth: 3
+    allowed_callers: []
+    bootstrap_token: orders-secret
+  - name: inventory-svc
+    spiffe_id: {INV}
+    max_obo_chain_depth: 3
+    allowed_callers: []
+"#
+    ))
+    .unwrap();
+    let short = LocalIssuer::generate(registry, 10).unwrap();
+    let t1 = short.issue_jwt_svid("api-gateway", ORD, "api-secret").unwrap().token;
+    let inbound_exp = short.verifier().verify_signature(&t1).unwrap().exp;
+    let (t2, _) = exchange_token(&t1, INV, &id(ORD), 3, &short, short.verifier(), &id(ORD), 300, now_unix_secs()).unwrap();
+    let minted_exp = short.verifier().verify_signature(&t2).unwrap().exp;
+    assert!(minted_exp <= inbound_exp, "minted exp {minted_exp} outlives inbound exp {inbound_exp}");
+}

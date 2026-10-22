@@ -1537,6 +1537,7 @@ async fn proxy_handler(
                 &trace_cx,
                 &routed_upstream_addr,
                 verified_caller.as_ref(),
+                verified_user.as_deref(),
                 verified_chain.as_deref(),
             )
             .await
@@ -1587,6 +1588,11 @@ const DELEGATION_HEADERS_TO_STRIP: [&str; 4] =
 /// `DELEGATION_HEADERS_TO_STRIP` has already removed anything the client
 /// itself sent under a similarly-named header. Never populated from a
 /// client-supplied value.
+const HEADER_VERIFIED_CALLER: &str = "x-zt-verified-caller";
+
+/// Gateway-owned header carrying the verified user principal, from the signed
+/// `user` claim of the OBO token (R2 fix, review 0003). The name matches its
+/// value: before R2 this header carried the caller, which was mislabeled.
 const HEADER_VERIFIED_USER: &str = "x-zt-verified-user";
 
 /// Gateway-owned header carrying the verified, chronological delegation
@@ -1626,6 +1632,7 @@ async fn forward_to_upstream(
     trace_cx: &OtelContext,
     upstream_addr: &str,
     verified_caller: Option<&SpiffeId>,
+    verified_user: Option<&str>,
     verified_chain: Option<&[String]>,
 ) -> Response {
     // Check body size limit (F6 fix)
@@ -1656,6 +1663,18 @@ async fn forward_to_upstream(
     for name in DELEGATION_HEADERS_TO_STRIP {
         headers.remove(name);
     }
+    // R2 fix (review 0003): remove every `x-zt-verified-*` header a client sent.
+    // The gateway sets the verified ones below, and only when it has verified
+    // the value. Without this, a direct call with no OBO token could pass a
+    // forged "verified" chain or user through to the backend.
+    let client_verified: Vec<HeaderName> = headers
+        .keys()
+        .filter(|name| name.as_str().starts_with("x-zt-verified-"))
+        .cloned()
+        .collect();
+    for name in client_verified {
+        headers.remove(name);
+    }
     // F12 fix: propagate the same trace context onward to the upstream, so
     // a delegation chain that keeps going past this gateway still shows up
     // as one trace rather than ending here.
@@ -1669,6 +1688,11 @@ async fn forward_to_upstream(
     // was a direct, tokenless call with no mTLS-verified peer either.
     if let Some(caller) = verified_caller {
         if let Ok(value) = axum::http::HeaderValue::from_str(&caller.to_string()) {
+            headers.insert(HeaderName::from_static(HEADER_VERIFIED_CALLER), value);
+        }
+    }
+    if let Some(user) = verified_user {
+        if let Ok(value) = axum::http::HeaderValue::from_str(user) {
             headers.insert(HeaderName::from_static(HEADER_VERIFIED_USER), value);
         }
     }
@@ -2004,6 +2028,72 @@ workloads:
         assert!(require_loopback_admin("[::1]:6443".parse().unwrap()).is_ok());
         assert!(require_loopback_admin("0.0.0.0:6443".parse().unwrap()).is_err());
         assert!(require_loopback_admin("10.0.0.5:6443".parse().unwrap()).is_err());
+    }
+
+    // --- R2 fix (review 0003): verified headers are gateway-owned ---
+
+    /// q8 (inverted): a client-sent `X-ZT-Verified-*` never reaches the backend,
+    /// even on a direct mTLS call with no OBO token.
+    #[tokio::test]
+    async fn client_cannot_forge_x_zt_verified_headers_on_a_direct_mtls_call() {
+        let (upstream_addr, captured) = spawn_header_capturing_upstream().await;
+        let router = build_router(test_state(upstream_addr));
+        let mut request = Request::builder()
+            .method("GET")
+            .uri("/some/path")
+            .header("x-zt-verified-chain", "spiffe://chakra.internal/ns/forged/sa/admin")
+            .header("x-zt-verified-user", "ceo@corp.internal")
+            .header("x-zt-verified-caller", "spiffe://chakra.internal/ns/forged/sa/admin")
+            .body(Body::empty())
+            .unwrap();
+        request.extensions_mut().insert(PeerIdentity {
+            spiffe_id: Some(ORDERS.parse().unwrap()),
+            cert_thumbprint: Some("orders-thumb".to_string()),
+        });
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), SC::OK);
+        let received = captured.lock().unwrap().take().expect("upstream should have been hit");
+        assert!(received.get(HEADER_VERIFIED_CHAIN).is_none(), "forged chain must be stripped");
+        assert!(received.get(HEADER_VERIFIED_USER).is_none(), "forged user must be stripped");
+        assert_eq!(
+            received.get(HEADER_VERIFIED_CALLER).and_then(|v| v.to_str().ok()),
+            Some(ORDERS),
+            "the caller header is set by the gateway from the verified mTLS peer, not from the client"
+        );
+    }
+
+    /// q9 (inverted): `X-ZT-Verified-User` carries the signed user claim, and the
+    /// caller goes under its own header.
+    #[tokio::test]
+    async fn x_zt_verified_user_carries_the_signed_user_claim() {
+        let (upstream_addr, captured) = spawn_header_capturing_upstream().await;
+        let mut state = test_state(upstream_addr);
+        state.user_issuers = Arc::new(vec!["auth.corp.internal".to_string()]);
+        let claims = zero_trust::OboClaims {
+            sub: ORDERS.to_string(),
+            aud: vec![INVENTORY.to_string()],
+            user: Some("alice@corp.internal".to_string()),
+            act: None,
+            iat: now_unix_secs(),
+            exp: now_unix_secs() + 300,
+            nbf: Some(now_unix_secs()),
+            jti: Some("q9-jti".to_string()),
+            cnf: None,
+            iss: Some("auth.corp.internal".to_string()),
+        };
+        let token = state.identity.sign_claims(&claims).unwrap();
+        let router = build_router(state);
+        let request = Request::builder()
+            .method("GET")
+            .uri("/some/path")
+            .header(HEADER_OBO_TOKEN, token)
+            .body(Body::empty())
+            .unwrap();
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), SC::OK);
+        let received = captured.lock().unwrap().take().expect("upstream should have been hit");
+        assert_eq!(received.get(HEADER_VERIFIED_USER).unwrap().to_str().unwrap(), "alice@corp.internal");
+        assert_eq!(received.get(HEADER_VERIFIED_CALLER).unwrap().to_str().unwrap(), ORDERS);
     }
 
     // --- R4 fix (review 0003): unsafe paths never reach routing or the upstream ---
@@ -2607,15 +2697,12 @@ workloads:
         assert_eq!(response.status(), SC::OK);
 
         let received = captured.lock().unwrap().take().expect("upstream should have been hit");
-        let verified_user = received
-            .get(HEADER_VERIFIED_USER)
-            .expect("X-ZT-Verified-User should be set on an authenticated request")
-            .to_str()
-            .unwrap();
         // `orders-svc` is the token's `current_actor` (no delegation chain
-        // here, so it's just `sub`) -- the verified immediate caller, which
-        // is what N10's gateway-owned header must carry.
-        assert_eq!(verified_user, ORDERS);
+        // here, so it's just `sub`) -- the verified immediate caller. R2 moved
+        // it to X-ZT-Verified-Caller, and X-ZT-Verified-User is reserved for the
+        // signed user claim.
+        assert_eq!(received.get(HEADER_VERIFIED_CALLER).unwrap().to_str().unwrap(), ORDERS);
+        assert!(received.get(HEADER_VERIFIED_USER).is_none(), "no user claim, so no user header");
 
         let verified_chain = received
             .get(HEADER_VERIFIED_CHAIN)

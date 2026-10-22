@@ -180,7 +180,7 @@ curl -s -X POST http://127.0.0.1:6443/v1/authorize `
 | admin | `POST /v1/svid/jwt-with-user` | Edge mint: `{user_credential, user_issuer}` -> a token whose `user` claim is the principal from a verified IdP credential. `401` if the credential doesn't verify. |
 | admin | `POST /v1/token-exchange` | RFC 8693 exchange: re-mints the inbound token for a new audience with this gateway appended to `act`. |
 | admin | `POST /v1/authorize` | Ask "is this allowed?" directly (ext_authz-style): `{destination, obo_token?, caller_chain?}` -> `{allow, deny_reason}`. |
-| proxy | `ANY /*` | The reverse proxy. Requires `X-SPIFFE-OBO-Token` (or, with mTLS, an allow-listed client cert). Forwards to `upstream_addr` on allow. Returns `403` with `{deny_reason}` on an OBO deny, and `403` with `deny_reason: capability_denied` when the capability policy refuses. Gateway-owned `X-ZT-Verified-*` headers carry the verified identity to the backend. Delegation headers from the caller are stripped. |
+| proxy | `ANY /*` | The reverse proxy. Requires `X-SPIFFE-OBO-Token` (or, with mTLS, an allow-listed client cert). Forwards to `upstream_addr` on allow. Returns `403` with `{deny_reason}` on an OBO deny, and `403` with `deny_reason: capability_denied` when the capability policy refuses. Gateway-owned headers carry verified identity to the backend: `X-ZT-Verified-Caller` (the mTLS peer or current actor), `X-ZT-Verified-User` (the signed user claim, if any), and `X-ZT-Verified-Chain`. Any `X-ZT-Verified-*` or delegation header the client sent is removed first (review 0003 R2). |
 
 ## Signing keys and JWKS
 

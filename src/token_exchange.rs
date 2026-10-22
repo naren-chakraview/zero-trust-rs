@@ -112,7 +112,8 @@ impl std::error::Error for TokenExchangeError {}
 ///   (the current actor), with whatever was already there nested one
 ///   level deeper as the prior actor.
 /// - `cnf`: preserved verbatim (cert binding survives re-minting).
-/// - `iat`/`exp`: fresh, `now_secs` .. `now_secs + ttl_secs`.
+/// - `iat`/`exp`: fresh `iat`; `exp` is `now_secs + ttl_secs`, capped at the
+///   inbound token's `exp` (R3, review 0003).
 /// - `jti`: freshly generated, unique per call.
 ///
 /// Returns the signed token and its TTL in seconds.
@@ -207,7 +208,8 @@ pub fn exchange_token(
         user: inbound_claims.user.clone(),
         act: append_hop(inbound_claims.act.clone(), gateway_id.to_string()),
         iat: now_secs,
-        exp: now_secs + ttl_secs as i64,
+        // R3 fix (review 0003): never outlive the token this was derived from.
+        exp: (now_secs + ttl_secs as i64).min(inbound_claims.exp),
         nbf: Some(now_secs),
         jti: Some(generate_jti()),
         cnf: inbound_claims.cnf.clone(),
@@ -328,7 +330,8 @@ pub fn exchange_token_with_cert_binding(
         user: inbound_claims.user.clone(),
         act: append_hop(inbound_claims.act.clone(), gateway_id.to_string()),
         iat: now_secs,
-        exp: now_secs + ttl_secs as i64,
+        // R3 fix (review 0003): never outlive the token this was derived from.
+        exp: (now_secs + ttl_secs as i64).min(inbound_claims.exp),
         nbf: Some(now_secs),
         jti: Some(generate_jti()),
         cnf: new_cnf,

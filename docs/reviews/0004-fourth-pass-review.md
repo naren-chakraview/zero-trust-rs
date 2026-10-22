@@ -9,6 +9,19 @@
 
 **Ready to feature.** Every finding from reviews 0001 to 0003 that bears on the article's claims is fixed and covered by a regression test, and Design 0002 (the proxy-side rebind) is implemented as accepted. What remains is hardening and documentation, listed below. None of it contradicts what the article says, provided the article describes the capability check the way this gateway implements it (S2).
 
+## Resolution status (2026-10-22)
+
+| ID | Status | Commit | How it's checked |
+|---|---|---|---|
+| S1 | Fixed | `5d7c40d` | `unsafe_path_reason` refuses backslashes, double encoding, overlong UTF-8, and dot-segments with matrix parameters. Probes inverted in `tests/review4_regressions.rs`. |
+| S2 | Documented | `2edd6be` | The check is per hop, against the current actor. README, module doc, and demo doc say so. Probe kept as a regression. |
+| S3 | Fixed | `2edd6be` | Review 0003 now says design 0002 is implemented. |
+| S4 | Documented | `2edd6be` | The demo's agent is the orders-svc workload. README, demo doc, and policy file say so. |
+| S5 | No change | | Already listed under known gaps in the README and the demo doc. |
+
+The kind cluster was deleted, so the demos were not re-run after `5d7c40d`. The S1
+change only refuses path forms the demos don't use.
+
 ## Review 0003 findings: verified
 
 I checked each fix in the code and re-ran the review 0003 probes against `a27371d`. Every probe that still compiles now fails, which means the gap it demonstrated is gone. The capability probes (q5 to q7) no longer compile against the stricter policy format, so I replaced them with equivalent ones: an agent acting for an admin cannot `DELETE` without its own grant in the same rule, and an agent's grant does not apply for a user with no rights.

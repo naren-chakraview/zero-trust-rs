@@ -2224,6 +2224,65 @@ workloads:
         assert_eq!(received.get(HEADER_VERIFIED_CALLER).unwrap().to_str().unwrap(), ORDERS);
     }
 
+    // --- R9 fix (review 0003): the decision log records the verified chain ---
+
+    /// Captures every tracing event's fields, so a test can read the log a request emits.
+    #[derive(Clone, Default)]
+    struct EventCapture(Arc<std::sync::Mutex<Vec<std::collections::HashMap<String, String>>>>);
+
+    struct FieldCollector<'a>(&'a mut std::collections::HashMap<String, String>);
+
+    impl tracing::field::Visit for FieldCollector<'_> {
+        fn record_str(&mut self, field: &tracing::field::Field, value: &str) {
+            self.0.insert(field.name().to_string(), value.to_string());
+        }
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            self.0.insert(field.name().to_string(), format!("{value:?}"));
+        }
+    }
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for EventCapture {
+        fn on_event(&self, event: &tracing::Event<'_>, _ctx: tracing_subscriber::layer::Context<'_, S>) {
+            let mut fields = std::collections::HashMap::new();
+            event.record(&mut FieldCollector(&mut fields));
+            self.0.lock().unwrap().push(fields);
+        }
+    }
+
+    #[tokio::test]
+    async fn decision_log_records_the_verified_chain_and_keeps_the_forged_header_unverified() {
+        use tracing_subscriber::layer::SubscriberExt;
+
+        let (upstream_addr, _captured) = spawn_header_capturing_upstream().await;
+        let state = test_state(upstream_addr);
+        let issued = state.identity.issue_jwt_svid("orders-svc", INVENTORY, "orders-secret").unwrap();
+        let router = build_router(state);
+
+        let events = EventCapture::default();
+        let _guard = tracing::subscriber::set_default(tracing_subscriber::registry().with(events.clone()));
+        let forged = "spiffe://chakra.internal/ns/forged/sa/admin";
+        let request = Request::builder()
+            .method("GET")
+            .uri("/some/path")
+            .header(HEADER_OBO_TOKEN, issued.token)
+            .header(HEADER_CALLER_CHAIN, forged)
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(router.oneshot(request).await.unwrap().status(), SC::OK);
+
+        let captured = events.0.lock().unwrap();
+        let decision = captured
+            .iter()
+            .find(|fields| fields.get("message").is_some_and(|m| m.contains("authorization decision")))
+            .expect("the proxy must log an authorization decision");
+        assert_eq!(decision.get("obo_chain").map(String::as_str), Some(ORDERS), "the logged chain is the verified one");
+        assert_eq!(
+            decision.get("obo_chain_unverified").map(String::as_str),
+            Some(forged),
+            "the forged header is kept only under the unverified name"
+        );
+    }
+
     // --- Design 0002, option A: proxy-side rebind to this workload's delegation cert ---
 
     /// A gateway whose own identity is INVENTORY, with one delegating route to a

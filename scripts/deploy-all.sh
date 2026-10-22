@@ -31,6 +31,42 @@ kubectl -n zero-trust-demo create configmap zt-jwks \
 # Agent demo (review 0003 R8): the mock IdP, its public keys, and the capability
 # policy for inventory-svc. The IdP's keys are fetched through a port-forward.
 # The mock generates them at startup, so they can't be committed.
+# Ops (review 0003). A gateway reads its config only at startup, and a ConfigMap
+# change doesn't roll the pods that mount it. So each gateway's pod template carries
+# a hash of everything that feeds it, and a change to any input rolls the pods.
+roll_on_config_change() {
+  local gw="$1"; shift
+  local hash
+  hash="$(cat "$@" | sha256sum | cut -d' ' -f1)"
+  kubectl -n zero-trust-demo patch deployment "$gw" --type merge \
+    -p "{\"spec\":{\"template\":{\"metadata\":{\"annotations\":{\"zt.chakra.dev/config-hash\":\"$hash\"}}}}}" >/dev/null
+}
+
+# After the rollout, checks that each running gateway loaded the registry and
+# config its ConfigMaps hold. If the kubelet still had an older value when the pod
+# started, the pod is replaced. A file mounted with subPath never picks up later
+# changes, so a restart is the only fix.
+verify_mounted_config() {
+  local gw="$1" pod want have
+  pod="$(kubectl -n zero-trust-demo get pods -l "app=$gw" -o json | python3 -c '
+import json, sys
+pods = [p for p in json.load(sys.stdin)["items"] if "deletionTimestamp" not in p["metadata"]]
+print(pods[0]["metadata"]["name"] if pods else "")')"
+  [ -n "$pod" ] || { echo "no running pod for $gw" >&2; return 1; }
+  local stale=0
+  want="$(kubectl -n zero-trust-demo get cm zt-registry -o jsonpath='{.data.registry\.yaml}' | sha256sum)"
+  have="$(kubectl -n zero-trust-demo exec "$pod" -c zt-gateway -- sha256sum /etc/zt-gateway/registry.yaml 2>/dev/null || true)"
+  [ -n "$have" ] && [ "${want%% *}" = "${have%% *}" ] || stale=1
+  want="$(kubectl -n zero-trust-demo get cm "zt-gateway-config-$gw" -o jsonpath='{.data.gateway\.config\.yaml}' | sha256sum)"
+  have="$(kubectl -n zero-trust-demo exec "$pod" -c zt-gateway -- sha256sum /etc/zt-gateway/gateway.config.yaml 2>/dev/null || true)"
+  [ -n "$have" ] && [ "${want%% *}" = "${have%% *}" ] || stale=1
+  if [ "$stale" = 1 ]; then
+    echo "$gw loaded a stale config; replacing pod $pod"
+    kubectl -n zero-trust-demo delete pod "$pod" >/dev/null
+    kubectl -n zero-trust-demo rollout status "deployment/$gw" --timeout=120s
+  fi
+}
+
 kubectl apply -f "$DIR/mock-idp.yaml"
 kubectl -n zero-trust-demo rollout status deployment/mock-idp --timeout=120s
 kubectl -n zero-trust-demo port-forward svc/mock-idp 18500:8080 >/tmp/zt-idp-pf.log 2>&1 &
@@ -86,9 +122,22 @@ kubectl apply -f "$DIR/inventory-svc.yaml"
 kubectl apply -f "$DIR/orders-svc.yaml"
 kubectl apply -f "$DIR/api-gateway.yaml"
 
+# The config inputs of each gateway: its manifest, the registry, the keys, its
+# delegation cert, the policy, and the CA. Any change rolls that gateway.
+for gw in inventory-svc orders-svc api-gateway; do
+  roll_on_config_change "$gw" "$DIR/$gw.yaml" "$DIR/registry-configmap.yaml" \
+    "$DIR/policy/capability-policy.yaml" "$KEYS_DIR/public-jwks.json" \
+    "$KEYS_DIR/idp-jwks.json" "$DELEG_DIR/$gw.crt" "$DIR/zt-ca-secret.yaml"
+done
+
 echo "=== waiting for rollouts ==="
 kubectl rollout status -n zero-trust-demo deployment/inventory-svc --timeout=60s
 kubectl rollout status -n zero-trust-demo deployment/orders-svc --timeout=60s
 kubectl rollout status -n zero-trust-demo deployment/api-gateway --timeout=60s
+
+echo "=== checking each gateway loaded its current config ==="
+for gw in inventory-svc orders-svc api-gateway; do
+  verify_mounted_config "$gw"
+done
 
 kubectl get pods -n zero-trust-demo -o wide

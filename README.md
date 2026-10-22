@@ -321,9 +321,8 @@ scripts/deploy-spire.sh              # SPIRE server + agent + a debug client pod
 scripts/register-spire-entries.sh    # register the node + debug-client entries
 kubectl apply -f deploy/k8s/jaeger.yaml -f deploy/k8s/otel-collector.yaml
 
-scripts/port-forward-all.sh          # gateways on :18443-18445, Jaeger UI on :16686
-scripts/verify-topology.sh           # allow-list / chain-depth checks against all 3
 scripts/demo-obo-chain.sh            # a live 3-hop OBO chain, then check Jaeger
+scripts/demo-agent-chain.sh          # an IdP user acting through an agent, bounded by the capability policy
 ```
 
 Jaeger's UI (after port-forwarding) is at `http://127.0.0.1:16686` —
@@ -374,7 +373,7 @@ chain that's too deep or an unauthorized hop is denied with a
 `deny_reason` before it reaches the next gateway.
 
 ### Verify the trace
-Open Jaeger at `http://localhost:16686` (see `scripts/port-forward-all.sh`)
+Open Jaeger at `http://localhost:16686` (`kubectl -n zero-trust-demo port-forward svc/jaeger 16686:16686`)
 and search for a trace containing the originator's ID. You should see:
 - A single trace spanning all three gateways (W3C TraceContext
   propagation, F12).

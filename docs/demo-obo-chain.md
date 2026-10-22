@@ -135,51 +135,34 @@ service `zt-gateway`, directly:
   `obo_token_signature_invalid` points straight at the two gaps called
   out below.
 
+## Verified run
+
+Run on the `zero-trust` kind cluster on 2026-10-22, after building the image
+from the current `master`. All three hops returned 200, and each response came
+from the expected backend (`response from backend-a`, `-b`, `-c`). Jaeger showed
+one trace with three spans, at delegation depths 1, 2, and 3, and the chain
+`client -> api-gateway -> orders-svc` in `obo.delegation_chain`. Cross-gateway
+signature checks passed, so the static JWKS (`scripts/gen-gateway-keys.sh`,
+`scripts/deploy-all.sh`) works on a cluster.
+
 ## Known limitations
 
-This script exercises the real `/v1/token-exchange` endpoint and real signed
-delegation chains. It has not been re-run against the current manifests, and
-it is **expected to fail** until the gaps below are closed. Each one is
-listed here rather than worked around silently.
+These are real limits of the current design, not failures of this run.
 
-1. **Cross-gateway JWKS is wired, but not yet verified on a cluster.** Each
-   gateway signs with its own key (`signing_key_path`, `active_kid`), and all
-   three verify against the shared `jwks_path`. `scripts/deploy-all.sh` creates
-   those keys and the ConfigMap. Locally, three gateway processes with the same
-   settings passed the check: orders-svc accepted a token signed by api-gateway,
-   and it refused a token signed by an unknown key with
-   `obo_token_signature_invalid`. Confirm on the kind cluster with the demo.
-2. **SPIRE identity issuance and `/v1/token-exchange` are mutually
-   exclusive.** `SpireProvider::sign_claims` always returns `Err`, so a gateway
-   with `spire_socket_path` set cannot serve `/v1/token-exchange`. None of the
-   three ConfigMaps set `spire_socket_path` (the `ZT_SPIRE_SOCKET_PATH` env var
-   they do set is inert, see the comment in `deploy/k8s/api-gateway.yaml`), so
-   all three still run on `LocalIssuer`. "SPIRE running" in this demo's
-   prerequisites means the SPIRE server and agent are up, for example for
-   `spire-debug-client`'s SVID. It does not mean the gateways' identities are
-   backed by SPIRE.
-3. **Backend routes are wired.** Each gateway's ConfigMap has a `/demo` route
-   (`routes:`, F14) to its standalone backend: api-gateway to `backend-a`,
-   orders-svc to `backend-b`, inventory-svc to `backend-c`. The route's
-   `workload_id` is the authorization destination, and it's the token audience
-   that gateway receives. The chain's three responses are therefore each
-   backend's own text. The embedded `backend` sidecar still answers other paths.
-4. **The first token is unbound, by design.** The gateway that receives a
-   client-bound token can't exchange it (N2), so api-gateway sets
-   `require_cert_binding: false` for the demo. Each hop still checks the mTLS
-   peer against the current actor (N1), and the audience and depth at each
-   exchange. Delegation for bound tokens is open work, proposed in
-   `docs/design/0002-delegation-with-bound-tokens.md`. That design would
-   remove this setting. Until it lands, this is an explicit demo setting, not a
-   default.
-5. **TLS is handled by the script, and the whole chain was verified locally.** The gateways require mTLS on the proxy listener
-   (`client_auth: required`), and admin serves HTTPS without client certs. The
-   script calls admin over HTTPS with `-k`, because the gateways present an
-   ephemeral self-signed server certificate. Before each proxy hop, it issues an
-   X.509 SVID for the calling workload through `/v1/svid/x509` and presents that
-   cert. The three SVIDs are `client`, then `api-gateway`, then `orders-svc`,
-   since each hop's TLS peer must be the current actor. The issuance flow was
-   checked against a local gateway with the same TLS posture. It has not been
-   run against the kind cluster.
-
-The full chain passed locally, with the demo script's own functions and mTLS on: three 200 responses, each from the expected backend. The cluster run is the remaining check. It still depends on item 1, the JWKS wiring, being confirmed on a real cluster.
+1. **The first token is unbound.** The gateway that receives a client-bound token
+   can't exchange it (N2), so api-gateway sets `require_cert_binding: false`. Each
+   hop still checks the mTLS peer against the current actor (N1), and the
+   audience and depth at each exchange. This is an explicit demo setting. Design
+   0002 (`docs/design/0002-delegation-with-bound-tokens.md`) proposes proxy-side
+   re-minting to remove it.
+2. **SPIRE identity issuance and `/v1/token-exchange` are mutually exclusive.**
+   `SpireProvider::sign_claims` always returns `Err`, so a gateway with
+   `spire_socket_path` set can't serve `/v1/token-exchange`. The gateways run on
+   `LocalIssuer`, and `ZT_SPIRE_SOCKET_PATH` in `deploy/k8s/api-gateway.yaml` is
+   inert. The SPIRE server and agent are up for `spire-debug-client`'s SVID, but
+   the gateways' identities aren't backed by SPIRE.
+3. **Jaeger's `allow` and `deny_reason` fields print as `None`.** The spans carry
+   the delegation chain and depth, but the demo script shows `None` for the
+   decision fields. I haven't yet checked whether the gateway fails to record them
+   on the span or the script reads them wrong. The decisions themselves were
+   correct: every hop returned 200.

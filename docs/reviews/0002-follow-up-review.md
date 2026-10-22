@@ -16,7 +16,7 @@ findings text below is the original review and is not edited.
 | F1 | Fixed | `1bbbd40`, `b64276f`, `77ac483` | N11 covers the span attribute. |
 | F2 | Fixed | `deb46b8` | Human principals come from verified IdP credentials. |
 | F3 | Fixed | `4fddfc2`, `1bbbd40`, `b64276f` | Exchange checks audience and depth, and the proxy strips delegation headers. |
-| F4 | Fixed (static keys) | `63e9370`, JWKS commit | The gateway uses a public JWKS and a per-gateway signing key. The K8s manifests and `deploy-all.sh` now deploy them (option 1). Verified locally. Not yet confirmed on a cluster. |
+| F4 | Fixed | `63e9370`, JWKS commit | Public JWKS and a per-gateway signing key, deployed with static keys (option 1). Verified on the kind cluster: the three-hop demo passed (2026-10-22). |
 | F5 | Fixed | `63e9370`, `d1f4103` | Issuance binds to the caller's cert by default. Exchange re-binds to the exchanging hop. |
 | F6 | Fixed | `aa9f07c` | Request bodies are capped while buffering. Responses and the TLS handshake are bounded. |
 | F7 | Fixed | (earlier) | Admin and proxy are separate. |
@@ -28,7 +28,7 @@ findings text below is the original review and is not edited.
 | F13 | Partial | `dbeac1d`, `98b56da` | ES256 verification is in. Under SPIRE, token exchange can't sign (N8). |
 | F14 | Fixed | (earlier) | |
 | F15 | Fixed | `77ac483` | `iss` is checked against `trusted_issuers` and `jti` against the replay cache, on the proxy path. |
-| F16 | Partial | `5d1edff` | The demo script still assumes plain HTTP and isn't re-run. See `docs/demo-obo-chain.md`. |
+| F16 | Fixed | `5d1edff`, routes commit | The demo script uses HTTPS and per-hop SVIDs. Routes are wired. The three-hop chain passed on the kind cluster on 2026-10-22. First token is unbound by design (design 0002). See `docs/demo-obo-chain.md`. |
 | F17 | Fixed | `98b56da` | Exchange and proxy round-trip benchmarks are in. |
 | F18 | Fixed | (earlier) | |
 | N1 | Fixed | `1bbbd40` | |

@@ -13,6 +13,9 @@ RUN apt-get update \
 WORKDIR /app
 COPY Cargo.toml Cargo.lock ./
 COPY src ./src
+# Cargo.toml declares a [[bench]] target, so cargo needs its source to parse the
+# manifest, even for `cargo build --bin`.
+COPY benches ./benches
 
 RUN cargo build --release --bin zt-gateway
 

@@ -41,6 +41,8 @@ data:
     # the cert the token is bound to. But the gateway that receives a
     # client-bound token can't exchange it, because it doesn't hold the client's
     # key (review 0002, N2). This gateway issues the demo's hop-0 token unbound.
+    # Design 0002 (docs/design/0002-delegation-with-bound-tokens.md) proposes
+    # proxy-side re-minting, which would remove this setting.
     # Hops are still checked: every proxy call must come from the current actor
     # (N1), and the token's audience and depth are checked at each exchange.
     require_cert_binding: false

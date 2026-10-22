@@ -168,7 +168,10 @@ listed here rather than worked around silently.
    client-bound token can't exchange it (N2), so api-gateway sets
    `require_cert_binding: false` for the demo. Each hop still checks the mTLS
    peer against the current actor (N1), and the audience and depth at each
-   exchange. Delegation for bound tokens is open work.
+   exchange. Delegation for bound tokens is open work, proposed in
+   `docs/design/0002-delegation-with-bound-tokens.md`. That design would
+   remove this setting. Until it lands, this is an explicit demo setting, not a
+   default.
 5. **TLS is handled by the script, and the whole chain was verified locally.** The gateways require mTLS on the proxy listener
    (`client_auth: required`), and admin serves HTTPS without client certs. The
    script calls admin over HTTPS with `-k`, because the gateways present an

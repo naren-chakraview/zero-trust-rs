@@ -263,7 +263,9 @@ These are open. The review trackers in `docs/reviews/` have the detail.
   A token bound to a client's certificate (N6) can only be exchanged by a caller
   presenting that certificate (N2). The gateway receiving it doesn't hold that
   key. The demo therefore issues its first token unbound (`require_cert_binding:
-  false` on api-gateway). Designing delegation for bound tokens is open work.
+  false` on api-gateway). This is an explicit demo setting, not a default.
+  `docs/design/0002-delegation-with-bound-tokens.md` proposes proxy-side
+  re-minting to remove it.
 
 ## Build & test
 

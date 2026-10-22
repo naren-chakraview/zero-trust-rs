@@ -23,7 +23,7 @@ pub use headers::{
     build_outbound_headers, CallerChain, OutboundHeaders, HEADER_CALLER_CHAIN, HEADER_OBO_TOKEN,
     HEADER_USER_PRINCIPAL,
 };
-pub use identity::{IdentityProvider, IssuedToken, LocalIssuer};
+pub use identity::{IdentityProvider, IssuedToken, JsonWebKeySet, LocalIssuer};
 pub use jwt::{compute_cert_thumbprint_x5t_s256, ActClaim, CertBinding, JwtSigner, JwtVerifier, OboClaims};
 pub use obo::{
     cert_binding_matches, current_actor, validate, validate_with_cert_binding,

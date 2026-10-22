@@ -44,8 +44,8 @@ use tracing_subscriber::util::SubscriberInitExt;
 use zero_trust::{
     build_client_cert_verifier, build_server_config, compute_cert_thumbprint_x5t_s256, current_actor,
     exchange_token_with_cert_binding, load_certs, now_unix_secs, validate_with_cert_binding_and_clock_skew, CaError,
-    CertificateAuthority, ClientAuth, Decision, GatewayConfig, IdentityError, IdentityProvider, LocalCa, LocalIssuer,
-    Registry, RouteTable, ServerCertificate, SpiffeId, SpireProvider, TokenExchangeError, TokenExchangeRequest,
+    CertificateAuthority, ClientAuth, Decision, GatewayConfig, IdentityError, IdentityProvider, JsonWebKeySet, LocalCa,
+    LocalIssuer, Registry, RouteTable, ServerCertificate, SpiffeId, SpireProvider, TokenExchangeError, TokenExchangeRequest,
     TokenExchangeResponse, ValidationRequest, DEFAULT_MAX_OBO_CHAIN_DEPTH, HEADER_CALLER_CHAIN, HEADER_OBO_TOKEN,
     HEADER_USER_PRINCIPAL,
 };
@@ -93,6 +93,13 @@ struct AppState {
     /// to `obo::validate_with_user_issuers` to accept this gateway's
     /// human-principal tokens.
     user_issuers: Arc<Vec<String>>,
+    /// Mirrors `GatewayConfig::effective_require_cert_binding()` (N6 fix,
+    /// review 0002): whether `POST /v1/svid/jwt` must refuse issuance
+    /// outright when the caller presented no mTLS client certificate at
+    /// all, rather than falling back to an unbound token. See
+    /// `issue_svid`'s doc comment for the full decision this field feeds
+    /// into.
+    require_cert_binding: bool,
 }
 
 /// Sets up structured stdout logs (always) plus, when
@@ -173,12 +180,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::new(SpireProvider::new(socket_path).await?)
     } else {
         let issuer = match (&config.jwks_path, &config.active_kid) {
+            // N7 (review 0002 / F4): `jwks_path` is the public verification
+            // set only. This gateway's private key comes from its own
+            // `signing_key_path`, never from the shared JWKS file.
             (Some(jwks_path), Some(active_kid)) => {
-                let jwks_data = std::fs::read_to_string(jwks_path)?;
-                LocalIssuer::with_jwks(
+                let signing_key_path = config.signing_key_path.as_ref().ok_or(
+                    "jwks_path is configured but signing_key_path is missing — the private \
+                     signing key must be loaded separately from the public JWKS",
+                )?;
+                let jwks = JsonWebKeySet::from_json(&std::fs::read_to_string(jwks_path)?)?;
+                let pem = std::fs::read(signing_key_path)?;
+                LocalIssuer::with_separated_keys(
                     registry.clone(),
-                    &jwks_data,
-                    active_kid.clone(),
+                    &pem,
+                    Some(active_kid.clone()),
+                    &jwks,
                     config.token_ttl_seconds,
                 )?
             }
@@ -263,6 +279,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         route_table: Arc::new(RouteTable::new(config.routes.clone())),
         clock_skew_tolerance_secs: config.clock_skew_tolerance_secs as i64,
         user_issuers: Arc::new(config.user_issuers.clone()),
+        require_cert_binding: config.effective_require_cert_binding(),
     };
 
     let listener_config = ListenerConfig {
@@ -648,11 +665,44 @@ struct IssueResponse {
     expires_at: i64,
 }
 
-async fn issue_svid(State(state): State<AppState>, Json(req): Json<IssueRequest>) -> Response {
-    match state
-        .identity
-        .issue_jwt_svid(&req.workload_name, &req.audience, &req.bootstrap_token)
-    {
+/// N6 fix (review 0002): the production issuance path. A caller that
+/// presented an mTLS client certificate on this connection (the same
+/// [`PeerIdentity`] every other admin/proxy route reads) always gets a
+/// token bound to it via [`IdentityProvider::issue_jwt_svid_with_cert_binding`]
+/// -- binding costs nothing extra whenever there's a certificate to bind
+/// to, so it's never conditional on `require_cert_binding`. A caller with
+/// no certificate at all falls back to the pre-N6 unbound
+/// [`IdentityProvider::issue_jwt_svid`] *unless* `require_cert_binding` is
+/// set (explicitly, or by its mTLS-derived default -- see
+/// `GatewayConfig::effective_require_cert_binding`), in which case
+/// issuance is refused outright rather than quietly handing back a token
+/// with nothing to steal-proof it.
+async fn issue_svid(
+    State(state): State<AppState>,
+    peer_identity: Option<Extension<PeerIdentity>>,
+    Json(req): Json<IssueRequest>,
+) -> Response {
+    let peer_cert_thumbprint = peer_identity.and_then(|Extension(peer)| peer.cert_thumbprint);
+
+    let issued = match &peer_cert_thumbprint {
+        Some(thumbprint) => state.identity.issue_jwt_svid_with_cert_binding(
+            &req.workload_name,
+            &req.audience,
+            thumbprint,
+            &req.bootstrap_token,
+        ),
+        None if state.require_cert_binding => {
+            return error_response(
+                StatusCode::FORBIDDEN,
+                "a client certificate is required to issue a JWT SVID on this gateway",
+            );
+        }
+        None => state
+            .identity
+            .issue_jwt_svid(&req.workload_name, &req.audience, &req.bootstrap_token),
+    };
+
+    match issued {
         Ok(issued) => (
             StatusCode::OK,
             Json(IssueResponse {
@@ -1507,6 +1557,11 @@ workloads:
             route_table: Arc::new(RouteTable::default()),
             clock_skew_tolerance_secs: zero_trust::DEFAULT_CLOCK_SKEW_SECS,
             user_issuers: Arc::new(Vec::new()),
+            // Most existing tests call `/v1/svid/jwt` with no peer
+            // certificate at all and expect the pre-N6 unbound token back
+            // -- `false` preserves that. Tests exercising the N6 gate
+            // itself override this field directly.
+            require_cert_binding: false,
         }
     }
 
@@ -1594,6 +1649,135 @@ workloads:
 
         let response = router.oneshot(request).await.unwrap();
         assert_eq!(response.status(), SC::UNAUTHORIZED);
+    }
+
+    // --- N6 fix (review 0002): production cert-binding issuance ---
+
+    #[tokio::test]
+    async fn issue_svid_binds_token_when_caller_presents_a_cert() {
+        let state = test_state("http://unused.invalid".to_string());
+        // Simulates a caller that completed an mTLS handshake and
+        // presented a client certificate -- see `extract_peer_identity`,
+        // which populates this same `PeerIdentity` extension from a real
+        // TLS connection in production.
+        let peer = PeerIdentity {
+            spiffe_id: None,
+            cert_thumbprint: Some("caller-thumbprint".to_string()),
+        };
+        let router = build_router(state).layer(Extension(peer));
+
+        let body = r#"{"workload_name":"orders-svc","audience":"spiffe://chakra.internal/ns/inventory/sa/inventory-svc","bootstrap_token":"orders-secret"}"#;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/svid/jwt")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), SC::OK);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let token = parsed["token"].as_str().unwrap();
+
+        // `state` (and its issuer) was consumed by `build_router` above --
+        // decode the JWT payload directly rather than re-deriving a
+        // verifier, same as `token_exchange_returns_a_token_with_the_gateway_appended_to_the_chain`
+        // does. The point here is the claim *shape* the handler produced
+        // (bound by default), not re-proving RS256 signature validity,
+        // which `issue_jwt_svid_with_cert_binding_signs_a_token_carrying_the_cnf_claim`
+        // (identity.rs) already covers.
+        let payload_b64 = token.split('.').nth(1).unwrap();
+        let payload_bytes = base64_decode_url_nopad(payload_b64).expect("jwt payload should be valid base64url");
+        let payload: serde_json::Value = serde_json::from_slice(&payload_bytes).unwrap();
+        assert_eq!(payload["cnf"]["x5t#S256"], "caller-thumbprint");
+    }
+
+    #[tokio::test]
+    async fn issue_svid_falls_back_to_unbound_when_no_cert_and_binding_not_required() {
+        // `test_state()` sets `require_cert_binding: false` -- a caller
+        // with no mTLS client certificate at all (no `PeerIdentity`
+        // extension layered here, same as a plain-HTTP connection) still
+        // gets a token, just an unbound one: the pre-N6 behavior, kept
+        // for deployments that haven't turned on mTLS.
+        let state = test_state("http://unused.invalid".to_string());
+        let router = build_router(state);
+
+        let body = r#"{"workload_name":"orders-svc","audience":"spiffe://chakra.internal/ns/inventory/sa/inventory-svc","bootstrap_token":"orders-secret"}"#;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/svid/jwt")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), SC::OK);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let token = parsed["token"].as_str().unwrap();
+        let payload_b64 = token.split('.').nth(1).unwrap();
+        let payload_bytes = base64_decode_url_nopad(payload_b64).expect("jwt payload should be valid base64url");
+        let payload: serde_json::Value = serde_json::from_slice(&payload_bytes).unwrap();
+        assert!(payload["cnf"].is_null());
+    }
+
+    #[tokio::test]
+    async fn issue_svid_rejects_issuance_when_require_cert_binding_and_no_cert_presented() {
+        // The strict side of the N6 gate: with `require_cert_binding: true`
+        // (what `GatewayConfig::effective_require_cert_binding` defaults
+        // to once mTLS is enabled), a caller with no client certificate
+        // is refused outright rather than handed an unbound, stealable
+        // token.
+        let mut state = test_state("http://unused.invalid".to_string());
+        state.require_cert_binding = true;
+        let router = build_router(state);
+
+        let body = r#"{"workload_name":"orders-svc","audience":"spiffe://chakra.internal/ns/inventory/sa/inventory-svc","bootstrap_token":"orders-secret"}"#;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/svid/jwt")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), SC::FORBIDDEN);
+    }
+
+    #[tokio::test]
+    async fn issue_svid_binds_token_even_when_require_cert_binding_is_true_and_cert_is_presented() {
+        // Binding is unconditional whenever a cert is actually presented
+        // -- `require_cert_binding` only ever makes the *missing*-cert
+        // case stricter, never the present-cert case looser or redundant.
+        let mut state = test_state("http://unused.invalid".to_string());
+        state.require_cert_binding = true;
+        let peer = PeerIdentity {
+            spiffe_id: None,
+            cert_thumbprint: Some("caller-thumbprint".to_string()),
+        };
+        let router = build_router(state).layer(Extension(peer));
+
+        let body = r#"{"workload_name":"orders-svc","audience":"spiffe://chakra.internal/ns/inventory/sa/inventory-svc","bootstrap_token":"orders-secret"}"#;
+        let request = Request::builder()
+            .method("POST")
+            .uri("/v1/svid/jwt")
+            .header("content-type", "application/json")
+            .body(Body::from(body))
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+        assert_eq!(response.status(), SC::OK);
+
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let parsed: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        let token = parsed["token"].as_str().unwrap();
+        let payload_b64 = token.split('.').nth(1).unwrap();
+        let payload_bytes = base64_decode_url_nopad(payload_b64).expect("jwt payload should be valid base64url");
+        let payload: serde_json::Value = serde_json::from_slice(&payload_bytes).unwrap();
+        assert_eq!(payload["cnf"]["x5t#S256"], "caller-thumbprint");
     }
 
     #[tokio::test]

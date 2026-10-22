@@ -2,10 +2,13 @@
 //! is decided, kept separate from `obo.rs` (which only ever consumes
 //! already-issued tokens) and from the HTTP layer.
 
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
 use jsonwebtoken::DecodingKey;
 use rsa::pkcs1::{DecodeRsaPrivateKey, EncodeRsaPrivateKey, EncodeRsaPublicKey, LineEnding};
+use rsa::traits::PublicKeyParts;
 use rsa::{RsaPrivateKey, RsaPublicKey};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::error::{IdentityError, JwtError};
 use crate::jwt::{CertBinding, JwtSigner, JwtVerifier, OboClaims};
@@ -37,6 +40,82 @@ fn parse_jwks(jwks_data: &str) -> Result<Vec<JwksKeyEntry>, IdentityError> {
     let document: JwksDocument =
         serde_json::from_str(jwks_data).map_err(|source| IdentityError::InvalidJwks(source.to_string()))?;
     Ok(document.keys)
+}
+
+/// One public RSA key in a [`JsonWebKeySet`]: only the RFC 7517 public
+/// members (`kty`, `kid`, `n`, `e`). There is deliberately no field for
+/// private material, so a serialized set can never carry it (N7, F4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PublicJwk {
+    pub kty: String,
+    pub kid: String,
+    pub n: String,
+    pub e: String,
+}
+
+/// The public verification set shared by every gateway in a trust domain
+/// (N7, review 0002 / F4). Unlike the legacy [`LocalIssuer::with_jwks`]
+/// document, this carries no private keys: each issuer loads its own
+/// private signing key separately (see [`LocalIssuer::with_separated_keys`])
+/// and every verifier loads only this public set.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct JsonWebKeySet {
+    pub keys: Vec<PublicJwk>,
+}
+
+impl JsonWebKeySet {
+    /// Derives the public half of an RSA private key (PKCS#1 PEM) and wraps
+    /// it as a one-key set under `kid`. The private key itself is not kept.
+    pub fn from_rsa_private_pem(kid: String, private_key_pem: &[u8]) -> Result<Self, IdentityError> {
+        let to_key_err = |source: rsa::pkcs1::Error| IdentityError::Jwt(JwtError::InvalidKey(source.to_string()));
+
+        let pem_str = std::str::from_utf8(private_key_pem)
+            .map_err(|source| IdentityError::Jwt(JwtError::InvalidKey(source.to_string())))?;
+        let private_key = RsaPrivateKey::from_pkcs1_pem(pem_str).map_err(to_key_err)?;
+        let public_key = RsaPublicKey::from(&private_key);
+
+        Ok(Self {
+            keys: vec![PublicJwk {
+                kty: "RSA".to_string(),
+                kid,
+                n: URL_SAFE_NO_PAD.encode(public_key.n().to_bytes_be()),
+                e: URL_SAFE_NO_PAD.encode(public_key.e().to_bytes_be()),
+            }],
+        })
+    }
+
+    /// Adds every key in `other` to this set, e.g. to publish several
+    /// gateways' keys in one document during rotation.
+    pub fn extend(&mut self, other: JsonWebKeySet) {
+        self.keys.extend(other.keys);
+    }
+
+    /// Serializes to the JSON document a verifier loads from `jwks_path`.
+    /// The output contains only public members by construction.
+    pub fn to_json(&self) -> Result<String, IdentityError> {
+        serde_json::to_string_pretty(self).map_err(|source| IdentityError::InvalidJwks(source.to_string()))
+    }
+
+    /// Parses a public JWKS document. Any private-key members present in the
+    /// input are ignored, so a verifier never holds private material even if
+    /// it is pointed at a file that contains some.
+    pub fn from_json(jwks_data: &str) -> Result<Self, IdentityError> {
+        serde_json::from_str(jwks_data).map_err(|source| IdentityError::InvalidJwks(source.to_string()))
+    }
+
+    /// Builds a verify-only [`JwtVerifier`] trusting every key in this set.
+    pub fn to_verifier(&self) -> Result<JwtVerifier, IdentityError> {
+        let mut entries = Vec::with_capacity(self.keys.len());
+        for jwk in &self.keys {
+            if jwk.kty != "RSA" {
+                return Err(IdentityError::InvalidJwks(format!("unsupported kty {:?} for kid {:?}", jwk.kty, jwk.kid)));
+            }
+            let decoding_key = DecodingKey::from_rsa_components(&jwk.n, &jwk.e)
+                .map_err(|source| IdentityError::Jwt(JwtError::InvalidKey(source.to_string())))?;
+            entries.push((jwk.kid.clone(), decoding_key));
+        }
+        Ok(JwtVerifier::from_jwks_entries(entries))
+    }
 }
 
 /// A fresh, random JWT ID (`jti`) for a newly issued token (Task 3): a v4
@@ -86,6 +165,36 @@ pub trait IdentityProvider {
     /// check because nothing new is being authenticated, only re-signed.
     fn sign_claims(&self, claims: &OboClaims) -> Result<String, IdentityError>;
 
+    /// Like [`Self::issue_jwt_svid`], but the issued token also carries a
+    /// signed `cnf.x5t#S256` claim (RFC 8705) binding it to
+    /// `cert_thumbprint` (N6 fix, review 0002): this is what
+    /// `POST /v1/svid/jwt` calls by default whenever the caller presented
+    /// an mTLS client certificate, so a token that leaks off that
+    /// connection (a compromised log, SSRF, a replay from a different
+    /// host) is useless without also presenting the same certificate on
+    /// the connection that uses it. See
+    /// [`LocalIssuer::issue_jwt_svid_with_cert_binding`] for the concrete
+    /// claim shape.
+    ///
+    /// The default implementation always refuses, for the same reason
+    /// [`Self::issue_jwt_svid_with_user`]'s does: producing this specific
+    /// signed claim shape requires holding this provider's signing key
+    /// material directly, which not every `IdentityProvider` does (e.g.
+    /// [`crate::SpireProvider`] issues JWT-SVIDs through SPIRE's own
+    /// Workload API, with no way to ask it to embed an arbitrary `cnf`
+    /// claim). [`LocalIssuer`] is the only provider that overrides this.
+    fn issue_jwt_svid_with_cert_binding(
+        &self,
+        _requester_workload_name: &str,
+        _audience: &str,
+        _cert_thumbprint: &str,
+        _credential: &str,
+    ) -> Result<IssuedToken, IdentityError> {
+        Err(IdentityError::Spire(
+            "issue_jwt_svid_with_cert_binding is not supported by this identity provider".to_string(),
+        ))
+    }
+
     /// Edge mint path for a human user principal (N5 fix, review 0002):
     /// mints a token whose `sub` is `gateway_id` and whose `user` claim
     /// carries a human principal string (e.g. `user@corp.internal`), not a
@@ -124,6 +233,10 @@ pub struct LocalIssuer {
     signer: JwtSigner,
     verifier: JwtVerifier,
     ttl_seconds: i64,
+    /// `true` only when built by [`Self::with_separated_keys`], i.e. the
+    /// private signing key was loaded on its own and never came from a
+    /// shared JWKS document (N7).
+    separated_signing_key: bool,
 }
 
 impl LocalIssuer {
@@ -133,7 +246,14 @@ impl LocalIssuer {
             signer,
             verifier,
             ttl_seconds,
+            separated_signing_key: false,
         }
+    }
+
+    /// Whether this issuer's private key was loaded separately from the
+    /// public verification set (see [`Self::with_separated_keys`]).
+    pub fn has_separated_signing_key(&self) -> bool {
+        self.separated_signing_key
     }
 
     /// Generates a fresh 2048-bit RSA keypair and builds a `LocalIssuer`
@@ -232,6 +352,54 @@ impl LocalIssuer {
         let signer = active_signer.expect("active_kid was verified to be present in entries");
 
         Ok(Self::new(registry, signer, verifier, ttl_seconds))
+    }
+
+    /// Builds a `LocalIssuer` that signs with a private key loaded from
+    /// `signing_key_pem` (this issuer's only private material) and verifies
+    /// against the public `public_jwks` set (N7, review 0002 / F4). Unlike
+    /// [`Self::with_jwks`], the verifier never sees a private key.
+    ///
+    /// `active_kid` names which key in `public_jwks` this issuer signs with.
+    /// It may be `None` only when the set holds exactly one key. The private
+    /// key must match that key's published public half, so a misconfigured
+    /// pairing fails at startup instead of minting tokens nobody can verify.
+    pub fn with_separated_keys(
+        registry: Registry,
+        signing_key_pem: &[u8],
+        active_kid: Option<String>,
+        public_jwks: &JsonWebKeySet,
+        ttl_seconds: i64,
+    ) -> Result<Self, IdentityError> {
+        let kid = match active_kid {
+            Some(kid) => kid,
+            None if public_jwks.keys.len() == 1 => public_jwks.keys[0].kid.clone(),
+            None => {
+                return Err(IdentityError::InvalidJwks(
+                    "active_kid is required when the public key set holds more than one key".to_string(),
+                ))
+            }
+        };
+
+        let published = public_jwks
+            .keys
+            .iter()
+            .find(|jwk| jwk.kid == kid)
+            .ok_or_else(|| IdentityError::InvalidKeyId(kid.clone()))?;
+
+        let derived = JsonWebKeySet::from_rsa_private_pem(kid.clone(), signing_key_pem)?;
+        let derived = &derived.keys[0];
+        if derived.n != published.n || derived.e != published.e {
+            return Err(IdentityError::InvalidJwks(format!(
+                "signing key does not match the public key published for kid {kid:?}"
+            )));
+        }
+
+        let signer = JwtSigner::from_rsa_pem_with_kid(signing_key_pem, kid)?;
+        let verifier = public_jwks.to_verifier()?;
+
+        let mut issuer = Self::new(registry, signer, verifier, ttl_seconds);
+        issuer.separated_signing_key = true;
+        Ok(issuer)
     }
 
     pub fn registry(&self) -> &Registry {
@@ -384,6 +552,23 @@ impl IdentityProvider for LocalIssuer {
 
     fn sign_claims(&self, claims: &OboClaims) -> Result<String, IdentityError> {
         Ok(self.signer.sign(claims)?)
+    }
+
+    /// Delegates to the inherent [`Self::issue_jwt_svid_with_cert_binding`]
+    /// -- kept as a separate trait override (rather than relying on the
+    /// default) so a caller holding only `&dyn IdentityProvider` (e.g.
+    /// `zt-gateway`'s `AppState::identity`, which is exactly what
+    /// `POST /v1/svid/jwt` calls through, N6 fix) can still reach it --
+    /// the same pattern [`Self::issue_jwt_svid_with_user`] below already
+    /// uses.
+    fn issue_jwt_svid_with_cert_binding(
+        &self,
+        requester_workload_name: &str,
+        audience: &str,
+        cert_thumbprint: &str,
+        credential: &str,
+    ) -> Result<IssuedToken, IdentityError> {
+        self.issue_jwt_svid_with_cert_binding(requester_workload_name, audience, cert_thumbprint, credential)
     }
 
     /// Delegates to the inherent [`Self::issue_jwt_svid_with_user`] -- kept

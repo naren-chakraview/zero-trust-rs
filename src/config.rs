@@ -258,11 +258,12 @@ pub struct GatewayConfig {
     #[serde(default)]
     pub signing_key_path: Option<PathBuf>,
 
-    /// Path to a JWKS document (see [`crate::LocalIssuer::with_jwks`]) shared
-    /// across every gateway in the trust domain. When set (together with
-    /// `active_kid`), this takes priority over `signing_key_path` — it lets
-    /// this gateway verify tokens signed by any other gateway's active key,
-    /// not just its own.
+    /// Path to a public JWKS document (see [`crate::JsonWebKeySet`]) shared
+    /// across every gateway in the trust domain. It holds only public key
+    /// members, so it's safe to distribute widely (N7, review 0002 / F4).
+    /// When set, `signing_key_path` must also be set: this gateway signs
+    /// with its own private key and verifies every other gateway's key from
+    /// this set.
     #[serde(default)]
     pub jwks_path: Option<PathBuf>,
 
@@ -404,6 +405,29 @@ pub struct GatewayConfig {
     /// See [`default_jti_ttl_secs`]'s doc comment. Default: 3600.
     #[serde(default = "default_jti_ttl_secs")]
     pub jti_ttl_secs: u64,
+
+    /// Whether `POST /v1/svid/jwt` must bind every issued token to the
+    /// caller's presented mTLS client certificate (N6 fix, review 0002):
+    /// `Some(true)` makes the endpoint refuse issuance outright when the
+    /// caller presented no client certificate at all (rather than quietly
+    /// handing back an unbound, stealable token); `Some(false)` allows
+    /// that fallback. A caller that *did* present a certificate always
+    /// gets a bound token regardless of this flag -- binding costs
+    /// nothing when there's a certificate to bind to, so it's never
+    /// skipped just because this flag is off; the flag only governs
+    /// whether a *missing* certificate is tolerated.
+    ///
+    /// `None` (the default) computes the effective value from whether
+    /// mTLS is enabled at all -- see [`Self::effective_require_cert_binding`]
+    /// and [`Self::mtls_enabled`]. This is deliberately `Option<bool>`
+    /// rather than a plain `bool` with a fixed default: the correct
+    /// default genuinely depends on another field (`tls.client_auth`),
+    /// which a `serde` field-level default function has no way to see --
+    /// `None` here means "not set," so the context-dependent computation
+    /// in `effective_require_cert_binding` can tell that apart from an
+    /// operator's explicit `false`.
+    #[serde(default)]
+    pub require_cert_binding: Option<bool>,
 }
 
 impl GatewayConfig {
@@ -561,6 +585,7 @@ impl GatewayConfig {
             trusted_issuers: Vec::new(),
             jti_cache_enabled: false,
             jti_ttl_secs: default_jti_ttl_secs(),
+            require_cert_binding: None,
         }
     }
 
@@ -589,6 +614,29 @@ impl GatewayConfig {
             }),
             None => self.protected_workload_id(),
         }
+    }
+
+    /// Whether this gateway's `tls` block requests (or requires) a client
+    /// certificate at all -- `true` for `client_auth: optional` or
+    /// `required`, `false` for `client_auth: none` or no `tls:` block.
+    /// [`Self::effective_require_cert_binding`]'s context-dependent
+    /// default is computed from this (N6 fix, review 0002).
+    pub fn mtls_enabled(&self) -> bool {
+        matches!(
+            self.tls.as_ref().map(|tls| tls.client_auth),
+            Some(ClientAuth::Optional) | Some(ClientAuth::Required)
+        )
+    }
+
+    /// The effective value of [`Self::require_cert_binding`] (N6 fix,
+    /// review 0002): the explicit config value if set, otherwise
+    /// [`Self::mtls_enabled`] -- a deployment with mTLS enabled defaults
+    /// to requiring cert-bound issuance; one with no mTLS at all has
+    /// nothing to bind to, so it defaults to allowing unbound issuance
+    /// instead of breaking every caller. See `require_cert_binding`'s
+    /// doc comment for the full rationale.
+    pub fn effective_require_cert_binding(&self) -> bool {
+        self.require_cert_binding.unwrap_or_else(|| self.mtls_enabled())
     }
 }
 
@@ -1002,5 +1050,79 @@ protected_workload: spiffe://chakra.internal/ns/inventory/sa/inventory-svc
         let config = GatewayConfig::test_with_listeners(proxy, admin);
         assert!(config.trusted_issuers.is_empty());
         assert!(!config.jti_cache_enabled);
+    }
+
+    // --- Production cert-binding issuance (Task 4 / N6) ---
+
+    #[test]
+    fn require_cert_binding_is_unset_by_default() {
+        let config = GatewayConfig::from_yaml_str(MINIMAL).unwrap();
+        assert!(config.require_cert_binding.is_none());
+    }
+
+    #[test]
+    fn effective_require_cert_binding_defaults_to_false_with_no_mtls() {
+        // No `tls:` block at all -- nothing to bind a token to.
+        let config = GatewayConfig::from_yaml_str(MINIMAL).unwrap();
+        assert!(!config.mtls_enabled());
+        assert!(!config.effective_require_cert_binding());
+    }
+
+    #[test]
+    fn effective_require_cert_binding_defaults_to_false_with_client_auth_none() {
+        let yaml = format!("{MINIMAL}\ntls:\n  client_auth: none\n");
+        let config = GatewayConfig::from_yaml_str(&yaml).unwrap();
+        assert!(!config.mtls_enabled());
+        assert!(!config.effective_require_cert_binding());
+    }
+
+    #[test]
+    fn effective_require_cert_binding_defaults_to_true_when_mtls_is_optional() {
+        let yaml = format!("{MINIMAL}\ntls:\n  client_auth: optional\n");
+        let config = GatewayConfig::from_yaml_str(&yaml).unwrap();
+        assert!(config.mtls_enabled());
+        assert!(config.effective_require_cert_binding());
+    }
+
+    #[test]
+    fn effective_require_cert_binding_defaults_to_true_when_mtls_is_required() {
+        let yaml = format!("{MINIMAL}\ntls:\n  client_auth: required\n");
+        let config = GatewayConfig::from_yaml_str(&yaml).unwrap();
+        assert!(config.mtls_enabled());
+        assert!(config.effective_require_cert_binding());
+    }
+
+    #[test]
+    fn require_cert_binding_explicit_false_overrides_mtls_default() {
+        // An operator can explicitly opt out of strict issuance even with
+        // mTLS enabled (e.g. a migration window) -- the explicit value
+        // always wins over the mTLS-derived default.
+        let yaml = format!("{MINIMAL}\ntls:\n  client_auth: required\nrequire_cert_binding: false\n");
+        let config = GatewayConfig::from_yaml_str(&yaml).unwrap();
+        assert_eq!(config.require_cert_binding, Some(false));
+        assert!(config.mtls_enabled());
+        assert!(!config.effective_require_cert_binding());
+    }
+
+    #[test]
+    fn require_cert_binding_explicit_true_overrides_no_mtls_default() {
+        // And the reverse: an operator can require binding even without
+        // mTLS configured in this file (e.g. TLS terminated upstream of
+        // this gateway by a sidecar/mesh that still presents a cert on
+        // this connection).
+        let yaml = format!("{MINIMAL}\nrequire_cert_binding: true\n");
+        let config = GatewayConfig::from_yaml_str(&yaml).unwrap();
+        assert_eq!(config.require_cert_binding, Some(true));
+        assert!(!config.mtls_enabled());
+        assert!(config.effective_require_cert_binding());
+    }
+
+    #[test]
+    fn test_with_listeners_has_no_explicit_require_cert_binding() {
+        let proxy: SocketAddr = "127.0.0.1:19449".parse().unwrap();
+        let admin: SocketAddr = "127.0.0.1:19450".parse().unwrap();
+        let config = GatewayConfig::test_with_listeners(proxy, admin);
+        assert!(config.require_cert_binding.is_none());
+        assert!(!config.effective_require_cert_binding());
     }
 }

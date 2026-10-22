@@ -119,6 +119,15 @@ user_idps:
 # Capability policy (F11)
 capability_policy_path: /path/to/capability-policy.yaml
 capability_policy_reload_secs: 5      # how often the file is checked for changes
+
+# Delegation (design 0002): a route with `delegate: true` rebinds the token to this
+# workload's delegation cert, and its backend exchanges it onward. Routes entry:
+#   - path_pattern: /demo
+#     workload_id: spiffe://chakra.internal/ns/orders/sa/orders-svc   # must be this gateway
+#     upstream_addr: http://127.0.0.1:8080                             # loopback only
+#     delegate: true
+#     delegated_ttl_seconds: 60
+delegation_cert_path: /path/to/delegation-cert.pem   # the cert the co-located backend presents
 ```
 
 Omit `ca.key_path` to run verify-only (trusting a CA this gateway doesn't
@@ -267,13 +276,11 @@ These are open. The review trackers in `docs/reviews/` have the detail.
   loopback-only, so any local process can reach it. Issuance endpoints check
   bootstrap tokens, and token exchange checks only the signature of the token
   it's given, not the identity of the caller (N3, partly open).
-- **Client-bound tokens can't be exchanged by the gateway that receives them.**
-  A token bound to a client's certificate (N6) can only be exchanged by a caller
-  presenting that certificate (N2). The gateway receiving it doesn't hold that
-  key. The demo therefore issues its first token unbound (`require_cert_binding:
-  false` on api-gateway). This is an explicit demo setting, not a default.
-  `docs/design/0002-delegation-with-bound-tokens.md` proposes proxy-side
-  re-minting to remove it.
+- **Delegation needs a co-located backend.** A route with `delegate: true` rebinds
+  the token to the gateway's delegation cert (`docs/design/0002-delegation-with-bound-tokens.md`),
+  and the backend must hold that cert's key to exchange the token onward. Startup
+  refuses a delegating route with a non-loopback upstream. Delegation to remote
+  backends is open work.
 
 ## Build & test
 

@@ -45,6 +45,43 @@ kubectl -n zero-trust-demo create configmap zt-user-idp-jwks \
   --from-file=idp-jwks.json="$KEYS_DIR/idp-jwks.json" --dry-run=client -o yaml | kubectl apply -f -
 kubectl -n zero-trust-demo create configmap zt-capability-policy \
   --from-file=capability-policy.yaml="$DIR/policy/capability-policy.yaml" --dry-run=client -o yaml | kubectl apply -f -
+# Design 0002 (option A): each gateway's delegation certificate. The gateway holds
+# the cert, which it binds rebound tokens to. Its co-located backend holds the key
+# and presents the cert when it exchanges the token. The demo issues them from the
+# demo CA in deploy/k8s/zt-ca-secret.yaml, so they're valid for the same trust root
+# as the workload SVIDs. They're re-issued when less than an hour of validity is left.
+DELEG_DIR="$KEYS_DIR/delegation"
+mkdir -p "$DELEG_DIR"
+python3 - "$DIR/zt-ca-secret.yaml" "$DELEG_DIR" <<'PY'
+import os, sys, yaml
+secret, out = sys.argv[1], sys.argv[2]
+data = yaml.safe_load(open(secret))["stringData"]
+for name, key in [("ca-cert.pem", "ca-cert.pem"), ("ca-key.pem", "ca-key.pem")]:
+    path = os.path.join(out, key)
+    with open(path, "w") as f:
+        f.write(data[name])
+    os.chmod(path, 0o600 if "key" in key else 0o644)
+PY
+for gw in api-gateway orders-svc inventory-svc; do
+  case "$gw" in
+    api-gateway) spiffe="spiffe://chakra.internal/ns/api-gateway/sa/api-gateway" ;;
+    orders-svc) spiffe="spiffe://chakra.internal/ns/orders/sa/orders-svc" ;;
+    inventory-svc) spiffe="spiffe://chakra.internal/ns/inventory/sa/inventory-svc" ;;
+  esac
+  if [ ! -f "$DELEG_DIR/$gw.crt" ] || ! openssl x509 -checkend 3600 -noout -in "$DELEG_DIR/$gw.crt" >/dev/null 2>&1; then
+    openssl genrsa -traditional -out "$DELEG_DIR/$gw.key" 2048 2>/dev/null
+    openssl req -new -key "$DELEG_DIR/$gw.key" -subj "/CN=$gw" -out "$DELEG_DIR/$gw.csr"
+    printf 'subjectAltName=URI:%s\nextendedKeyUsage=clientAuth\nkeyUsage=digitalSignature\nbasicConstraints=CA:FALSE\n' "$spiffe" > "$DELEG_DIR/$gw.ext"
+    openssl x509 -req -in "$DELEG_DIR/$gw.csr" -CA "$DELEG_DIR/ca-cert.pem" -CAkey "$DELEG_DIR/ca-key.pem" \
+      -set_serial "0x$(openssl rand -hex 8)" -days 1 -extfile "$DELEG_DIR/$gw.ext" -out "$DELEG_DIR/$gw.crt" 2>/dev/null
+    chmod 600 "$DELEG_DIR/$gw.key"
+    echo "issued delegation certificate for $gw"
+  fi
+  kubectl -n zero-trust-demo create secret generic "zt-delegation-$gw" \
+    --from-file=cert.pem="$DELEG_DIR/$gw.crt" --from-file=key.pem="$DELEG_DIR/$gw.key" \
+    --dry-run=client -o yaml | kubectl apply -f -
+done
+
 kubectl apply -f "$DIR/inventory-svc.yaml"
 kubectl apply -f "$DIR/orders-svc.yaml"
 kubectl apply -f "$DIR/api-gateway.yaml"

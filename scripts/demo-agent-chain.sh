@@ -50,7 +50,11 @@ fail() { echo "[demo-agent-chain] FAIL: $*" >&2; exit 1; }
 # Starts `kubectl port-forward` to a pod, then waits for it to accept connections.
 port_forward_pod() {
   local app="$1" local_port="$2" remote_port="$3" pod
-  pod="$(kubectl -n "$NAMESPACE" get pods -l "app=$app" -o jsonpath='{.items[0].metadata.name}')"
+  # Skip pods being deleted, which can still show as running during a rollout.
+  pod="$(kubectl -n "$NAMESPACE" get pods -l "app=$app" -o json | python3 -c '
+import json, sys
+pods = [p for p in json.load(sys.stdin)["items"] if "deletionTimestamp" not in p["metadata"]]
+print(pods[0]["metadata"]["name"] if pods else "")')"
   kubectl -n "$NAMESPACE" port-forward "pod/$pod" "${local_port}:${remote_port}" >"/tmp/pf-agent-${app}-${remote_port}.log" 2>&1 &
   PF_PIDS+=("$!")
   wait_for_local_port "$local_port"
@@ -164,7 +168,7 @@ issue_svid_cert "orders-svc" "$GW_B_ID" "$GW_A_ADMIN_PORT" "orders-dev-secret"
 echo
 call_proxy "5. the agent reads /demo for alice" GET "$INVENTORY_TOKEN" orders-svc
 [ "$LAST_STATUS" = "200" ] || fail "expected 200 for alice's GET through the agent, got $LAST_STATUS"
-echo "$LAST_BODY" | grep -q "response from backend-c" || fail "the GET did not reach backend-c"
+echo "$LAST_BODY" | grep -q "hello from inventory-svc" || fail "the GET did not reach inventory-svc's sidecar"
 
 echo
 call_proxy "6. the agent tries to DELETE /demo for alice" DELETE "$INVENTORY_TOKEN" orders-svc

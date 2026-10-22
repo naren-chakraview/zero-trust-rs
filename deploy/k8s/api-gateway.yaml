@@ -31,10 +31,15 @@ data:
     # answered by the standalone demo backend, not the embedded sidecar.
     # The route's workload_id is the authorization destination, so it must
     # be this gateway's own identity, the audience of the token it receives.
+    # Design 0002: /demo rebinds the token to this workload's delegation cert and
+    # forwards to the co-located sidecar, which exchanges it onward.
+    delegation_cert_path: /etc/zt-gateway/delegation/cert.pem
     routes:
       - path_pattern: /demo
         workload_id: spiffe://chakra.internal/ns/api-gateway/sa/api-gateway
-        upstream_addr: http://backend-a.zero-trust-demo.svc.cluster.local:8080
+        upstream_addr: http://127.0.0.1:8080
+        delegate: true
+        delegated_ttl_seconds: 60
     # Agent demo (review 0003 R8): trust the mock IdP for edge-minted user tokens.
     user_issuers:
       - http://localhost:18500/default
@@ -45,16 +50,6 @@ data:
         principal_claim: email
     protected_workload: spiffe://chakra.internal/ns/api-gateway/sa/api-gateway
     token_ttl_seconds: 300
-    # Demo only (docs/demo-obo-chain.md). With mTLS on, issuance binds tokens to
-    # the caller's cert and refuses unbound ones. Each delegation hop then needs
-    # the cert the token is bound to. But the gateway that receives a
-    # client-bound token can't exchange it, because it doesn't hold the client's
-    # key (review 0002, N2). This gateway issues the demo's hop-0 token unbound.
-    # Design 0002 (docs/design/0002-delegation-with-bound-tokens.md) proposes
-    # proxy-side re-minting, which would remove this setting.
-    # Hops are still checked: every proxy call must come from the current actor
-    # (N1), and the token's audience and depth are checked at each exchange.
-    require_cert_binding: false
     tls:
       client_auth: required
     # R7 fix (review 0003): the only gateway holding the CA private key. It issues
@@ -83,11 +78,16 @@ spec:
         app: api-gateway
     spec:
       containers:
+        # Design 0002 demo backend: a co-located sidecar on loopback. It echoes the
+        # token it was handed, so the demo can continue the chain from its response.
+        # The demo stands in for the real workload.
         - name: backend
-          image: hashicorp/http-echo:latest
+          image: python:3-alpine
+          command: ["python3"]
           args:
-            - -listen=127.0.0.1:8080
-            - -text=hello from api-gateway
+            - -c
+            - "import http.server, sys\nNAME = sys.argv[1]\nclass H(http.server.BaseHTTPRequestHandler):\n    def do_GET(self):\n        token = self.headers.get(\"X-SPIFFE-OBO-Token\", \"\")\n        body = (\"hello from \" + NAME + \"\\ntoken: \" + token + \"\\n\").encode()\n        self.send_response(200)\n        self.send_header(\"content-length\", str(len(body)))\n        self.end_headers()\n        self.wfile.write(body)\n    def log_message(self, *args):\n        pass\nhttp.server.ThreadingHTTPServer((\"127.0.0.1\", 8080), H).serve_forever()"
+            - api-gateway
 
         - name: zt-gateway
           image: zero-trust/zt-gateway:dev
@@ -136,6 +136,9 @@ spec:
             - name: jwks
               mountPath: /etc/zt-gateway/jwks
               readOnly: true
+            - name: delegation
+              mountPath: /etc/zt-gateway/delegation
+              readOnly: true
             - name: idp-jwks
               mountPath: /etc/zt-gateway/idp
               readOnly: true
@@ -163,6 +166,13 @@ spec:
         - name: jwks
           configMap:
             name: zt-jwks
+        # Design 0002: this workload's delegation certificate (cert only).
+        - name: delegation
+          secret:
+            secretName: zt-delegation-api-gateway
+            items:
+              - key: cert.pem
+                path: cert.pem
         # Agent demo: the mock IdP's public keys, created by scripts/deploy-all.sh.
         - name: idp-jwks
           configMap:

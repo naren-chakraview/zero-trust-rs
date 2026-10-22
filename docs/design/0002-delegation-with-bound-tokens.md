@@ -1,6 +1,29 @@
 # 0002: Delegation with certificate-bound tokens
 
-**Status:** Accepted with changes (review 0003, 2026-10-22). See "Changes from review 0003" below.
+**Status:** Implemented (option A), 2026-10-22. Accepted with changes (review 0003); see "Changes from review 0003" below.
+
+## Implementation notes
+
+What landed, and where it differs from the text above:
+
+- **`cnf` comes from a delegation certificate.** The gateway binds rebound tokens to
+  the thumbprint of `delegation_cert_path`, not to its own TLS server cert. The
+  co-located backend holds the matching key and presents that cert when it exchanges
+  the token. The demo's certs are issued from the demo CA by `scripts/deploy-all.sh`
+  and stored in `zt-delegation-<gateway>` Secrets. The gateway mounts the cert only.
+- **Route requirements.** A delegating route must have `workload_id` equal to this
+  gateway, a loopback `upstream_addr`, mTLS on the proxy, and `delegation_cert_path`.
+  Startup refuses any other setup.
+- **The duplicate-hop fix is in exchange.** An exchange does not add its gateway to
+  `act` when the gateway is already the current actor (edge tokens). Acceptance 7 holds
+  on the cluster: the trace shows depths 1, 2, and 3 with no repeated entries.
+- **The demo backend is a stand-in.** The sidecar echoes the token it received, and
+  the script holds the backend's key and does the exchanges. The verified cluster runs
+  are `scripts/demo-obo-chain.sh` and `scripts/demo-agent-chain.sh`.
+- **Acceptance.** Criteria 1 to 10 are covered by the token-exchange and gateway tests
+  or by the cluster runs. Criterion 9 (inbound replay refused after a rebind) is the
+  existing `jti` replay test, since validation records the inbound `jti`.
+
 **Date:** 2026-10-22
 **Relates to:** review 0002 findings N2 and N6; `docs/design/0001-tls-mtls-termination.md`;
 `docs/demo-obo-chain.md` (known limitation 4)

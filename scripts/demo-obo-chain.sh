@@ -77,8 +77,11 @@ log() { echo "[demo-obo-chain] $*"; }
 
 # Finds the (first) running pod for a `app=<label>` Deployment.
 pod_for() {
-  kubectl -n "$NAMESPACE" get pods -l "app=$1" \
-    -o jsonpath='{.items[0].metadata.name}' 2>/dev/null
+  # Skip pods being deleted, which can still show as running during a rollout.
+  kubectl -n "$NAMESPACE" get pods -l "app=$1" -o json 2>/dev/null | python3 -c '
+import json, sys
+pods = [p for p in json.load(sys.stdin)["items"] if "deletionTimestamp" not in p["metadata"]]
+print(pods[0]["metadata"]["name"] if pods else "")'
 }
 
 # Starts `kubectl port-forward` to a pod (so it reaches whatever address
@@ -131,8 +134,14 @@ wait_for_local_port() {
 # backed by `LocalIssuer` — is the only thing that can hand back a token
 # any of this script's later `/v1/token-exchange` calls can act on).
 get_initial_token() {
-  local admin_port="$1" workload_name="$2" audience="$3" bootstrap_token="$4"
-  curl -sfk -X POST "https://127.0.0.1:${admin_port}/v1/svid/jwt" \
+  local admin_port="$1" workload_name="$2" audience="$3" bootstrap_token="$4" cert_name="${5:-}"
+  # Design 0002: with mTLS on, issuance binds the token to the presented cert, so the
+  # caller presents its own SVID.
+  local cert_args=()
+  if [ -n "$cert_name" ]; then
+    cert_args=(--cert "$CERT_DIR/$cert_name.crt" --key "$CERT_DIR/$cert_name.key")
+  fi
+  curl -sfk "${cert_args[@]}" -X POST "https://127.0.0.1:${admin_port}/v1/svid/jwt" \
     -H "content-type: application/json" \
     -d "{\"workload_name\":\"${workload_name}\",\"audience\":\"${audience}\",\"bootstrap_token\":\"${bootstrap_token}\"}" \
     | python3 -c "import sys, json; print(json.load(sys.stdin)['token'])"
@@ -160,8 +169,11 @@ issue_svid_cert() {
 # re-mints `subject_token` for `audience`, with the gateway answering this
 # call appended to the signed `act` chain server-side.
 exchange_token() {
-  local admin_port="$1" subject_token="$2" audience="$3"
-  curl -sfk -X POST "https://127.0.0.1:${admin_port}/v1/token-exchange" \
+  local admin_port="$1" subject_token="$2" audience="$3" cert_name="$4"
+  # Design 0002: the exchanging hop is the backend that holds this workload's
+  # delegation cert, so it presents that cert. The new token binds to it.
+  curl -sfk --cert "$CERT_DIR/$cert_name.crt" --key "$CERT_DIR/$cert_name.key" \
+    -X POST "https://127.0.0.1:${admin_port}/v1/token-exchange" \
     -H "content-type: application/json" \
     -d "{\"subject_token\":\"${subject_token}\",\"audience\":\"${audience}\"}" \
     | python3 -c "import sys, json; print(json.load(sys.stdin)['access_token'])"
@@ -173,6 +185,9 @@ exchange_token() {
 # and body; does not abort the script on a non-2xx response, so every hop
 # still runs and the final diagnostics can point at exactly which hop
 # failed and why.
+# The response body of the last call, in LAST_BODY, so the next hop can take the
+# token the gateway rebound for this workload from it (the co-located sidecar echoes it).
+LAST_BODY=""
 call_proxy() {
   local label="$1" proxy_port="$2" token="$3" traceparent="$4" caller="$5"
   local status body
@@ -184,6 +199,7 @@ call_proxy() {
     -H "traceparent: ${traceparent}")"
   status="${body##*$'\n'}"
   body="${body%$'\n'*}"
+  LAST_BODY="$body"
   echo "=== $label: status $status ==="
   echo "$body"
   if [ "$status" != "200" ]; then
@@ -192,6 +208,20 @@ call_proxy() {
          "a JWKS trust anchor yet, or the registry's allowed_callers not" \
          "including $CLIENT_ID.)"
   fi
+}
+
+# Writes a workload's delegation cert and key from its zt-delegation-<gw> Secret
+# (deploy/k8s/*.yaml mount only the cert into the gateway; the key stays with the
+# co-located backend. This demo's backend is the script, so it reads the key here.)
+fetch_delegation_cert() {
+  local name="$1" secret="zt-delegation-$2"
+  kubectl -n "$NAMESPACE" get secret "$secret" -o jsonpath='{.data.cert\.pem}' | base64 -d > "$CERT_DIR/$name.crt"
+  kubectl -n "$NAMESPACE" get secret "$secret" -o jsonpath='{.data.key\.pem}' | base64 -d > "$CERT_DIR/$name.key"
+}
+
+# The rebound token the gateway returned in the last response body (the sidecar echoes it).
+rebound_token_from_body() {
+  printf '%s\n' "$LAST_BODY" | sed -n 's/^token: //p' | head -1
 }
 
 random_hex() {
@@ -223,32 +253,36 @@ TRACEPARENT="00-${TRACE_ID}-${PARENT_SPAN_ID}-01"
 log "Shared trace ID for this run's three gateway hops: $TRACE_ID"
 
 echo
-log "=== issuing X.509 SVIDs for the three calling workloads ==="
+log "=== issuing the client's X.509 SVID, and fetching the gateways' delegation certs ==="
 issue_svid_cert "client" "$CLIENT_ID" "$GW_A_ADMIN_PORT" "$CLIENT_BOOTSTRAP_TOKEN"
-issue_svid_cert "api-gateway" "$GW_A_ID" "$GW_A_ADMIN_PORT" "${API_GATEWAY_BOOTSTRAP_TOKEN:-api-gateway-dev-secret}"
-issue_svid_cert "orders-svc" "$GW_B_ID" "$GW_A_ADMIN_PORT" "${ORDERS_BOOTSTRAP_TOKEN:-orders-dev-secret}"
+fetch_delegation_cert "api-gateway" "api-gateway"
+fetch_delegation_cert "orders-svc" "orders-svc"
 
 echo
-log "=== hop 0: mint the initial token for '$CLIENT_ID' (audience: api-gateway) ==="
-TOKEN_0=$(get_initial_token "$GW_A_ADMIN_PORT" "client" "$GW_A_ID" "$CLIENT_BOOTSTRAP_TOKEN")
+log "=== hop 0: mint the client's token, bound to the client's cert (audience: api-gateway) ==="
+TOKEN_0=$(get_initial_token "$GW_A_ADMIN_PORT" "client" "$GW_A_ID" "$CLIENT_BOOTSTRAP_TOKEN" "client")
 echo "token_0 (for api-gateway): ${TOKEN_0:0:40}..."
 
 echo
-log "=== hop 1: client -> Gateway A (api-gateway) ==="
+log "=== hop 1: client -> Gateway A (api-gateway). The gateway rebinds the token to its delegation cert ==="
 call_proxy "Gateway A (api-gateway)" "$GW_A_PROXY_PORT" "$TOKEN_0" "$TRACEPARENT" "client"
+REBOUND_A="$(rebound_token_from_body)"
+[ -n "$REBOUND_A" ] || { echo "no rebound token in the response from Gateway A" >&2; exit 1; }
 
 echo
-log "=== exchange at Gateway A: re-mint for orders-svc, api-gateway appended to act chain ==="
-TOKEN_1=$(exchange_token "$GW_A_ADMIN_PORT" "$TOKEN_0" "$GW_B_ID")
+log "=== exchange at Gateway A (api-gateway's backend presents its delegation cert): re-mint for orders-svc ==="
+TOKEN_1=$(exchange_token "$GW_A_ADMIN_PORT" "$REBOUND_A" "$GW_B_ID" "api-gateway")
 echo "token_1 (for orders-svc): ${TOKEN_1:0:40}..."
 
 echo
-log "=== hop 2: (on client's behalf) -> Gateway B (orders-svc) ==="
+log "=== hop 2: (on client's behalf) -> Gateway B (orders-svc). The gateway rebinds again ==="
 call_proxy "Gateway B (orders-svc)" "$GW_B_PROXY_PORT" "$TOKEN_1" "$TRACEPARENT" "api-gateway"
+REBOUND_B="$(rebound_token_from_body)"
+[ -n "$REBOUND_B" ] || { echo "no rebound token in the response from Gateway B" >&2; exit 1; }
 
 echo
-log "=== exchange at Gateway B: re-mint for inventory-svc, orders-svc appended to act chain ==="
-TOKEN_2=$(exchange_token "$GW_B_ADMIN_PORT" "$TOKEN_1" "$GW_C_ID")
+log "=== exchange at Gateway B (orders-svc's backend presents its delegation cert): re-mint for inventory-svc ==="
+TOKEN_2=$(exchange_token "$GW_B_ADMIN_PORT" "$REBOUND_B" "$GW_C_ID" "orders-svc")
 echo "token_2 (for inventory-svc): ${TOKEN_2:0:40}..."
 
 echo
@@ -256,8 +290,8 @@ log "=== hop 3: (on client's behalf) -> Gateway C (inventory-svc) ==="
 call_proxy "Gateway C (inventory-svc)" "$GW_C_PROXY_PORT" "$TOKEN_2" "$TRACEPARENT" "orders-svc"
 
 echo
-log "=== demo backends (standalone; curled directly — see demo-backends.yaml's" \
-    "header comment for why the gateway trio doesn't route to these yet) ==="
+log "=== standalone demo backends (not on the /demo path: each gateway's /demo goes to its" \
+    "co-located sidecar, which echoes the token it was handed) ==="
 for b in a b c; do
   port_var="BACKEND_${b^^}_PORT"
   echo "-- backend-$b --"

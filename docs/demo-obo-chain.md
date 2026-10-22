@@ -149,12 +149,13 @@ signature checks passed, so the static JWKS (`scripts/gen-gateway-keys.sh`,
 
 These are real limits of the current design, not failures of this run.
 
-1. **The first token is unbound.** The gateway that receives a client-bound token
-   can't exchange it (N2), so api-gateway sets `require_cert_binding: false`. Each
-   hop still checks the mTLS peer against the current actor (N1), and the
-   audience and depth at each exchange. This is an explicit demo setting. Design
-   0002 (`docs/design/0002-delegation-with-bound-tokens.md`) proposes proxy-side
-   re-minting to remove it.
+1. **Delegation runs through a demo backend.** Each gateway's `/demo` route
+   delegates to a loopback sidecar (`python3`, echoing the token it was handed).
+   The gateway rebinds the token to its delegation cert (design 0002, option A).
+   The demo script stands in for the backend when it exchanges the token onward,
+   presenting the cert and key from the `zt-delegation-<gateway>` Secret. A real
+   workload would hold its own key. The first token is bound to the client's cert
+   from the start.
 2. **SPIRE identity issuance and `/v1/token-exchange` are mutually exclusive.**
    `SpireProvider::sign_claims` always returns `Err`, so a gateway with
    `spire_socket_path` set can't serve `/v1/token-exchange`. The gateways run on

@@ -27,6 +27,24 @@ for gw in api-gateway orders-svc inventory-svc; do
 done
 kubectl -n zero-trust-demo create configmap zt-jwks \
   --from-file=public-jwks.json="$KEYS_DIR/public-jwks.json" --dry-run=client -o yaml | kubectl apply -f -
+
+# Agent demo (review 0003 R8): the mock IdP, its public keys, and the capability
+# policy for inventory-svc. The IdP's keys are fetched through a port-forward.
+# The mock generates them at startup, so they can't be committed.
+kubectl apply -f "$DIR/mock-idp.yaml"
+kubectl -n zero-trust-demo rollout status deployment/mock-idp --timeout=120s
+kubectl -n zero-trust-demo port-forward svc/mock-idp 18500:8080 >/tmp/zt-idp-pf.log 2>&1 &
+IDP_PF=$!
+for _ in $(seq 1 30); do
+  curl -sf -o "$KEYS_DIR/idp-jwks.json" http://localhost:18500/default/jwks && break
+  sleep 1
+done
+kill "$IDP_PF" 2>/dev/null || true
+test -s "$KEYS_DIR/idp-jwks.json" || { echo "could not fetch the mock IdP's JWKS" >&2; exit 1; }
+kubectl -n zero-trust-demo create configmap zt-user-idp-jwks \
+  --from-file=idp-jwks.json="$KEYS_DIR/idp-jwks.json" --dry-run=client -o yaml | kubectl apply -f -
+kubectl -n zero-trust-demo create configmap zt-capability-policy \
+  --from-file=capability-policy.yaml="$DIR/policy/capability-policy.yaml" --dry-run=client -o yaml | kubectl apply -f -
 kubectl apply -f "$DIR/inventory-svc.yaml"
 kubectl apply -f "$DIR/orders-svc.yaml"
 kubectl apply -f "$DIR/api-gateway.yaml"

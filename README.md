@@ -122,6 +122,7 @@ user_idps:
     jwks_path: /path/to/idp-public-jwks.json   # the IdP's public RS256 keys
     audience: zt-gateway                       # required aud on the IdP credential
     principal_claim: email                     # claim that becomes the user principal
+    attribute_claims: [kyc_id]                 # further string claims carried as the token's user_attributes (v0.4.4)
 
 # Capability policy (F11)
 capability_policy_path: /path/to/capability-policy.yaml

@@ -816,7 +816,8 @@ fn load_user_idps(config: &GatewayConfig) -> Result<std::collections::HashMap<St
             jwks,
             entry.audience.clone(),
             entry.principal_claim.clone(),
-        );
+        )
+        .with_attribute_claims(entry.attribute_claims.clone());
         idps.insert(entry.issuer.clone(), idp);
     }
     for issuer in &config.user_issuers {
@@ -955,11 +956,11 @@ async fn issue_svid_with_user(
     // N5 fix (review 0002): verify the credential before trusting any
     // principal from it. The identity provider's own issuer check still runs
     // below, as a second guard.
-    let (principal, roles) = match state.user_idps.get(&req.user_issuer) {
+    let (principal, roles, attributes) = match state.user_idps.get(&req.user_issuer) {
         None => {
             return error_response(StatusCode::UNAUTHORIZED, format!("untrusted user issuer: {}", req.user_issuer))
         }
-        Some(idp) => match idp.verify_with_roles(&req.user_credential) {
+        Some(idp) => match idp.verify_full(&req.user_credential) {
             Ok(verified) => verified,
             Err(error) => return error_response(StatusCode::UNAUTHORIZED, error.to_string()),
         },
@@ -971,6 +972,7 @@ async fn issue_svid_with_user(
         &req.user_issuer,
         &state.user_issuers,
         roles.as_deref().unwrap_or(&[]),
+        attributes.unwrap_or_default(),
     ) {
         Ok(issued) => (
             StatusCode::OK,
@@ -2229,7 +2231,7 @@ workloads:
         let (upstream_addr, captured) = spawn_header_capturing_upstream().await;
         let mut state = test_state(upstream_addr);
         state.user_issuers = Arc::new(vec!["auth.corp.internal".to_string()]);
-        let claims = zero_trust::OboClaims { roles: None,
+        let claims = zero_trust::OboClaims { user_attributes: None, roles: None,
             sub: ORDERS.to_string(),
             aud: vec![INVENTORY.to_string()],
             user: Some("alice@corp.internal".to_string()),
@@ -2349,7 +2351,7 @@ workloads:
     fn sidecar_token_bound(signer: &LocalIssuer, cnf: Option<&str>, jti: &str) -> String {
         let now = now_unix_secs();
         signer
-            .sign_claims(&zero_trust::OboClaims {
+            .sign_claims(&zero_trust::OboClaims { user_attributes: None,
                 sub: AGENT.to_string(),
                 aud: vec![BOUNDARY_SVC.to_string()],
                 user: Some(ANALYST.to_string()),
@@ -2538,7 +2540,7 @@ workloads:
     fn sidecar_token(signer: &LocalIssuer, thumb: &str, jti: &str) -> String {
         let now = now_unix_secs();
         signer
-            .sign_claims(&zero_trust::OboClaims { roles: None,
+            .sign_claims(&zero_trust::OboClaims { user_attributes: None, roles: None,
                 sub: AGENT.to_string(),
                 aud: vec![BOUNDARY_SVC.to_string()],
                 user: Some(ANALYST.to_string()),
@@ -4427,7 +4429,7 @@ workloads:
             )
         };
         const ALICE: &str = "spiffe://chakra.internal/ns/users/sa/alice";
-        let claims = zero_trust::OboClaims { roles: None,
+        let claims = zero_trust::OboClaims { user_attributes: None, roles: None,
             user_iss: None,
             sub: ORDERS.to_string(),
             aud: vec![INVENTORY.to_string()],

@@ -254,6 +254,7 @@ pub trait IdentityProvider {
         _user_issuer: &str,
         _trusted_user_issuers: &[String],
         _roles: &[String],
+        _attributes: std::collections::BTreeMap<String, String>,
     ) -> Result<IssuedToken, IdentityError> {
         Err(IdentityError::Spire(
             "issue_jwt_svid_with_user_and_roles is not supported by this identity provider".to_string(),
@@ -491,7 +492,7 @@ impl LocalIssuer {
         let audience_id: SpiffeId = audience.parse()?;
 
         let now = crate::now_unix_secs();
-        let claims = OboClaims { roles: None,
+        let claims = OboClaims { user_attributes: None, roles: None,
             user_iss: None,
             sub: requester.spiffe_id.to_string(),
             aud: vec![audience_id.to_string()],
@@ -535,7 +536,14 @@ impl LocalIssuer {
         user_issuer: &str,
         trusted_user_issuers: &[String],
     ) -> Result<IssuedToken, IdentityError> {
-        self.issue_jwt_svid_with_user_and_roles(gateway_id, user_principal, user_issuer, trusted_user_issuers, &[])
+        self.issue_jwt_svid_with_user_and_roles(
+            gateway_id,
+            user_principal,
+            user_issuer,
+            trusted_user_issuers,
+            &[],
+            Default::default(),
+        )
     }
 
     /// Like [`Self::issue_jwt_svid_with_user`], and also records the human's roles as a signed `roles` claim. The
@@ -548,13 +556,16 @@ impl LocalIssuer {
         user_issuer: &str,
         trusted_user_issuers: &[String],
         roles: &[String],
+        attributes: std::collections::BTreeMap<String, String>,
     ) -> Result<IssuedToken, IdentityError> {
         if !trusted_user_issuers.iter().any(|trusted| trusted == user_issuer) {
             return Err(IdentityError::UntrustedUserIssuer(user_issuer.to_string()));
         }
 
         let now = crate::now_unix_secs();
-        let claims = OboClaims { roles: (!roles.is_empty()).then(|| roles.to_vec()),
+        let claims = OboClaims {
+            user_attributes: (!attributes.is_empty()).then_some(attributes),
+            roles: (!roles.is_empty()).then(|| roles.to_vec()),
             sub: gateway_id.to_string(),
             aud: vec![gateway_id.to_string()],
             user: Some(user_principal.to_string()),
@@ -601,7 +612,7 @@ impl IdentityProvider for LocalIssuer {
         let audience_id: SpiffeId = audience.parse()?;
 
         let now = crate::now_unix_secs();
-        let claims = OboClaims { roles: None,
+        let claims = OboClaims { user_attributes: None, roles: None,
             user_iss: None,
             sub: requester.spiffe_id.to_string(),
             aud: vec![audience_id.to_string()],
@@ -672,8 +683,9 @@ impl IdentityProvider for LocalIssuer {
         user_issuer: &str,
         trusted_user_issuers: &[String],
         roles: &[String],
+        attributes: std::collections::BTreeMap<String, String>,
     ) -> Result<IssuedToken, IdentityError> {
-        self.issue_jwt_svid_with_user_and_roles(gateway_id, user_principal, user_issuer, trusted_user_issuers, roles)
+        self.issue_jwt_svid_with_user_and_roles(gateway_id, user_principal, user_issuer, trusted_user_issuers, roles, attributes)
     }
 }
 
@@ -917,7 +929,7 @@ workloads:
         let rogue_pem = rogue_key.to_pkcs1_pem(LineEnding::LF).unwrap();
         let rogue_signer =
             crate::jwt::JwtSigner::from_rsa_pem_with_kid(rogue_pem.as_bytes(), "unregistered".to_string()).unwrap();
-        let claims = crate::jwt::OboClaims { roles: None,
+        let claims = crate::jwt::OboClaims { user_attributes: None, roles: None,
             user_iss: None,
             sub: "spiffe://chakra.internal/ns/orders/sa/orders-svc".to_string(),
             aud: vec!["spiffe://chakra.internal/ns/inventory/sa/inventory-svc".to_string()],

@@ -370,7 +370,7 @@ mod tests {
         let verifier = verifier_from_jwt_bundles(&bundles);
 
         let signer = crate::jwt::JwtSigner::from_ec_pem_with_kid(&private_pem, "spire-ec-key".to_string()).unwrap();
-        let claims = crate::jwt::OboClaims {
+        let claims = crate::jwt::OboClaims { roles: None,
             user_iss: None,
             sub: "spiffe://example.org/ns/orders/sa/orders-svc".to_string(),
             aud: vec!["spiffe://example.org/ns/inventory/sa/inventory-svc".to_string()],
@@ -412,7 +412,7 @@ mod tests {
 
         let signer = crate::jwt::JwtSigner::from_ec_pem_with_kid(&private_pem, "es256-kid".to_string()).unwrap();
         let token = signer
-            .sign(&crate::jwt::OboClaims {
+            .sign(&crate::jwt::OboClaims { roles: None,
                 user_iss: None,
                 sub: "spiffe://chakra.internal/ns/orders/sa/orders-svc".to_string(),
                 aud: vec!["spiffe://chakra.internal/ns/inventory/sa/inventory-svc".to_string()],
@@ -463,7 +463,7 @@ mod tests {
         bundles.add_bundle(bundle);
         let verifier = verifier_from_jwt_bundles(&bundles);
 
-        let sample_claims = || crate::jwt::OboClaims {
+        let sample_claims = || crate::jwt::OboClaims { roles: None,
             user_iss: None,
             sub: "spiffe://mixed.test/workload".to_string(),
             aud: vec!["spiffe://mixed.test/aud".to_string()],

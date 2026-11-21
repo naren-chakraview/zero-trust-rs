@@ -163,7 +163,7 @@ fn f1_signed_chain_depth_enforced_header_has_no_effect() {
 
     // reg()'s inventory-svc caps max_obo_chain_depth at 3. This chain is
     // 4 deep: sub (orders) + 3 signed act hops.
-    let claims = OboClaims {
+    let claims = OboClaims { roles: None,
         user_iss: None,
         sub: ORD.to_string(),
         aud: vec![INV.to_string()],
@@ -218,7 +218,7 @@ fn f1_chain_entries_must_be_valid_spiffe_ids() {
     let dest: SpiffeId = INV.parse().unwrap();
     let now = now_unix_secs();
 
-    let claims = OboClaims {
+    let claims = OboClaims { roles: None,
         user_iss: None,
         sub: ORD.to_string(),
         aud: vec![INV.to_string()],
@@ -259,7 +259,7 @@ fn f2_user_principal_is_signed_and_validated() {
     let dest: SpiffeId = INV.parse().unwrap();
     let now = now_unix_secs();
 
-    let good_claims = OboClaims {
+    let good_claims = OboClaims { roles: None,
         user_iss: None,
         sub: ORD.to_string(),
         aud: vec![INV.to_string()],

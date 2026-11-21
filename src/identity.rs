@@ -244,6 +244,21 @@ pub trait IdentityProvider {
             "issue_jwt_svid_with_user is not supported by this identity provider".to_string(),
         ))
     }
+
+    /// Edge mint with the human's roles (see [`LocalIssuer::issue_jwt_svid_with_user_and_roles`]). Not supported
+    /// by default, like [`Self::issue_jwt_svid_with_user`].
+    fn issue_jwt_svid_with_user_and_roles(
+        &self,
+        _gateway_id: &SpiffeId,
+        _user_principal: &str,
+        _user_issuer: &str,
+        _trusted_user_issuers: &[String],
+        _roles: &[String],
+    ) -> Result<IssuedToken, IdentityError> {
+        Err(IdentityError::Spire(
+            "issue_jwt_svid_with_user_and_roles is not supported by this identity provider".to_string(),
+        ))
+    }
 }
 
 /// v0.1's only [`IdentityProvider`]: this process holds its own RSA
@@ -476,7 +491,7 @@ impl LocalIssuer {
         let audience_id: SpiffeId = audience.parse()?;
 
         let now = crate::now_unix_secs();
-        let claims = OboClaims {
+        let claims = OboClaims { roles: None,
             user_iss: None,
             sub: requester.spiffe_id.to_string(),
             aud: vec![audience_id.to_string()],
@@ -520,12 +535,26 @@ impl LocalIssuer {
         user_issuer: &str,
         trusted_user_issuers: &[String],
     ) -> Result<IssuedToken, IdentityError> {
+        self.issue_jwt_svid_with_user_and_roles(gateway_id, user_principal, user_issuer, trusted_user_issuers, &[])
+    }
+
+    /// Like [`Self::issue_jwt_svid_with_user`], and also records the human's roles as a signed `roles` claim. The
+    /// roles come from the IdP credential the gateway verified, so the backend can trust them as it trusts `user`.
+    /// An empty slice leaves the claim out.
+    pub fn issue_jwt_svid_with_user_and_roles(
+        &self,
+        gateway_id: &SpiffeId,
+        user_principal: &str,
+        user_issuer: &str,
+        trusted_user_issuers: &[String],
+        roles: &[String],
+    ) -> Result<IssuedToken, IdentityError> {
         if !trusted_user_issuers.iter().any(|trusted| trusted == user_issuer) {
             return Err(IdentityError::UntrustedUserIssuer(user_issuer.to_string()));
         }
 
         let now = crate::now_unix_secs();
-        let claims = OboClaims {
+        let claims = OboClaims { roles: (!roles.is_empty()).then(|| roles.to_vec()),
             sub: gateway_id.to_string(),
             aud: vec![gateway_id.to_string()],
             user: Some(user_principal.to_string()),
@@ -572,7 +601,7 @@ impl IdentityProvider for LocalIssuer {
         let audience_id: SpiffeId = audience.parse()?;
 
         let now = crate::now_unix_secs();
-        let claims = OboClaims {
+        let claims = OboClaims { roles: None,
             user_iss: None,
             sub: requester.spiffe_id.to_string(),
             aud: vec![audience_id.to_string()],
@@ -634,6 +663,17 @@ impl IdentityProvider for LocalIssuer {
         trusted_user_issuers: &[String],
     ) -> Result<IssuedToken, IdentityError> {
         self.issue_jwt_svid_with_user(gateway_id, user_principal, user_issuer, trusted_user_issuers)
+    }
+
+    fn issue_jwt_svid_with_user_and_roles(
+        &self,
+        gateway_id: &SpiffeId,
+        user_principal: &str,
+        user_issuer: &str,
+        trusted_user_issuers: &[String],
+        roles: &[String],
+    ) -> Result<IssuedToken, IdentityError> {
+        self.issue_jwt_svid_with_user_and_roles(gateway_id, user_principal, user_issuer, trusted_user_issuers, roles)
     }
 }
 
@@ -877,7 +917,7 @@ workloads:
         let rogue_pem = rogue_key.to_pkcs1_pem(LineEnding::LF).unwrap();
         let rogue_signer =
             crate::jwt::JwtSigner::from_rsa_pem_with_kid(rogue_pem.as_bytes(), "unregistered".to_string()).unwrap();
-        let claims = crate::jwt::OboClaims {
+        let claims = crate::jwt::OboClaims { roles: None,
             user_iss: None,
             sub: "spiffe://chakra.internal/ns/orders/sa/orders-svc".to_string(),
             aud: vec!["spiffe://chakra.internal/ns/inventory/sa/inventory-svc".to_string()],

@@ -44,7 +44,7 @@ fn test_keys() -> (JwtSigner, JwtVerifier) {
 }
 
 fn claims_with_iss(iss: Option<String>) -> OboClaims {
-    OboClaims {
+    OboClaims { roles: None,
         user_iss: None,
         sub: ORDERS.to_string(),
         aud: vec![INVENTORY.to_string()],
@@ -414,7 +414,7 @@ fn three_hop_chain_has_the_latest_hop_as_the_outermost_act() {
     let issuer = LocalIssuer::generate(placeholder_registry(), 300).unwrap();
     let now = 1_000i64;
 
-    let originator_claims = OboClaims {
+    let originator_claims = OboClaims { roles: None,
         user_iss: None,
         sub: "spiffe://chakra.internal/ns/originator/sa/originator".to_string(),
         aud: vec![GATEWAY.to_string()],
@@ -548,7 +548,7 @@ workloads:
 /// `exchange_token` would leave it: `sub` stays at the originator, and
 /// `act.sub` is the current (most recent) actor.
 fn n1_two_hop_token(signer: &JwtSigner) -> String {
-    let claims = OboClaims {
+    let claims = OboClaims { roles: None,
         user_iss: None,
         sub: N1_API_GATEWAY.to_string(),
         aud: vec![N1_INVENTORY.to_string()],
@@ -658,7 +658,7 @@ workloads:
 ///    unchanged -- behavior for non-delegated tokens is untouched by N1.
 #[test]
 fn current_actor_defaults_to_sub_with_no_delegation() {
-    let claims = OboClaims {
+    let claims = OboClaims { roles: None,
         user_iss: None,
         sub: N1_ORDERS.to_string(),
         aud: vec![N1_INVENTORY.to_string()],
@@ -701,7 +701,7 @@ const TRUSTED_ISSUER: &str = "spiffe://chakra.internal";
 const UNTRUSTED_ISSUER: &str = "spiffe://attacker.example";
 
 fn n12_claims(iss: Option<&str>, jti: Option<&str>) -> OboClaims {
-    OboClaims {
+    OboClaims { roles: None,
         user_iss: None,
         sub: ORDERS.to_string(),
         aud: vec![INVENTORY.to_string()],
@@ -869,7 +869,7 @@ fn exchange_rejects_wrong_audience() {
     let issuer = n3_issuer();
     let now = 1_000i64;
 
-    let claims = OboClaims {
+    let claims = OboClaims { roles: None,
         user_iss: None,
         sub: "spiffe://chakra.internal/ns/originator/sa/originator".to_string(),
         aud: vec![N3_PAYMENTS.to_string()],
@@ -912,7 +912,7 @@ fn exchange_respects_max_depth() {
     // via nested `act` (outermost = most recent hop, per the N4 fix) rather
     // than performing three real exchanges, to isolate exactly the depth
     // check this test targets.
-    let claims = OboClaims {
+    let claims = OboClaims { roles: None,
         user_iss: None,
         sub: "spiffe://chakra.internal/ns/originator/sa/originator".to_string(),
         aud: vec![INVENTORY.to_string()],
@@ -961,7 +961,7 @@ fn exchange_allows_matching_audience_and_depth() {
 
     // Chain so far: [originator, hop-a] -- 2 entries, one hop already
     // recorded.
-    let claims = OboClaims {
+    let claims = OboClaims { roles: None,
         user_iss: None,
         sub: "spiffe://chakra.internal/ns/originator/sa/originator".to_string(),
         aud: vec![ORDERS.to_string()],
@@ -1064,7 +1064,7 @@ fn user_principal_validation_accepts_user_claim() {
     let (signer, verifier) = test_keys();
     let destination: SpiffeId = N5_EDGE_GATEWAY.parse().unwrap();
 
-    let claims = OboClaims {
+    let claims = OboClaims { roles: None,
         sub: N5_EDGE_GATEWAY.to_string(),
         aud: vec![N5_EDGE_GATEWAY.to_string()],
         user: Some(N5_HUMAN_PRINCIPAL.to_string()), // human principal, not a SPIFFE ID
@@ -1157,7 +1157,7 @@ fn cert_binding_at_exchange() {
 
     // Hop A's token: no `cnf` at all -- an ordinary unbound token, exactly
     // what a first-hop issuance looks like today.
-    let claims = OboClaims {
+    let claims = OboClaims { roles: None,
         user_iss: None,
         sub: "spiffe://chakra.internal/ns/originator/sa/originator".to_string(),
         aud: vec![N2_ORDERS_GW.to_string()],
@@ -1210,7 +1210,7 @@ fn cert_binding_mismatch_at_exchange() {
     const HOP_A_THUMBPRINT: &str = "hop-a-cert-thumbprint";
     const ATTACKER_THUMBPRINT: &str = "attacker-cert-thumbprint";
 
-    let claims = OboClaims {
+    let claims = OboClaims { roles: None,
         user_iss: None,
         sub: "spiffe://chakra.internal/ns/originator/sa/originator".to_string(),
         aud: vec![N2_ORDERS_GW.to_string()],
@@ -1308,7 +1308,7 @@ fn cert_binding_propagates_through_chain() {
     let gw_c: SpiffeId = "spiffe://chakra.internal/ns/gw-c/sa/gw-c".parse().unwrap();
 
     // Originator's token, addressed to gw-a, unbound.
-    let originator_claims = OboClaims {
+    let originator_claims = OboClaims { roles: None,
         user_iss: None,
         sub: "spiffe://chakra.internal/ns/originator/sa/originator".to_string(),
         aud: vec![gw_a.to_string()],
@@ -1353,7 +1353,7 @@ fn cert_binding_propagates_through_chain() {
     // exchange, unbound -- re-signed as a fresh "inbound" claims set with
     // `cnf: None`, exactly like `token_0` was. gw-b then exchanges it
     // toward gw-c, presenting its own cert.
-    let hop2_inbound_claims = OboClaims {
+    let hop2_inbound_claims = OboClaims { roles: None,
         user_iss: None,
         sub: claims_1.sub.clone(),
         aud: vec![gw_b.to_string()],
@@ -1395,7 +1395,7 @@ fn cert_binding_propagates_through_chain() {
 
     // Hop 3: gw-c, same pattern -- receives the chain-so-far unbound, then
     // exchanges toward the final backend presenting its own cert.
-    let hop3_inbound_claims = OboClaims {
+    let hop3_inbound_claims = OboClaims { roles: None,
         user_iss: None,
         sub: claims_2.sub.clone(),
         aud: vec![gw_c.to_string()],
@@ -1561,7 +1561,7 @@ workloads:
     let rogue_pem = generate_private_key_pem();
     let rogue_signer = JwtSigner::from_rsa_pem_with_kid(&rogue_pem, "key-1".to_string()).unwrap();
     let rogue_token = rogue_signer
-        .sign(&OboClaims {
+        .sign(&OboClaims { roles: None,
             user_iss: None,
             sub: ORDERS.to_string(),
             aud: vec![INVENTORY.to_string()],

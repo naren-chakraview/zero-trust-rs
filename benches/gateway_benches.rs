@@ -75,7 +75,7 @@ fn spiffe(s: &str) -> SpiffeId {
 
 /// A plain (non-delegated) OBO token: `sub` + `aud`, no `act` chain.
 fn single_hop_token(signer: &JwtSigner) -> String {
-    let claims = OboClaims {
+    let claims = OboClaims { roles: None,
         user_iss: None,
         sub: ORDERS.to_string(),
         aud: vec![INVENTORY.to_string()],
@@ -98,7 +98,7 @@ fn single_hop_token(signer: &JwtSigner) -> String {
 /// how many hops are nested — that's exactly what this benchmark is meant
 /// to demonstrate against `validate_token_signature_and_checks`.
 fn three_hop_delegation_token(signer: &JwtSigner) -> String {
-    let claims = OboClaims {
+    let claims = OboClaims { roles: None,
         user_iss: None,
         sub: ORDERS.to_string(),
         aud: vec![INVENTORY.to_string()],
@@ -246,7 +246,7 @@ fn bench_exchange_token_rs256_signature(c: &mut Criterion) {
 
     // The inbound token the exchanger receives: signed by the issuer,
     // scoped to the exchanger as its audience.
-    let inbound_claims = OboClaims {
+    let inbound_claims = OboClaims { roles: None,
         user_iss: None,
         sub: "spiffe://chakra.internal/ns/bench-caller/sa/bench-caller".to_string(),
         aud: vec![EXCHANGER_ID.to_string()],
@@ -500,7 +500,7 @@ workloads:
     // The initial client token: sub=client, aud=gw1, no `act` chain yet --
     // this is the token gw1 exchanges on the first hop.
     let now = now_unix_secs();
-    let client_claims = OboClaims {
+    let client_claims = OboClaims { roles: None,
         user_iss: None,
         sub: CLIENT_ID.to_string(),
         aud: vec![GW1_ID.to_string()],
@@ -562,7 +562,7 @@ workloads:
     let gw_url = spawn_forward_hop(state).await;
 
     let now = now_unix_secs();
-    let claims = OboClaims {
+    let claims = OboClaims { roles: None,
         user_iss: None,
         sub: CLIENT_ID.to_string(),
         aud: vec![GW_ID.to_string()],

@@ -53,6 +53,12 @@ impl UserIdp {
 
     /// Verifies `credential` and returns the human principal it names.
     pub fn verify(&self, credential: &str) -> Result<String, UserAuthError> {
+        self.verify_with_roles(credential).map(|(principal, _)| principal)
+    }
+
+    /// Verifies `credential` and returns the principal and its roles. Roles come from a `roles` claim, which must
+    /// be an array of strings when present. `None` when the credential has no `roles` claim.
+    pub fn verify_with_roles(&self, credential: &str) -> Result<(String, Option<Vec<String>>), UserAuthError> {
         let invalid = |reason: String| UserAuthError::InvalidCredential(reason);
 
         let header = decode_header(credential).map_err(|source| invalid(source.to_string()))?;
@@ -72,12 +78,29 @@ impl UserIdp {
         let data = decode::<Map<String, Value>>(credential, &key, &validation)
             .map_err(|source| invalid(source.to_string()))?;
 
-        data.claims
+        let principal = data
+            .claims
             .get(&self.principal_claim)
             .and_then(Value::as_str)
             .filter(|principal| !principal.is_empty())
             .map(str::to_string)
-            .ok_or_else(|| invalid(format!("missing string claim {:?}", self.principal_claim)))
+            .ok_or_else(|| invalid(format!("missing string claim {:?}", self.principal_claim)))?;
+
+        let roles = match data.claims.get("roles") {
+            None => None,
+            Some(Value::Array(items)) => Some(
+                items
+                    .iter()
+                    .map(|item| {
+                        item.as_str()
+                            .map(str::to_string)
+                            .ok_or_else(|| invalid("roles claim must be an array of strings".to_string()))
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+            ),
+            Some(_) => return Err(invalid("roles claim must be an array of strings".to_string())),
+        };
+        Ok((principal, roles))
     }
 }
 

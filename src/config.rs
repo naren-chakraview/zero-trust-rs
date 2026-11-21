@@ -567,6 +567,19 @@ pub struct GatewayConfig {
     #[serde(default = "default_jti_ttl_secs")]
     pub jti_ttl_secs: u64,
 
+    /// Z1: forward the exact OBO token this gateway validated, as `X-ZT-Verified-Token`, on every allowed request.
+    /// The backend can then verify the signature against the gateways' public JWKS (defence in depth if the
+    /// network isolation ever fails) and record the token's `jti` and hash. Off by default: a backend that does not
+    /// need the token should not be given one. A client-sent `X-ZT-Verified-Token` is always stripped first.
+    #[serde(default)]
+    pub forward_verified_token: bool,
+
+    /// Z2: refuse to start unless the configuration is complete enough to be trusted: a signing key, a TLS
+    /// identity, and at least one trusted issuer. Off by default, so existing configs keep working; deployments
+    /// that want the guarantee set it. A configured capability policy that fails to load already refuses to start.
+    #[serde(default)]
+    pub strict: bool,
+
     /// Whether `POST /v1/svid/jwt` must bind every issued token to the
     /// caller's presented mTLS client certificate (N6 fix, review 0002):
     /// `Some(true)` makes the endpoint refuse issuance outright when the
@@ -595,6 +608,25 @@ impl GatewayConfig {
     /// Parses the YAML only — does not touch the process environment. Pure
     /// and side-effect-free, which is what makes it safe to call from
     /// multiple tests running concurrently (see [`Self::with_env_overrides`]).
+    /// Z2: the reasons a `strict` configuration is refused. Empty when the config is complete, or when `strict` is
+    /// off. Callers refuse to start when this is non-empty.
+    pub fn strict_violations(&self) -> Vec<&'static str> {
+        if !self.strict {
+            return Vec::new();
+        }
+        let mut violations = Vec::new();
+        if self.signing_key_path.is_none() {
+            violations.push("strict: signing_key_path is required (an ephemeral key does not survive a restart)");
+        }
+        if self.tls.is_none() {
+            violations.push("strict: a tls block is required (plain HTTP would carry the token in the clear)");
+        }
+        if self.trusted_issuers.is_empty() {
+            violations.push("strict: trusted_issuers must name at least one gateway issuer");
+        }
+        violations
+    }
+
     pub fn from_yaml_str(s: &str) -> Result<Self, ConfigError> {
         let config: GatewayConfig = serde_yaml_ng::from_str(s)?;
         Ok(config)
@@ -750,6 +782,8 @@ impl GatewayConfig {
             trusted_issuers: Vec::new(),
             jti_cache_enabled: false,
             jti_ttl_secs: default_jti_ttl_secs(),
+            forward_verified_token: false,
+            strict: false,
             require_cert_binding: None,
         }
     }

@@ -108,6 +108,8 @@ struct AppState {
     /// Whether a token's `jti` is checked against the replay cache (N12 fix),
     /// mirrors `GatewayConfig::jti_cache_enabled`.
     jti_cache_enabled: bool,
+    /// Z5: whether an OBO token with no transport-verified peer may authorize a request on its own.
+    allow_unbound_obo: bool,
     /// How long a seen `jti` is remembered, in seconds. Mirrors
     /// `GatewayConfig::jti_ttl_secs`.
     jti_ttl_secs: u64,
@@ -334,6 +336,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         jti_ttl_secs: config.jti_ttl_secs,
         require_cert_binding: config.effective_require_cert_binding(),
         forward_verified_token: config.forward_verified_token,
+        allow_unbound_obo: config.allow_unbound_obo,
     };
 
     require_loopback_admin(config.admin_addr)?;
@@ -1479,6 +1482,7 @@ async fn proxy_handler(
         state.jti_ttl_secs,
         now_unix_secs(),
         state.clock_skew_tolerance_secs,
+        state.allow_unbound_obo,
     );
 
     let span = tracing::Span::current();
@@ -1961,6 +1965,9 @@ workloads:
             jti_cache_enabled: false,
             jti_ttl_secs: 300,
             forward_verified_token: false,
+            // Most existing tests send a bearer token with no client certificate, the plain-HTTP posture this option
+            // exists for. The Z5 tests set it to false to test the refusal.
+            allow_unbound_obo: true,
             // Most existing tests call `/v1/svid/jwt` with no peer
             // certificate at all and expect the pre-N6 unbound token back
             // -- `false` preserves that. Tests exercising the N6 gate
@@ -2320,7 +2327,140 @@ workloads:
             key_path: Some("/certs/edge.key".into()),
             client_auth: zero_trust::ClientAuth::Optional,
         });
+        // Z5: a proxy that does not require a certificate is refused under strict mode.
+        let violations = config.strict_violations();
+        assert_eq!(violations.len(), 1, "optional client auth is refused: {violations:?}");
+        assert!(violations[0].contains("client_auth"));
+
+        config.tls.as_mut().unwrap().client_auth = zero_trust::ClientAuth::Required;
         assert!(config.strict_violations().is_empty(), "a complete config starts");
+
+        // Z5: bearer use is refused under strict mode, whatever else is configured.
+        config.allow_unbound_obo = true;
+        let violations = config.strict_violations();
+        assert_eq!(violations.len(), 1, "allow_unbound_obo is refused: {violations:?}");
+    }
+
+    // --- Z5 (v0.4.3): an OBO token needs a verified caller, unless bearer use is explicitly allowed ---
+    //
+    // The actor check only runs when a transport-verified peer exists. These cases pin what happens without one.
+
+    /// A token like the sidecar's, with `cnf` set to `cnf` (or unbound when `None`), identified by `jti`.
+    fn sidecar_token_bound(signer: &LocalIssuer, cnf: Option<&str>, jti: &str) -> String {
+        let now = now_unix_secs();
+        signer
+            .sign_claims(&zero_trust::OboClaims {
+                sub: AGENT.to_string(),
+                aud: vec![BOUNDARY_SVC.to_string()],
+                user: Some(ANALYST.to_string()),
+                act: None,
+                iat: now,
+                exp: now + 60,
+                nbf: Some(now),
+                jti: Some(jti.to_string()),
+                cnf: cnf.map(|thumb| zero_trust::CertBinding { x5t_s256: thumb.to_string() }),
+                iss: Some(signer.issuer_claim().unwrap()),
+                user_iss: Some(IDP.to_string()),
+                roles: None,
+            })
+            .unwrap()
+    }
+
+    /// The notebook's identity, as a verified peer.
+    const NOTEBOOK_SVC: &str = "spiffe://chakra.internal/ns/analytics/sa/notebook";
+
+    fn strict_boundary(upstream: String, trusted: Vec<String>, public: &[&JsonWebKeySet]) -> (AppState, LocalIssuer) {
+        let (agent_sidecar, _) = sidecar("a-1");
+        let mut state = boundary_gateway(upstream, public, trusted);
+        state.allow_unbound_obo = false;
+        (state, agent_sidecar)
+    }
+
+    async fn json_body(response: axum::response::Response) -> serde_json::Value {
+        let bytes = axum::body::to_bytes(response.into_body(), 1 << 20).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null)
+    }
+
+    /// d: the token is bound to the notebook's certificate, and the notebook presents it. The binding matches, but
+    /// the current actor is the agent, not the notebook. Only the actor check can refuse this.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn z5_d_a_token_bound_to_the_presenting_cert_still_fails_the_actor_check() {
+        let (agent_sidecar, agent_public) = sidecar("a-1");
+        let (upstream_addr, _) = spawn_header_capturing_upstream().await;
+        let (state, _) = strict_boundary(upstream_addr, vec![agent_sidecar.issuer_claim().unwrap()], &[&agent_public]);
+        let router = build_router(state);
+        let token = sidecar_token_bound(&agent_sidecar, Some("nb-thumb"), "z5-d");
+
+        let response = router.oneshot(call_from(NOTEBOOK_SVC, "nb-thumb", &token)).await.unwrap();
+
+        assert_eq!(response.status(), SC::FORBIDDEN);
+        assert_eq!(json_body(response).await["deny_reason"], "obo_token_subject_mismatch");
+    }
+
+    /// e: an unbound token from the agent's sidecar, presented by the notebook's certificate. The actor check refuses it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn z5_e_an_unbound_token_from_another_workload_fails_the_actor_check() {
+        let (agent_sidecar, agent_public) = sidecar("a-1");
+        let (upstream_addr, _) = spawn_header_capturing_upstream().await;
+        let (state, _) = strict_boundary(upstream_addr, vec![agent_sidecar.issuer_claim().unwrap()], &[&agent_public]);
+        let router = build_router(state);
+        let token = sidecar_token_bound(&agent_sidecar, None, "z5-e");
+
+        let response = router.oneshot(call_from(NOTEBOOK_SVC, "nb-thumb", &token)).await.unwrap();
+
+        assert_eq!(response.status(), SC::FORBIDDEN);
+        assert_eq!(json_body(response).await["deny_reason"], "obo_token_subject_mismatch");
+    }
+
+    /// f: an unbound token with no client certificate at all. Before Z5 this was a 200: the token was a bearer
+    /// credential. It must now be refused, and it is served only when bearer use is explicitly allowed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn z5_f_an_unbound_token_with_no_client_certificate_is_refused_unless_bearer_use_is_allowed() {
+        let (agent_sidecar, agent_public) = sidecar("a-1");
+        let (upstream_addr, _) = spawn_header_capturing_upstream().await;
+        let (state, _) = strict_boundary(upstream_addr.clone(), vec![agent_sidecar.issuer_claim().unwrap()],
+                                         &[&agent_public]);
+        let router = build_router(state);
+        let token = sidecar_token_bound(&agent_sidecar, None, "z5-f");
+        let no_cert = || {
+            Request::builder()
+                .method("GET")
+                .uri("/products/risk-compliance.risk-scores/rows")
+                .header(HEADER_OBO_TOKEN, token.clone())
+                .body(Body::empty())
+                .unwrap()
+        };
+
+        let refused = router.clone().oneshot(no_cert()).await.unwrap();
+        assert_eq!(refused.status(), SC::FORBIDDEN);
+        assert_eq!(json_body(refused).await["deny_reason"], "no_verified_peer");
+
+        let (mut opted_in, _) = strict_boundary(upstream_addr, vec![agent_sidecar.issuer_claim().unwrap()],
+                                                &[&agent_public]);
+        opted_in.allow_unbound_obo = true;
+        let served = build_router(opted_in).oneshot(no_cert()).await.unwrap();
+        assert_eq!(served.status(), SC::OK, "bearer use works when the operator allowed it");
+    }
+
+    /// g: a bound token with no client certificate. The binding refuses it, and that reason is reported first.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn z5_g_a_bound_token_with_no_client_certificate_is_a_binding_mismatch() {
+        let (agent_sidecar, agent_public) = sidecar("a-1");
+        let (upstream_addr, _) = spawn_header_capturing_upstream().await;
+        let (state, _) = strict_boundary(upstream_addr, vec![agent_sidecar.issuer_claim().unwrap()], &[&agent_public]);
+        let router = build_router(state);
+        let token = sidecar_token_bound(&agent_sidecar, Some("agent-thumb"), "z5-g");
+        let request = Request::builder()
+            .method("GET")
+            .uri("/products/risk-compliance.risk-scores/rows")
+            .header(HEADER_OBO_TOKEN, token)
+            .body(Body::empty())
+            .unwrap();
+
+        let response = router.oneshot(request).await.unwrap();
+
+        assert_eq!(response.status(), SC::FORBIDDEN);
+        assert_eq!(json_body(response).await["deny_reason"], "certificate_binding_mismatch");
     }
 
     // --- Z4 (v0.4.1): the sidecar topology, pinned by a test ---

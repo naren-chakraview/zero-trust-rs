@@ -574,6 +574,12 @@ pub struct GatewayConfig {
     #[serde(default)]
     pub forward_verified_token: bool,
 
+    /// Z5: allow an OBO token that arrives with no transport-verified peer (no client certificate) to authorize the
+    /// request on its own, as a bearer credential. Off by default: a token nobody can prove the holder of is refused.
+    /// Set it only for a plain-HTTP deployment that accepts bearer tokens by design. Refused under `strict`.
+    #[serde(default)]
+    pub allow_unbound_obo: bool,
+
     /// Z2: refuse to start unless the configuration is complete enough to be trusted: a signing key, a TLS
     /// identity, and at least one trusted issuer. Off by default, so existing configs keep working; deployments
     /// that want the guarantee set it. A configured capability policy that fails to load already refuses to start.
@@ -623,6 +629,16 @@ impl GatewayConfig {
         }
         if self.trusted_issuers.is_empty() {
             violations.push("strict: trusted_issuers must name at least one gateway issuer");
+        }
+        // Z5: a proxy listener that accepts connections without a client certificate has no verified caller for any
+        // connection that presents no certificate. Strict deployments require one.
+        if let Some(tls) = &self.tls {
+            if tls.client_auth != ClientAuth::Required {
+                violations.push("strict: tls.client_auth must be required, so every proxy caller is certificate-verified");
+            }
+        }
+        if self.allow_unbound_obo {
+            violations.push("strict: allow_unbound_obo must be false");
         }
         violations
     }
@@ -783,6 +799,7 @@ impl GatewayConfig {
             jti_cache_enabled: false,
             jti_ttl_secs: default_jti_ttl_secs(),
             forward_verified_token: false,
+            allow_unbound_obo: false,
             strict: false,
             require_cert_binding: None,
         }

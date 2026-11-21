@@ -105,6 +105,8 @@ active_kid: key-1                            # which kid in jwks_path this gatew
 strict: false
 # Forward the OBO token this gateway validated, as X-ZT-Verified-Token (v0.4.1). Off by default.
 forward_verified_token: false
+# Bearer use (v0.4.3): an OBO token with no verified client certificate is refused unless this is true.
+allow_unbound_obo: false
 
 # Delegation and claim checks
 require_cert_binding: true            # refuse unbound issuance when a cert is missing; defaults to true with mTLS

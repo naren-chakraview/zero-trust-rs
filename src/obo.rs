@@ -172,6 +172,10 @@ impl Decision {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DenyReason {
+    /// Z5 fix: an OBO token was presented, but the transport layer verified no peer. A bearer token with no caller
+    /// proven by a certificate is refused unless the operator has explicitly allowed bearer use
+    /// (`allow_unbound_obo`). Only [`validate_for_proxy`] produces it.
+    NoVerifiedPeer,
     UnknownDestination,
     CallerNotInAllowList,
     OboChainDepthExceeded,
@@ -248,6 +252,7 @@ impl DenyReason {
             DenyReason::OboTokenNotYetValid => "obo_token_not_yet_valid",
             DenyReason::CertificateBindingMismatch => "certificate_binding_mismatch",
             DenyReason::IssuerInvalid => "issuer_invalid",
+            DenyReason::NoVerifiedPeer => "no_verified_peer",
             DenyReason::IssuerNotTrusted => "issuer_not_trusted",
             DenyReason::TokenReplayed => "token_replayed",
             DenyReason::AudienceMismatch => "audience_mismatch",
@@ -632,6 +637,7 @@ pub fn validate_for_proxy(
     jti_ttl_secs: u64,
     now_unix_secs: i64,
     clock_skew_secs: i64,
+    allow_unbound_obo: bool,
 ) -> Decision {
     let decision = validate_with_cert_binding_user_issuers_and_clock_skew(
         registry,
@@ -644,6 +650,12 @@ pub fn validate_for_proxy(
     );
     if !decision.is_allow() {
         return decision;
+    }
+    // Z5 fix: the actor check above only runs when a transport-verified peer exists. Without one, an unbound OBO token
+    // would be a bearer credential, so it is refused unless the operator opted in. A bound token without a certificate
+    // was already refused above, as a certificate-binding mismatch.
+    if request.obo_token.is_some() && request.source_principal.is_none() && !allow_unbound_obo {
+        return Decision::Deny(DenyReason::NoVerifiedPeer);
     }
     check_issuer_and_replay(registry, verifier, request, trusted_issuers, jti_cache_enabled, jti_ttl_secs)
 }

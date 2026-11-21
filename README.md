@@ -101,6 +101,11 @@ signing_key_path: /path/to/private-key.pem   # this gateway's own private key (P
 jwks_path: /path/to/public-jwks.json         # public verification set; holds no private keys
 active_kid: key-1                            # which kid in jwks_path this gateway signs with
 
+# Strict mode (v0.4.1): refuse to start without a signing key, a tls block and a trusted issuer
+strict: false
+# Forward the OBO token this gateway validated, as X-ZT-Verified-Token (v0.4.1). Off by default.
+forward_verified_token: false
+
 # Delegation and claim checks
 require_cert_binding: true            # refuse unbound issuance when a cert is missing; defaults to true with mTLS
 trusted_issuers: [spiffe://chakra.internal/ns/zt-gateway/sa/api-gateway]  # the signing gateways' iss values; empty disables the check (N12, R6)
@@ -269,6 +274,16 @@ fetch. Rotating them means updating the file and restarting the gateway.
 
 Credentials are not single-use. A stolen credential works until its `exp`.
 
+## Sidecar topology (v0.4.1)
+
+zt-gateway is a per-workload gateway. Run one as a sidecar beside each workload that takes part in delegation,
+sharing its network namespace: the admin listener stays on loopback, the workload calls its own sidecar's admin to
+mint a token bound to its certificate, and the sidecar of the callee verifies it on the proxy listener. The hop from
+the callee's sidecar to the backend is loopback, so no upstream TLS is needed; the backend trusts the
+`X-ZT-Verified-*` headers only because nothing else can reach it. `forward_verified_token` lets the backend verify the
+token itself as well. The test `z4_the_boundary_gateway_accepts_the_agent_and_refuses_everything_else` pins the
+behaviour: a token bound to another certificate, a replayed `jti`, and an untrusted issuer are each refused.
+
 ## Known gaps
 
 These are open. The review trackers in `docs/reviews/` have the detail.
@@ -280,6 +295,9 @@ These are open. The review trackers in `docs/reviews/` have the detail.
   loopback-only, so any local process can reach it. Issuance endpoints check
   bootstrap tokens, and token exchange checks only the signature of the token
   it's given, not the identity of the caller (N3, partly open).
+- **Upstream TLS for remote backends (planned, Z3).** The upstream client presents no client certificate and
+  trusts only the system roots. That is fine for the loopback sidecar hop. A gateway fronting a remote backend over
+  TLS needs `upstream_tls` (CA, client certificate and key). Not built yet.
 - **Delegation needs a co-located backend.** A route with `delegate: true` rebinds
   the token to the gateway's delegation cert (`docs/design/0002-delegation-with-bound-tokens.md`),
   and the backend must hold that cert's key to exchange the token onward. Startup

@@ -1,6 +1,6 @@
 [package]
 name = "zero-trust"
-version = "0.1.0"
+version = "0.4.1"
 edition = "2021"
 description = "A zero-trust identity and OBO-delegation gateway/fabric service"
 license = "MIT OR Apache-2.0"

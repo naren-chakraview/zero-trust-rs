@@ -122,6 +122,8 @@ struct AppState {
     /// `issue_svid`'s doc comment for the full decision this field feeds
     /// into.
     require_cert_binding: bool,
+    /// Z1: whether to forward the validated OBO token to the backend as `X-ZT-Verified-Token`.
+    forward_verified_token: bool,
 }
 
 /// Sets up structured stdout logs (always) plus, when
@@ -181,6 +183,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .nth(1)
         .unwrap_or_else(|| "gateway.config.yaml".to_string());
     let config = GatewayConfig::from_file(&config_path)?;
+    // Z2: a `strict` deployment refuses to start with an incomplete configuration, before any listener opens.
+    let violations = config.strict_violations();
+    if !violations.is_empty() {
+        return Err(violations.join("; ").into());
+    }
 
     let registry = Registry::from_reader(std::fs::File::open(&config.registry_path)?)?;
     let protected_workload = config.protected_workload_id()?;
@@ -326,6 +333,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         jti_cache_enabled: config.jti_cache_enabled,
         jti_ttl_secs: config.jti_ttl_secs,
         require_cert_binding: config.effective_require_cert_binding(),
+        forward_verified_token: config.forward_verified_token,
     };
 
     require_loopback_admin(config.admin_addr)?;
@@ -1508,9 +1516,13 @@ async fn proxy_handler(
     let mut verified_caller: Option<SpiffeId> = None;
     let mut verified_chain: Option<Vec<String>> = None;
     let mut verified_user: Option<String> = None;
+    let mut verified_token: Option<String> = None;
     if decision.is_allow() {
         if let Some(token) = obo_token.as_deref() {
             if let Ok(claims) = state.identity.verifier().verify_signature(token) {
+                if state.forward_verified_token {
+                    verified_token = Some(token.to_string());
+                }
                 // N1 fix: `current_actor`, not `claims.sub` -- the decision
                 // is already `Allow`, so `obo::validate` has already
                 // confirmed `current_actor` (not the originator) is what
@@ -1654,6 +1666,7 @@ async fn proxy_handler(
                     verified_caller.as_ref(),
                     verified_user.as_deref(),
                     verified_chain.as_deref(),
+                    verified_token.as_deref(),
                     rebound_token,
                 )
                 .await
@@ -1717,6 +1730,10 @@ const HEADER_VERIFIED_USER: &str = "x-zt-verified-user";
 /// [`HEADER_VERIFIED_USER`].
 const HEADER_VERIFIED_CHAIN: &str = "x-zt-verified-chain";
 
+/// Gateway-owned header carrying the OBO token this gateway validated (Z1). Only set when
+/// `forward_verified_token` is on.
+const HEADER_VERIFIED_TOKEN: &str = "x-zt-verified-token";
+
 /// Why [`read_upstream_body_limited`] gave up on an upstream response body.
 enum UpstreamBodyError {
     /// The body grew past the configured limit.
@@ -1751,6 +1768,7 @@ async fn forward_to_upstream(
     verified_caller: Option<&SpiffeId>,
     verified_user: Option<&str>,
     verified_chain: Option<&[String]>,
+    verified_token: Option<&str>,
     rebound_token: Option<String>,
 ) -> Response {
     // Check body size limit (F6 fix)
@@ -1826,6 +1844,13 @@ async fn forward_to_upstream(
             if let Ok(value) = axum::http::HeaderValue::from_str(&chain.join(",")) {
                 headers.insert(HeaderName::from_static(HEADER_VERIFIED_CHAIN), value);
             }
+        }
+    }
+    // Z1: the exact token this gateway validated, when the operator opted in. The client's copy of this header was
+    // already stripped by the `x-zt-verified-*` loop above.
+    if let Some(token) = verified_token {
+        if let Ok(value) = axum::http::HeaderValue::from_str(token) {
+            headers.insert(HeaderName::from_static(HEADER_VERIFIED_TOKEN), value);
         }
     }
 
@@ -1934,6 +1959,7 @@ workloads:
             trusted_issuers: Arc::new(Vec::new()),
             jti_cache_enabled: false,
             jti_ttl_secs: 300,
+            forward_verified_token: false,
             // Most existing tests call `/v1/svid/jwt` with no peer
             // certificate at all and expect the pre-N6 unbound token back
             // -- `false` preserves that. Tests exercising the N6 gate
@@ -2222,6 +2248,215 @@ workloads:
         let received = captured.lock().unwrap().take().expect("upstream should have been hit");
         assert_eq!(received.get(HEADER_VERIFIED_USER).unwrap().to_str().unwrap(), "alice@corp.internal");
         assert_eq!(received.get(HEADER_VERIFIED_CALLER).unwrap().to_str().unwrap(), ORDERS);
+    }
+
+    // --- Z1 (v0.4.1): forward the verified OBO token, opt-in ---
+
+    /// Z1: with the option on, the backend gets exactly the token the gateway validated. With it off (the default),
+    /// the header is absent. A client-sent copy is stripped either way.
+    #[tokio::test]
+    async fn z1_forwards_the_validated_token_only_when_enabled() {
+        let issuer_state = test_state("http://127.0.0.1:0".to_string());
+        let issued = issuer_state.identity.issue_jwt_svid("orders-svc", INVENTORY, "orders-secret").unwrap();
+
+        let (upstream_addr, captured) = spawn_header_capturing_upstream().await;
+        let mut on = test_state(upstream_addr.clone());
+        on.identity = issuer_state.identity.clone();
+        on.forward_verified_token = true;
+        let router = build_router(on);
+        let request = Request::builder()
+            .method("GET")
+            .uri("/some/path")
+            .header(HEADER_OBO_TOKEN, issued.token.clone())
+            .header("x-zt-verified-token", "forged-by-client")
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(router.oneshot(request).await.unwrap().status(), SC::OK);
+        let received = captured.lock().unwrap().take().expect("upstream hit");
+        assert_eq!(
+            received.get(HEADER_VERIFIED_TOKEN).unwrap().to_str().unwrap(),
+            issued.token,
+            "the backend gets the validated token, never the client's copy"
+        );
+
+        let (upstream_addr, captured) = spawn_header_capturing_upstream().await;
+        let mut off = test_state(upstream_addr);
+        off.identity = issuer_state.identity.clone();
+        let router = build_router(off);
+        let request = Request::builder()
+            .method("GET")
+            .uri("/some/path")
+            .header(HEADER_OBO_TOKEN, issued.token)
+            .body(Body::empty())
+            .unwrap();
+        assert_eq!(router.oneshot(request).await.unwrap().status(), SC::OK);
+        let received = captured.lock().unwrap().take().expect("upstream hit");
+        assert!(received.get(HEADER_VERIFIED_TOKEN).is_none(), "off by default: no token is forwarded");
+    }
+
+    // --- Z2 (v0.4.1): strict mode refuses an incomplete configuration ---
+
+    #[test]
+    fn z2_strict_refuses_a_missing_key_tls_or_issuer_and_passes_a_complete_config() {
+        let mut config = GatewayConfig::test_with_listeners(
+            "127.0.0.1:0".parse().unwrap(),
+            "127.0.0.1:0".parse().unwrap(),
+        );
+        assert!(config.strict_violations().is_empty(), "strict off: nothing is refused");
+
+        config.strict = true;
+        let violations = config.strict_violations();
+        assert_eq!(violations.len(), 3, "no key, no tls, no issuer: {violations:?}");
+
+        config.signing_key_path = Some("/config/gateway-signing.pem".into());
+        config.trusted_issuers = vec!["spiffe://chakra.internal/ns/edge/sa/gateway".to_string()];
+        let violations = config.strict_violations();
+        assert_eq!(violations.len(), 1, "only tls is missing now: {violations:?}");
+        assert!(violations[0].contains("tls"));
+
+        config.tls = Some(zero_trust::TlsConfig {
+            cert_path: Some("/certs/edge.pem".into()),
+            key_path: Some("/certs/edge.key".into()),
+            client_auth: zero_trust::ClientAuth::Optional,
+        });
+        assert!(config.strict_violations().is_empty(), "a complete config starts");
+    }
+
+    // --- Z4 (v0.4.1): the sidecar topology, pinned by a test ---
+    //
+    // Two gateways, as they are deployed: the agent's sidecar mints a token for an analyst, bound to the agent's
+    // certificate; the boundary's gateway accepts it from the agent's mTLS peer, forwards the verified headers, and
+    // refuses it from any other certificate, on reuse, and from an issuer it does not trust.
+
+    const AGENT: &str = "spiffe://chakra.internal/ns/agents/sa/risk-review-agent";
+    const BOUNDARY_SVC: &str = "spiffe://chakra.internal/ns/boundary/sa/boundary";
+    const ANALYST: &str = "risk.analyst@chakra.fintech";
+    const IDP: &str = "auth.corp.internal";
+
+    fn topology_registry() -> Registry {
+        Registry::from_yaml_str(&format!(
+            r#"
+trust_domain: chakra.internal
+workloads:
+  - name: boundary
+    spiffe_id: {BOUNDARY_SVC}
+    max_obo_chain_depth: 2
+    allowed_callers:
+      - {AGENT}
+  - name: risk-review-agent
+    spiffe_id: {AGENT}
+    max_obo_chain_depth: 2
+    allowed_callers: []
+    bootstrap_token: agent-secret
+"#
+        ))
+        .unwrap()
+    }
+
+    /// A fresh RSA key as PKCS#1 PEM, and its public half as a one-key JWKS under `kid`.
+    fn key_and_public_set(kid: &str) -> (Vec<u8>, JsonWebKeySet) {
+        let mut rng = rand::rngs::OsRng;
+        let private = rsa::RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let pem = rsa::pkcs1::EncodeRsaPrivateKey::to_pkcs1_pem(&private, rsa::pkcs1::LineEnding::LF)
+            .unwrap()
+            .as_bytes()
+            .to_vec();
+        let set = JsonWebKeySet::from_rsa_private_pem(kid.to_string(), &pem).unwrap();
+        (pem, set)
+    }
+
+    /// A sidecar's identity: an issuer for `gateway_id`, whose tokens verify under `public` (its own public half).
+    fn sidecar(kid: &str) -> (LocalIssuer, JsonWebKeySet) {
+        let (pem, public) = key_and_public_set(kid);
+        let issuer = LocalIssuer::with_separated_keys(topology_registry(), &pem, Some(kid.to_string()), &public, 300)
+            .unwrap();
+        (issuer, public)
+    }
+
+    /// The boundary's gateway: verifies its own tokens and the sidecars' (through the merged public set), trusts only
+    /// `trusted`, and keeps the jti replay cache on.
+    fn boundary_gateway(upstream: String, public_sets: &[&JsonWebKeySet], trusted: Vec<String>) -> AppState {
+        let (pem, mut keys) = key_and_public_set("b-1");
+        for set in public_sets {
+            keys.extend((*set).clone());
+        }
+        let issuer = LocalIssuer::with_separated_keys(topology_registry(), &pem, Some("b-1".to_string()), &keys, 300)
+            .unwrap();
+        let mut state = test_state(upstream);
+        state.identity = Arc::new(issuer);
+        state.registry = Arc::new(topology_registry());
+        state.protected_workload = Arc::new(BOUNDARY_SVC.parse().unwrap());
+        state.trusted_issuers = Arc::new(trusted);
+        state.user_issuers = Arc::new(vec![IDP.to_string()]);
+        state.jti_cache_enabled = true;
+        state.forward_verified_token = true;
+        state
+    }
+
+    /// The token the agent's sidecar mints for `ANALYST`, bound to `thumb` and identified by `jti`.
+    fn sidecar_token(signer: &LocalIssuer, thumb: &str, jti: &str) -> String {
+        let now = now_unix_secs();
+        signer
+            .sign_claims(&zero_trust::OboClaims {
+                sub: AGENT.to_string(),
+                aud: vec![BOUNDARY_SVC.to_string()],
+                user: Some(ANALYST.to_string()),
+                act: None,
+                iat: now,
+                exp: now + 60,
+                nbf: Some(now),
+                jti: Some(jti.to_string()),
+                cnf: Some(zero_trust::CertBinding { x5t_s256: thumb.to_string() }),
+                iss: Some(signer.issuer_claim().unwrap()),
+                user_iss: Some(IDP.to_string()),
+            })
+            .unwrap()
+    }
+
+    fn call_from(peer: &str, thumb: &str, token: &str) -> Request<Body> {
+        let mut request = Request::builder()
+            .method("GET")
+            .uri("/products/risk-compliance.risk-scores/rows")
+            .header(HEADER_OBO_TOKEN, token)
+            .body(Body::empty())
+            .unwrap();
+        request.extensions_mut().insert(PeerIdentity {
+            spiffe_id: Some(peer.parse().unwrap()),
+            cert_thumbprint: Some(thumb.to_string()),
+        });
+        request
+    }
+
+    #[tokio::test]
+    async fn z4_the_boundary_gateway_accepts_the_agent_and_refuses_everything_else() {
+        let (agent_sidecar, agent_public) = sidecar("a-1");
+        let (rogue, rogue_public) = sidecar("x-1");
+        let trusted = vec![agent_sidecar.issuer_claim().unwrap()];
+        let (upstream_addr, captured) = spawn_header_capturing_upstream().await;
+        let router = build_router(boundary_gateway(upstream_addr, &[&agent_public, &rogue_public], trusted));
+
+        // (ok) the agent's own certificate, a fresh token: served, and the verified headers reach the boundary.
+        let good = sidecar_token(&agent_sidecar, "agent-thumb", "z4-ok");
+        let ok = router.clone().oneshot(call_from(AGENT, "agent-thumb", &good)).await.unwrap();
+        assert_eq!(ok.status(), SC::OK);
+        let received = captured.lock().unwrap().take().expect("upstream hit");
+        assert_eq!(received.get(HEADER_VERIFIED_CALLER).unwrap().to_str().unwrap(), AGENT);
+        assert_eq!(received.get(HEADER_VERIFIED_USER).unwrap().to_str().unwrap(), ANALYST);
+        assert_eq!(received.get(HEADER_VERIFIED_TOKEN).unwrap().to_str().unwrap(), good);
+
+        // (a) the same token from another certificate: the cnf binding refuses it.
+        let other = sidecar_token(&agent_sidecar, "agent-thumb", "z4-other-cert");
+        let wrong_cert = router.clone().oneshot(call_from(AGENT, "notebook-thumb", &other)).await.unwrap();
+        assert_eq!(wrong_cert.status(), SC::FORBIDDEN, "a token bound to the agent's certificate is refused elsewhere");
+
+        // (b) a replay of the accepted token: the jti cache refuses it.
+        let replay = router.clone().oneshot(call_from(AGENT, "agent-thumb", &good)).await.unwrap();
+        assert_eq!(replay.status(), SC::FORBIDDEN, "a replayed jti is refused");
+
+        // (c) a token from a gateway the boundary does not trust, even though its signature verifies.
+        let untrusted = sidecar_token(&rogue, "agent-thumb", "z4-rogue");
+        let rogue_resp = router.oneshot(call_from(AGENT, "agent-thumb", &untrusted)).await.unwrap();
+        assert_eq!(rogue_resp.status(), SC::FORBIDDEN, "an untrusted issuer is refused");
     }
 
     // --- R9 fix (review 0003): the decision log records the verified chain ---

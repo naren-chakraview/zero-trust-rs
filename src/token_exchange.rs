@@ -207,7 +207,7 @@ pub fn exchange_token(
     // R6 fix (review 0003): `iss` names the gateway that signs the new token,
     // not the originator. The IdP that vouched for `user` is carried in `user_iss`.
     let gateway_iss = issuer.issuer_claim().ok_or(TokenExchangeError::InternalError)?;
-    let new_claims = OboClaims {
+    let new_claims = OboClaims { roles: inbound_claims.roles.clone(),
         user_iss: inbound_claims.user_iss.clone(),
         sub: inbound_claims.sub.clone(),
         aud: vec![next_aud.to_string()],
@@ -335,7 +335,7 @@ pub fn exchange_token_with_cert_binding(
     // R6 fix (review 0003): `iss` names the gateway that signs the new token,
     // not the originator. The IdP that vouched for `user` is carried in `user_iss`.
     let gateway_iss = issuer.issuer_claim().ok_or(TokenExchangeError::InternalError)?;
-    let new_claims = OboClaims {
+    let new_claims = OboClaims { roles: inbound_claims.roles.clone(),
         user_iss: inbound_claims.user_iss.clone(),
         sub: inbound_claims.sub.clone(),
         aud: vec![next_aud.to_string()],
@@ -469,7 +469,7 @@ pub fn rebind_token(
     let gateway_iss = issuer.issuer_claim().ok_or(TokenExchangeError::InternalError)?;
 
     let exp = (now_secs + ttl_secs as i64).min(inbound.exp);
-    let claims = OboClaims {
+    let claims = OboClaims { roles: inbound.roles.clone(),
         user_iss: inbound.user_iss.clone(),
         sub: inbound.sub.clone(),
         aud: vec![workload_str],
@@ -519,7 +519,7 @@ workloads:
         let issuer = LocalIssuer::generate(reg, 300).unwrap();
 
         // Step 1: Issuer creates initial token (originator -> backend A).
-        let initial_claims = OboClaims {
+        let initial_claims = OboClaims { roles: None,
             user_iss: None,
             sub: "spiffe://chakra.internal/ns/originator/sa/originator".into(),
             aud: vec!["spiffe://chakra.internal/ns/backend-a/sa/backend-a".into()],
@@ -606,7 +606,7 @@ workloads:
         let now = 1000i64;
 
         // Step 1: user originates a call to gateway A.
-        let initial_claims = OboClaims {
+        let initial_claims = OboClaims { roles: None,
             user_iss: None,
             sub: "spiffe://chakra.internal/ns/originator/sa/originator".into(),
             aud: vec!["spiffe://chakra.internal/ns/gateway-a/sa/gateway-a".into()],
@@ -679,7 +679,7 @@ workloads:
         use crate::jwt::CertBinding;
 
         let issuer = LocalIssuer::generate(test_registry(), 300).unwrap();
-        let claims = OboClaims {
+        let claims = OboClaims { roles: None,
             user_iss: None,
             sub: "spiffe://chakra.internal/ns/originator/sa/originator".into(),
             aud: vec!["spiffe://chakra.internal/ns/backend/sa/backend".into()],
@@ -722,7 +722,7 @@ workloads:
     fn test_token_exchange_rejects_expired_token() {
         let issuer = LocalIssuer::generate(test_registry(), 300).unwrap();
 
-        let expired_claims = OboClaims {
+        let expired_claims = OboClaims { roles: None,
             user_iss: None,
             sub: "spiffe://chakra.internal/ns/originator/sa/originator".into(),
             aud: vec!["spiffe://chakra.internal/ns/backend/sa/backend".into()],
@@ -756,7 +756,7 @@ workloads:
     fn test_token_exchange_rejects_invalid_audience() {
         let issuer = LocalIssuer::generate(test_registry(), 300).unwrap();
 
-        let claims = OboClaims {
+        let claims = OboClaims { roles: None,
             user_iss: None,
             sub: "spiffe://chakra.internal/ns/originator/sa/originator".into(),
             aud: vec!["spiffe://chakra.internal/ns/backend/sa/backend".into()],
@@ -791,7 +791,7 @@ workloads:
         let issuer = LocalIssuer::generate(test_registry(), 300).unwrap();
         let other_issuer = LocalIssuer::generate(test_registry(), 300).unwrap();
 
-        let claims = OboClaims {
+        let claims = OboClaims { roles: None,
             user_iss: None,
             sub: "spiffe://chakra.internal/ns/originator/sa/originator".into(),
             aud: vec!["spiffe://chakra.internal/ns/backend/sa/backend".into()],
@@ -845,7 +845,7 @@ workloads:
     #[test]
     fn exchanged_jti_is_unique_per_call() {
         let issuer = LocalIssuer::generate(test_registry(), 300).unwrap();
-        let claims = OboClaims {
+        let claims = OboClaims { roles: None,
             user_iss: None,
             sub: "spiffe://chakra.internal/ns/originator/sa/originator".into(),
             aud: vec!["spiffe://chakra.internal/ns/backend/sa/backend".into()],
@@ -907,7 +907,7 @@ workloads:
     /// A token bound to the client's certificate, addressed to the gateway, as
     /// the edge or the client would present it.
     fn bound_token(issuer: &LocalIssuer, now: i64, exp: i64) -> String {
-        let claims = OboClaims {
+        let claims = OboClaims { roles: None,
             user_iss: None,
             sub: "spiffe://chakra.internal/ns/client/sa/client".into(),
             aud: vec![GW_ID.into()],
@@ -986,7 +986,7 @@ workloads:
         // Build an edge-shaped token: sub = this gateway, aud = this gateway, no act.
         let now = crate::now_unix_secs();
         let edge = issuer
-            .sign_claims(&OboClaims {
+            .sign_claims(&OboClaims { roles: None,
                 user_iss: None,
                 sub: GW_ID.into(),
                 aud: vec![GW_ID.into()],

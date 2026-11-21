@@ -89,6 +89,11 @@ pub struct OboClaims {
     /// holds the user's IdP. Only edge-minted tokens set it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_iss: Option<String>,
+    /// Roles of the verified human principal, copied from the IdP credential at the edge mint and carried through
+    /// every exchange. Set only on user-bound tokens. The gateway signs them, so a backend can trust them the way
+    /// it trusts `user`. Absent (not an empty list) when the credential carried none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roles: Option<Vec<String>>,
 }
 
 impl OboClaims {
@@ -410,7 +415,7 @@ mod tests {
     }
 
     fn sample_claims(exp: i64) -> OboClaims {
-        OboClaims {
+        OboClaims { roles: None,
             user_iss: None,
             sub: "spiffe://chakra.internal/ns/orders/sa/orders-svc".to_string(),
             aud: vec!["spiffe://chakra.internal/ns/inventory/sa/inventory-svc".to_string()],

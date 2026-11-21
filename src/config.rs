@@ -345,6 +345,10 @@ pub struct UserIdpConfig {
     /// `email`.
     #[serde(default = "default_principal_claim")]
     pub principal_claim: String,
+    /// Further claims of the credential to carry into the edge-minted token as `user_attributes` (v0.4.4). Each must
+    /// be a string claim of the credential; a missing one is simply not carried. Empty by default.
+    #[serde(default)]
+    pub attribute_claims: Vec<String>,
 }
 
 fn default_capability_policy_reload_secs() -> u64 {

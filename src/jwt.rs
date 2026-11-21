@@ -94,6 +94,11 @@ pub struct OboClaims {
     /// it trusts `user`. Absent (not an empty list) when the credential carried none.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub roles: Option<Vec<String>>,
+    /// Attributes of the verified human principal that the IdP credential carried, for the claim names the operator
+    /// configured (`user_idps[].attribute_claims`), e.g. a KYC identifier. Signed by the gateway, carried through
+    /// every exchange. Absent when none were configured or the credential carried none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_attributes: Option<std::collections::BTreeMap<String, String>>,
 }
 
 impl OboClaims {
@@ -415,7 +420,7 @@ mod tests {
     }
 
     fn sample_claims(exp: i64) -> OboClaims {
-        OboClaims { roles: None,
+        OboClaims { user_attributes: None, roles: None,
             user_iss: None,
             sub: "spiffe://chakra.internal/ns/orders/sa/orders-svc".to_string(),
             aud: vec!["spiffe://chakra.internal/ns/inventory/sa/inventory-svc".to_string()],

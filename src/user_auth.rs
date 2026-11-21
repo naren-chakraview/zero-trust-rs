@@ -33,6 +33,7 @@ pub struct UserIdp {
     jwks: JsonWebKeySet,
     audience: String,
     principal_claim: String,
+    attribute_claims: Vec<String>,
 }
 
 impl UserIdp {
@@ -44,7 +45,14 @@ impl UserIdp {
             jwks,
             audience,
             principal_claim,
+            attribute_claims: Vec::new(),
         }
+    }
+
+    /// The credential claims to carry as attributes of the principal (see `UserIdpConfig::attribute_claims`).
+    pub fn with_attribute_claims(mut self, claims: Vec<String>) -> Self {
+        self.attribute_claims = claims;
+        self
     }
 
     pub fn issuer(&self) -> &str {
@@ -59,6 +67,15 @@ impl UserIdp {
     /// Verifies `credential` and returns the principal and its roles. Roles come from a `roles` claim, which must
     /// be an array of strings when present. `None` when the credential has no `roles` claim.
     pub fn verify_with_roles(&self, credential: &str) -> Result<(String, Option<Vec<String>>), UserAuthError> {
+        self.verify_full(credential).map(|(principal, roles, _)| (principal, roles))
+    }
+
+    /// Verifies `credential` and returns the principal, its roles, and the configured attribute claims that the
+    /// credential carries (a string claim each; absent claims are left out).
+    pub fn verify_full(
+        &self,
+        credential: &str,
+    ) -> Result<(String, Option<Vec<String>>, Option<std::collections::BTreeMap<String, String>>), UserAuthError> {
         let invalid = |reason: String| UserAuthError::InvalidCredential(reason);
 
         let header = decode_header(credential).map_err(|source| invalid(source.to_string()))?;
@@ -100,7 +117,14 @@ impl UserIdp {
             ),
             Some(_) => return Err(invalid("roles claim must be an array of strings".to_string())),
         };
-        Ok((principal, roles))
+        let mut attributes = std::collections::BTreeMap::new();
+        for claim in &self.attribute_claims {
+            if let Some(value) = data.claims.get(claim).and_then(Value::as_str).filter(|v| !v.is_empty()) {
+                attributes.insert(claim.clone(), value.to_string());
+            }
+        }
+        let attributes = (!attributes.is_empty()).then_some(attributes);
+        Ok((principal, roles, attributes))
     }
 }
 

@@ -778,7 +778,7 @@ workloads:
     }
 
     fn mint_token(signer: &JwtSigner, sub: &str, aud: &[&str], now: i64, ttl: i64) -> String {
-        let claims = OboClaims { roles: None,
+        let claims = OboClaims { user_attributes: None, roles: None,
             user_iss: None,
             sub: sub.to_string(),
             aud: aud.iter().map(|s| s.to_string()).collect(),
@@ -848,7 +848,7 @@ workloads:
         let registry = test_registry();
         let (signer, verifier) = test_keys();
         let destination = id(INVENTORY);
-        let claims = OboClaims { roles: None,
+        let claims = OboClaims { user_attributes: None, roles: None,
             user_iss: None,
             sub: ORDERS.to_string(),
             aud: vec![INVENTORY.to_string()],
@@ -899,7 +899,7 @@ workloads:
         let destination = id(INVENTORY);
 
         // 4-deep signed chain (sub + 3 act hops) exceeds max depth 3.
-        let claims = OboClaims { roles: None,
+        let claims = OboClaims { user_attributes: None, roles: None,
             user_iss: None,
             sub: ORDERS.to_string(),
             aud: vec![INVENTORY.to_string()],
@@ -942,7 +942,7 @@ workloads:
         let (signer, verifier) = test_keys();
         let destination = id(INVENTORY);
 
-        let claims = OboClaims { roles: None,
+        let claims = OboClaims { user_attributes: None, roles: None,
             user_iss: None,
             sub: ORDERS.to_string(),
             aud: vec![INVENTORY.to_string()],
@@ -979,7 +979,7 @@ workloads:
         let (signer, verifier) = test_keys();
         let destination = id(INVENTORY);
 
-        let claims = OboClaims { roles: None,
+        let claims = OboClaims { user_attributes: None, roles: None,
             user_iss: None,
             sub: ORDERS.to_string(),
             aud: vec![INVENTORY.to_string()],
@@ -1013,7 +1013,7 @@ workloads:
         let (signer, verifier) = test_keys();
         let destination = id(INVENTORY);
 
-        let claims = OboClaims { roles: None,
+        let claims = OboClaims { user_attributes: None, roles: None,
             user_iss: None,
             sub: ORDERS.to_string(),
             aud: vec![INVENTORY.to_string()],
@@ -1045,7 +1045,7 @@ workloads:
         let destination = id(INVENTORY);
 
         // 3-deep signed chain (sub + 2 act hops) exceeds max depth 2.
-        let claims = OboClaims { roles: None,
+        let claims = OboClaims { user_attributes: None, roles: None,
             user_iss: None,
             sub: ORDERS.to_string(),
             aud: vec![INVENTORY.to_string()],
@@ -1096,7 +1096,7 @@ workloads:
         let registry = test_registry();
         let (signer, verifier) = test_keys();
         let destination = id(INVENTORY);
-        let mut claims = OboClaims { roles: None,
+        let mut claims = OboClaims { user_attributes: None, roles: None,
             user_iss: None,
             sub: ORDERS.to_string(),
             aud: vec![INVENTORY.to_string()],
@@ -1130,7 +1130,7 @@ workloads:
         let registry = test_registry();
         let (signer, verifier) = test_keys();
         let destination = id(INVENTORY);
-        let claims = OboClaims { roles: None,
+        let claims = OboClaims { user_attributes: None, roles: None,
             user_iss: None,
             sub: ORDERS.to_string(),
             aud: vec![INVENTORY.to_string()],
@@ -1312,7 +1312,7 @@ workloads:
     use crate::jwt::CertBinding;
 
     fn mint_token_with_cnf(signer: &JwtSigner, sub: &str, aud: &[&str], cert_thumbprint: &str) -> String {
-        let claims = OboClaims { roles: None,
+        let claims = OboClaims { user_attributes: None, roles: None,
             user_iss: None,
             sub: sub.to_string(),
             aud: aud.iter().map(|s| s.to_string()).collect(),
@@ -1427,7 +1427,7 @@ workloads:
         let registry = test_registry();
         let (signer, verifier) = test_keys();
         let destination = id(INVENTORY);
-        let claims = OboClaims { roles: None,
+        let claims = OboClaims { user_attributes: None, roles: None,
             user_iss: None,
             sub: ORDERS.to_string(),
             aud: vec![INVENTORY.to_string()],
@@ -1472,7 +1472,7 @@ workloads:
     // --- Trusted issuer + JTI replay detection (Task 13 / N12) ---
 
     fn mint_token_with_iss_and_jti(signer: &JwtSigner, sub: &str, aud: &[&str], iss: Option<&str>, jti: Option<&str>) -> String {
-        let claims = OboClaims { roles: None,
+        let claims = OboClaims { user_attributes: None, roles: None,
             user_iss: None,
             sub: sub.to_string(),
             aud: aud.iter().map(|s| s.to_string()).collect(),
